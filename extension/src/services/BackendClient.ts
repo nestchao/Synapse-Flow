@@ -32,13 +32,16 @@ export class BackendClient {
         return { cpp: cppStatus, python: pythonStatus };
     }
 
-    async getAutocomplete(prefix: string, suffix: string): Promise<string> {
+    async getAutocomplete(prefix: string, suffix: string, projectId: string, filePath: string): Promise<string> {
         try {
-            const response = await cppClient.post('/complete', { prefix, suffix });
-            // Extract the 'completion' field from the C++ JSON response
+            const response = await cppClient.post('/complete', { 
+                prefix, 
+                suffix,
+                project_id: projectId,
+                file_path: filePath // 🚀 NEW
+            });
             return response.data.completion || "";
         } catch (error) {
-            console.error("Autocomplete Engine Stall:", error);
             return "";
         }
     }

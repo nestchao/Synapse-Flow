@@ -4,7 +4,8 @@
 #include <string>
 #include <spdlog/spdlog.h>
 
-#include "parser_elite.hpp"
+// 🚀 Make sure this file exists and ASTBooster is implemented!
+#include "parser_elite.hpp" 
 
 namespace code_assistance {
 namespace fs = std::filesystem;
@@ -20,7 +21,7 @@ public:
                 fs::copy(p, journalPath, fs::copy_options::overwrite_existing);
                 return true;
             }
-            // If file doesn't exist, it's a new file creation; backup not needed
+            // New file creation; backup not needed but operation is valid
             return true; 
         } catch (const std::exception& e) {
             spdlog::error("🚨 Journal Backup Failed: {}", e.what());
@@ -49,21 +50,22 @@ public:
         }
     }
 
-    // 🚀 THE FIX: Integrated Surgery Logic
+    // 🚀 THE INTEGRATED SURGERY LOGIC
     static bool apply_surgery_safe(const std::string& path, const std::string& new_code) {
         fs::path p(path);
         std::string ext = p.extension().string();
 
-        // 🛑 STEP 1: MEMORY-ONLY VALIDATION (Zero Disk I/O)
-        // We validate BEFORE we even touch the disk or create a journal.
+        // 🛑 STEP 1: MEMORY-ONLY VALIDATION
+        // We validate via Tree-sitter BEFORE we touch the disk
         if (!validate_ast_integrity(new_code, ext)) {
-            return false; // Rejection
+            return false; // Rejection, no file touched
         }
 
-        // 🛡️ STEP 2: JOURNAL & WRITE
+        // 🛡️ STEP 2: JOURNAL (Backup)
         if (!backup(path)) return false;
 
-        std::ofstream out(path, std::ios::trunc);
+        // ✍️ STEP 3: WRITE
+        std::ofstream out(path, std::ios::trunc); // Text mode usually fine, add | std::ios::binary if needed
         if (!out.is_open()) {
             rollback(path);
             return false;
@@ -72,7 +74,7 @@ public:
         out << new_code;
         out.close();
 
-        // ✅ STEP 3: COMMIT
+        // ✅ STEP 4: COMMIT (Delete Backup)
         commit(path);
         return true;
     }
@@ -81,15 +83,15 @@ public:
         // Instantiate the Elite Parser
         code_assistance::elite::ASTBooster parser;
         
-        // 1. Syntax Check
+        // 1. Syntax Check via Tree-sitter
         if (!parser.validate_syntax(code, ext)) {
             spdlog::error("❌ AST REJECTION: Syntax error detected in proposed code.");
             return false;
         }
 
-        // 2. Critical Heuristic (Optional): Prevent emptying a file
-        if (code.length() < 10 && ext != ".txt") {
-            spdlog::warn("⚠️ AST WARNING: Proposed code is dangerously short.");
+        // 2. Critical Heuristic: Prevent wiping files
+        if (code.length() < 10 && ext != ".txt" && ext != ".md") {
+            spdlog::warn("⚠️ AST WARNING: Proposed code is dangerously short/empty.");
             return false;
         }
 

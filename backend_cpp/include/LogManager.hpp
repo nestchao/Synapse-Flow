@@ -54,7 +54,7 @@ public:
             j_list.push_back({
                 {"timestamp", it->timestamp},
                 {"project_id", it->project_id},
-                {"type", it->request_type},
+                {"request_type", it->request_type},
                 {"user_query", it->user_query},
                 {"full_prompt", it->full_prompt},
                 {"ai_response", it->ai_response},

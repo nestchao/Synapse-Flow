@@ -1,12 +1,13 @@
 // backend_cpp/src/embedding_service.cpp
-#include "embedding_service.hpp"
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
 #include <chrono>
 #include <cmath>
+
 #include "SystemMonitor.hpp" 
+#include "embedding_service.hpp"
 
 namespace code_assistance {
 
@@ -243,108 +244,88 @@ VisionResult EmbeddingService::analyze_vision(const std::string& prompt, const s
     return result;
 }
 
-std::string EmbeddingService::generate_autocomplete(const std::string& prefix) {
+std::string EmbeddingService::generate_autocomplete(
+    const std::string& prefix, 
+    const std::string& suffix, 
+    const std::string& project_context,
+    const std::string& file_path
+) {
     size_t total_keys = key_manager_->get_total_keys();
     size_t total_models = key_manager_->get_total_models();
-    size_t max_attempts = total_keys * total_models; // Try ALL combinations
+    size_t max_attempts = total_keys * total_models;
     
-    // 🚀 LOGIC: Check if prefix ends with open parenthesis or comma to preserve spacing
-    bool needs_space = false;
-    if (!prefix.empty()) {
-        char last = prefix.back();
-        if (last == ',' || last == ')') needs_space = true;
-    }
-
     for(size_t attempt = 0; attempt < max_attempts; ++attempt) {
         auto pair = key_manager_->get_current_pair();
-        
-        // Construct URL for specific model
         std::string url = base_url_ + pair.model + ":generateContent?key=" + pair.key;
         
+        // 🏗️ GOD MODE PROMPT CONSTRUCTION
+        std::string full_prompt = 
+            "ROLE: Senior Code Completion Engine.\n"
+            "TASK: Complete the code at the <CURSOR> position. Return ONLY the code to be inserted.\n"
+            "RULES:\n"
+            "1. No Markdown (```). No conversational text.\n"
+            "2. Use the provided PROJECT TOPOLOGY and CONTEXT to resolve imports/definitions.\n"
+            "3. If the user started a word, complete it. Do not repeat the prefix.\n\n"
+            + project_context + "\n\n" // <--- 0ms RAM Injection
+            "### CURRENT FILE: " + file_path + "\n"
+            "[START]\n" + prefix + "<CURSOR>" + suffix + "\n[END]";
+
         json payload = {
-            {"contents", {{ 
-                {"parts", {{{"text", 
-                    "ROLE: Code Completion Engine.\n"
-                    "TASK: Complete the code at the cursor.\n"
-                    "RULES:\n"
-                    "1. Output ONLY the code to be inserted.\n"
-                    "2. Do NOT repeat the input.\n"
-                    "3. Do NOT wrap in markdown.\n"
-                    "4. If the input is a function signature, complete the parameters or body.\n"
-                    "5. DO NOT hallucinate a new 'main()' function.\n\n"
-                    "INPUT CONTEXT:\n" + prefix}}}} 
-            }}},
+            {"contents", {{ {"parts", {{{"text", full_prompt}}}} }}},
             {"generationConfig", {
-                {"maxOutputTokens", 64},
-                {"stopSequences", {"\n\n", "```", "void main"}} // 🚀 HARD STOP on hallucinations
+                {"maxOutputTokens", 64}, // Low token count for latency
+                {"stopSequences", {"```", "\n\n\n"}} 
             }}
         };
 
-        auto r = cpr::Post(
-            cpr::Url{url}, 
-            cpr::Body{payload.dump()}, 
-            cpr::Header{{"Content-Type", "application/json"}},
-            cpr::Timeout{3500} // 3.5s timeout per attempt
-        );
+        // Short timeout (4s) for Ghost Text - fail fast if network lags
+        auto r = cpr::Post(cpr::Url{url}, cpr::Body{payload.dump()}, cpr::Header{{"Content-Type", "application/json"}}, cpr::Timeout{4000});
         
-        // ✅ SUCCESS
         if (r.status_code == 200) {
             try {
                 auto j = json::parse(r.text);
-                if (j["candidates"].empty()) {
-                    // Empty candidates often means safety filter block
-                    spdlog::warn("⚠️ Blocked/Empty (Model: {} | Key: #{})", pair.model, pair.key_index);
-                    key_manager_->rotate_key(); 
-                    continue;
-                }
+                if (j["candidates"].empty()) { key_manager_->rotate_key(); continue; }
                 
                 std::string text = j["candidates"][0]["content"]["parts"][0]["text"];
                 
-                // 🚀 SANITIZATION
-                // Remove Markdown
+                // 1. Sanitize Markdown
                 if (text.find("```") != std::string::npos) {
                     size_t start = text.find("```");
                     size_t end = text.rfind("```");
                     if (start != std::string::npos) text = text.substr(text.find('\n', start) + 1);
                     if (end != std::string::npos && end > 0) text = text.substr(0, end);
                 }
-                
-                // Remove Repetitive "main()"
-                if (text.find("void main") != std::string::npos) {
-                    text = ""; // Reject bad completion
+
+                // 2. Smart Overlap Detection
+                // Prevents "std::vec" -> "vector" becoming "std::vecvector"
+                if (!prefix.empty() && !text.empty()) {
+                    size_t check_len = (std::min)((size_t)15, prefix.length());
+                    std::string tail = prefix.substr(prefix.length() - check_len);
+                    
+                    for (size_t i = 0; i < check_len; ++i) {
+                        std::string sub = tail.substr(i);
+                        if (text.find(sub) == 0) {
+                            text = text.substr(sub.length());
+                            break;
+                        }
+                    }
                 }
 
-                if (text.empty()) {
-                    key_manager_->rotate_key(); continue;
-                }
+                // 3. Trim whitespace logic
+                if (!text.empty() && text.back() == '\n') text.pop_back();
 
-                spdlog::info("✅ Ghost: '{}' (Model: {} | Key: #{})", text, pair.model, pair.key_index);
+                spdlog::info("✅ Ghost Generated ({} chars) via {}", text.length(), pair.model);
                 return text;
 
-            } catch(...) { 
-                key_manager_->rotate_key(); continue;
-            }
+            } catch(...) { key_manager_->rotate_key(); continue; }
         }
-
-        // ⚠️ 429: ROTATE KEY
+        
         if (r.status_code == 429) {
-            spdlog::warn("⚠️ 429 Rate Limit (Model: {} | Key: #{}) -> Rotating...", pair.model, pair.key_index);
-            key_manager_->rotate_key();
+            key_manager_->report_rate_limit();
             continue;
         }
-
-        // ❌ 400/404: BAD MODEL -> ROTATE MODEL
-        if (r.status_code == 400 || r.status_code == 404) {
-            spdlog::error("❌ Bad Model '{}' -> Switching Model...", pair.model);
-            key_manager_->rotate_model();
-            continue;
-        }
-
-        // ❌ OTHER: TRY NEXT KEY
-        spdlog::error("❌ API Error {}: {}", r.status_code, r.text.substr(0,50));
         key_manager_->rotate_key();
     }
-
     return "";
 }
 
