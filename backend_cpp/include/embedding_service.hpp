@@ -3,8 +3,9 @@
 #include <vector>
 #include <optional>
 #include <memory>
-#include "cache_manager.hpp"
+
 #include "KeyManager.hpp" 
+#include "cache_manager.hpp"
 
 namespace code_assistance {
 
@@ -32,7 +33,12 @@ public:
     std::vector<float> generate_embedding(const std::string& text);
     std::vector<std::vector<float>> generate_embeddings_batch(const std::vector<std::string>& texts);
     std::string generate_text(const std::string& prompt);
-    std::string generate_autocomplete(const std::string& prefix);
+    std::string generate_autocomplete(
+        const std::string& prefix, 
+        const std::string& suffix, 
+        const std::string& project_context,
+        const std::string& current_file_path 
+    );
     GenerationResult generate_text_elite(const std::string& prompt); 
     VisionResult analyze_vision(const std::string& prompt, const std::string& base64_image);
 

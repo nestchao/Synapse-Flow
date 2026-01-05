@@ -373,19 +373,23 @@ SyncResult SyncService::perform_sync(
     std::unordered_map<std::string, std::string> new_manifest;
     std::vector<std::shared_ptr<CodeNode>> nodes_to_embed;
     std::ofstream full_context_file(storage_dir / "_full_context.txt");
+    full_context_file << "### AGGREGATED SOURCE CONTEXT\n";
 
     for (const auto& file_path : files_to_process) {
         std::string rel_path_str = fs::relative(file_path, source_dir).generic_string();
         std::string current_hash = calculate_file_hash(file_path);
         std::string old_hash = manifest.count(rel_path_str) ? manifest.at(rel_path_str) : "";
         
-        bool is_changed = (current_hash != old_hash);
-        new_manifest[rel_path_str] = current_hash;
-
-        // 1. Context Reassembly (Always update full context for the agent)
+        // 1. Read Content
         std::ifstream file_in(file_path);
         std::string content((std::istreambuf_iterator<char>(file_in)), std::istreambuf_iterator<char>());
+        
+        // 🚀 APPEND TO FULL CONTEXT STREAM
+        // This runs for EVERY file in the scan list to ensure the context file is complete
         full_context_file << "\n\n--- FILE: " << rel_path_str << " ---\n" << content << "\n";
+
+        bool is_changed = (current_hash != old_hash);
+        new_manifest[rel_path_str] = current_hash;
 
         // 2. Node Generation
         if (is_changed) {
@@ -405,6 +409,8 @@ SyncResult SyncService::perform_sync(
             }
         }
     }
+
+    full_context_file.close();
 
     // 🚀 PHASE 4: VECTOR & METADATA FINALIZATION
     if (!nodes_to_embed.empty()) {
