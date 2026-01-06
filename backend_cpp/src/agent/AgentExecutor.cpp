@@ -97,21 +97,29 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     code_assistance::GenerationResult last_gen; 
     std::string final_output = "Mission Timed Out.";
     
+    std::string last_error = "";
+
     int max_steps = 10;
     
     for (int step = 0; step < max_steps; ++step) {
+        // 🚀 DYNAMIC PROMPTING
         std::string prompt = 
             "### ROLE: Synapse Autonomous Pilot\n"
             "### TOOLS\n" + tool_manifest + "\n\n"
-            "### MISSION\n" + req.prompt() + "\n\n"
-            "### PROTOCOL\n"
-            "1. Format calls as JSON: {\"tool\": \"name\", \"parameters\": {...}}\n"
-            "2. If answer found, use FINAL_ANSWER.\n";
+            "### MISSION\n" + req.prompt() + "\n\n";
 
         if (!internal_monologue.empty()) {
-            prompt += "\n### HISTORY\n" + internal_monologue;
+            prompt += "### FLIGHT LOG (HISTORY)\n" + internal_monologue + "\n";
         }
-        prompt += "\nNEXT ACTION:";
+
+        // 🧠 STEP-BACK REASONING INJECTION
+        if (!last_error.empty()) {
+            prompt += "\n### ⚠️ CRITICAL ALERT\n"
+                      "The previous action FAILED with: " + last_error + "\n"
+                      "PROTOCOL: Analyze the error. Change your strategy. Do NOT repeat the same action.\n";
+        }
+
+        prompt += "\nNEXT ACTION (JSON):";
 
         last_gen = ai_service_->generate_text_elite(prompt);
         
@@ -151,6 +159,15 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             
             if (tool_name == "read_file" && !observation.starts_with("ERROR")) {
                 ctx.focal_code += "\nFile: " + params.value("path", "") + "\n" + observation;
+            }
+
+            if (observation.find("ERROR:") == 0) {
+                last_error = observation;
+                // Add a "Thought" marker to the history so the AI sees it failed
+                internal_monologue += "\n[SYSTEM ALERT: Action Failed. Error: " + last_error + "]";
+            } else {
+                last_error = ""; // Clear error on success
+                internal_monologue += "\n[RESULT: " + tool_name + "]\n" + observation;
             }
 
             internal_monologue += "\n[RESULT: " + tool_name + "]\n" + observation;
