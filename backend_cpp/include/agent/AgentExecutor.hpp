@@ -39,6 +39,12 @@ private:
     // 🚀 FIXED: Ensure duration_ms is the 4th argument
     void notify(::grpc::ServerWriter<::code_assistance::AgentResponse>* w, const std::string& phase, const std::string& msg, double duration_ms = 0.0);
     bool check_reflection(const std::string& query, const std::string& topo, std::string& reason);
+
+    std::string construct_reasoning_prompt(
+        const std::string& task, 
+        const std::string& history, 
+        const std::string& last_error
+    );
 };
 
 }
