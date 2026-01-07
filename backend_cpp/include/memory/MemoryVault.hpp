@@ -1,72 +1,87 @@
-// backend_cpp/include/memory/MemoryVault.hpp
 #pragma once
 #include <string>
 #include <vector>
-#include <mutex>
-#include <nlohmann/json.hpp>
+#include <memory>
+#include <filesystem>
 #include <spdlog/spdlog.h>
-#include "faiss_vector_store.hpp" // Reuse our wrapper
+#include "faiss_vector_store.hpp"
 
 namespace code_assistance {
 
-struct Experience {
-    std::string id;
-    std::string prompt;
-    std::string solution;
-    double outcome_score; // 1.0 = Success, -1.0 = Rejected
-    std::vector<float> embedding;
-};
+namespace fs = std::filesystem;
 
 class MemoryVault {
 public:
-    MemoryVault(const std::string& storage_path) : path_(storage_path) {
-        // Initialize distinct index for experiences
-        store_ = std::make_unique<FaissVectorStore>(768); 
+    MemoryVault(const std::string& storage_path, int dimension = 768) 
+        : path_(storage_path) {
+        // Reuse the robust FAISS wrapper we built for code
+        store_ = std::make_shared<FaissVectorStore>(dimension);
         load();
     }
 
-    void add_experience(const std::string& prompt, const std::string& solution, 
-                        const std::vector<float>& embedding, bool success) {
-        std::lock_guard<std::mutex> lock(mtx_);
+    // 🧠 STORE: Save a successful interaction
+    void add_experience(const std::string& user_intent, const std::string& successful_action, 
+                       const std::vector<float>& embedding, double quality_score) {
+        auto node = std::make_shared<CodeNode>();
+        // Unique ID based on timestamp
+        node->id = "EXP_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        node->name = "Experience_Entry";
         
-        auto exp = std::make_shared<CodeNode>(); // Reusing CodeNode structure for simplicity
-        exp->id = "EXP_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-        exp->content = solution; // Store solution in content
-        exp->docstring = prompt; // Store prompt in docstring
-        exp->embedding = embedding;
-        exp->weights["outcome"] = success ? 1.0 : -1.0;
-
-        store_->add_nodes({exp});
-        spdlog::info("🧠 Experience Vault: Learned new {} pattern.", success ? "positive" : "negative");
+        // We hijack the CodeNode fields for memory storage:
+        node->docstring = user_intent;       // The Trigger (Problem)
+        node->content = successful_action;   // The Solution (Fix)
+        node->embedding = embedding;         // The Vector DNA
+        node->weights["quality"] = quality_score;
+        
+        store_->add_nodes({node});
+        save();
+        spdlog::info("🧠 Experience Vault: Synapse learned a new pattern. Total Memories: {}", store_->get_all_nodes().size());
     }
 
-    std::vector<std::string> recall_relevant(const std::vector<float>& query_vec) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto results = store_->search(query_vec, 3); // Top 3 relevant memories
-        
-        std::vector<std::string> insights;
+    // 🧠 RECALL: Find similar past problems
+    std::string recall(const std::vector<float>& query_vec) {
+        if (!store_ || store_->get_all_nodes().empty()) return "";
+
+        // Search for the 2 most relevant memories
+        auto results = store_->search(query_vec, 2); 
+        if (results.empty()) return "";
+
+        std::string memory_block = "\n### 🧠 LONG-TERM MEMORY (Past Successes)\n";
+        bool found = false;
+
         for (const auto& res : results) {
-            double outcome = res.node->weights.count("outcome") ? res.node->weights["outcome"] : 0.0;
-            std::string type = (outcome > 0) ? "SUCCESSFUL STRATEGY" : "FAILED ATTEMPT";
-            
-            insights.push_back("[" + type + "] Context: " + res.node->docstring + "\nResult: " + res.node->content);
+            // L2 Distance threshold: Lower is closer. 
+            // 1.5 is a loose match, 0.5 is an exact match.
+            if (res.faiss_score < 1.3) { 
+                 found = true;
+                 memory_block += "- SITUATION: " + res.node->docstring + "\n"
+                                 "  SOLUTION: " + res.node->content + "\n"
+                                 "  (Confidence: " + std::to_string(res.node->weights["quality"]) + ")\n\n";
+            }
         }
-        return insights;
-    }
-
-    void save() {
-        // In a real implementation, we'd serialize to disk here
-        // store_->save(path_);
+        
+        return found ? memory_block : "";
     }
 
 private:
+    void save() {
+        if (!fs::exists(path_)) fs::create_directories(path_);
+        store_->save(path_);
+    }
+
     void load() {
-        // store_->load(path_);
+        if (fs::exists(path_ + "/faiss.index")) {
+            try { 
+                store_->load(path_); 
+                spdlog::info("🧠 Memory Vault Loaded: {} items", store_->get_all_nodes().size());
+            } catch(...) { 
+                spdlog::warn("⚠️ Memory Vault corrupted or version mismatch. Starting fresh."); 
+            }
+        }
     }
 
     std::string path_;
-    std::unique_ptr<FaissVectorStore> store_;
-    std::mutex mtx_;
+    std::shared_ptr<FaissVectorStore> store_;
 };
 
 }
