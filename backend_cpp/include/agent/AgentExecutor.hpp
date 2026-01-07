@@ -24,7 +24,6 @@ public:
     );
 
     static std::string find_project_root();
-
     std::string run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer);
     std::string run_autonomous_loop_internal(const nlohmann::json& body);
     void determineContextStrategy(const std::string& query, ContextSnapshot& ctx, const std::string& project_id);
@@ -35,8 +34,8 @@ private:
     std::shared_ptr<SubAgent> sub_agent_;
     std::shared_ptr<ToolRegistry> tool_registry_;
     std::unique_ptr<ContextManager> context_mgr_;
+    std::unique_ptr<MemoryVault> memory_vault_;
 
-    // 🚀 FIXED: Ensure duration_ms is the 4th argument
     void notify(::grpc::ServerWriter<::code_assistance::AgentResponse>* w, const std::string& phase, const std::string& msg, double duration_ms = 0.0);
     bool check_reflection(const std::string& query, const std::string& topo, std::string& reason);
 
