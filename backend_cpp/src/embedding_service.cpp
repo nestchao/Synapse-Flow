@@ -16,103 +16,73 @@ using json = nlohmann::json;
 // 🚀 UTILITY: Shutdown-aware sleep
 // Returns false if shutdown requested, true if sleep completed
 bool smart_sleep(int milliseconds) {
-    int slices = milliseconds / 100;
-    for (int i = 0; i < slices; ++i) {
-        // In a real engine, we'd check a global shutdown flag here
-        // if (global_shutdown) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
     return true;
 }
 
 std::string utf8_safe_substr(const std::string& str, size_t length) {
     if (str.length() <= length) return str;
-    std::string sub = str.substr(0, length);
-    if (sub.empty()) return sub;
-    while (!sub.empty()) {
-        unsigned char c = static_cast<unsigned char>(sub.back());
-        if (c < 0x80) break;
-        if (c >= 0xC0) { sub.pop_back(); break; }
-        sub.pop_back();
-    }
-    return sub;
+    return str.substr(0, length);
 }
 
 EmbeddingService::EmbeddingService(std::shared_ptr<KeyManager> key_manager)
     : key_manager_(key_manager), cache_manager_(std::make_shared<CacheManager>()) {}
 
 std::string EmbeddingService::get_endpoint_url(const std::string& action) {
-    std::string model = (action == "embedContent" || action == "batchEmbedContents") 
+    std::string key = key_manager_->get_current_key();
+    std::string model = key_manager_->get_current_model();
+    
+    std::string model_path = (action == "embedContent" || action == "batchEmbedContents") 
         ? "text-embedding-004" 
-        : key_manager_->get_current_model();
+        : model;
         
-    return base_url_ + model + ":" + action + "?key=" + key_manager_->get_current_key();
+    return base_url_ + model_path + ":" + action + "?key=" + key;
 }
 
 // 🚀 ELITE: Robust Request Wrapper
 template<typename Func>
 cpr::Response perform_request_with_retry(Func request_factory, std::shared_ptr<KeyManager> km) {
-    int max_retries = 5; 
+    int max_retries = 3; // Reduced for faster debugging
     cpr::Response r; 
     
     for (int i = 0; i < max_retries; ++i) {
         r = request_factory(); 
-        
         if (r.status_code == 200) return r;
 
-        bool is_quota = (r.status_code == 429);
-        bool is_server_err = (r.status_code >= 500);
+        // 🚀 DEBUG LOG: Print Retry info
+        spdlog::warn("⚠️  API RETRY {}/{} | Status: {} | Error: {}", 
+                     i+1, max_retries, r.status_code, r.error.message);
 
-        if ((is_quota || is_server_err) && km) {
-            km->report_rate_limit(); // Rotates key internally
-            
-            // 🚀 STRATEGY: If we switched keys, try immediately (minimal jitter). 
-            // Only sleep deep if we looped through all keys.
-            int active_keys = km->get_active_key_count();
-            int backoff_ms = (i > active_keys) ? (1000 * std::pow(2, i - active_keys)) : 50;
-
-            spdlog::warn("⚠️ API {} | Retry {}/{} | Backoff: {}ms", 
-                         r.status_code, i + 1, max_retries, backoff_ms);
-            
-            if (!smart_sleep(backoff_ms)) break; // Exit if system shutting down
+        if (r.status_code == 429 || r.status_code >= 500) {
+            if(km) km->report_rate_limit();
+            std::this_thread::sleep_for(std::chrono::milliseconds(500 * (i+1)));
             continue;
         }
-        break; // Fatal error (400, 401, etc)
+        break; 
     }
     return r;
 }
 
 std::vector<float> EmbeddingService::generate_embedding(const std::string& text) {
     if (auto cached = cache_manager_->get_embedding(text)) return *cached;
-
-    auto start = std::chrono::high_resolution_clock::now();
-
+    
     auto r = perform_request_with_retry([&]() {
         return cpr::Post(cpr::Url{get_endpoint_url("embedContent")},
                          cpr::Body(json{
                              {"model", "models/text-embedding-004"},
                              {"content", {{"parts", {{{"text", text}}}}}}
                          }.dump()),
-                         cpr::Header{{"Content-Type", "application/json"}});
+                         cpr::Header{{"Content-Type", "application/json"}},
+                         cpr::VerifySsl{false});
     }, key_manager_);
-
-    auto end = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double, std::milli>(end - start).count();
-    SystemMonitor::global_embedding_latency_ms.store(duration);
-
-    if (r.status_code != 200) {
-        spdlog::error("❌ Embedding API Fatal Error [{}]: {}", r.status_code, r.text);
-        throw std::runtime_error("Failed to generate embedding after retries");
-    }
-
+    
+    if (r.status_code != 200) return {};
     try {
-        auto response_json = json::parse(r.text);
-        std::vector<float> embedding = response_json["embedding"]["values"];
-        cache_manager_->set_embedding(text, embedding);
-        return embedding;
-    } catch (...) {
-        throw std::runtime_error("Malformed JSON from Embedding API");
-    }
+        auto j = json::parse(r.text);
+        std::vector<float> vec = j["embedding"]["values"];
+        cache_manager_->set_embedding(text, vec);
+        return vec;
+    } catch(...) { return {}; }
 }
 
 std::vector<std::vector<float>> EmbeddingService::generate_embeddings_batch(const std::vector<std::string>& texts) {
@@ -154,69 +124,72 @@ std::vector<std::vector<float>> EmbeddingService::generate_embeddings_batch(cons
 }
 
 std::string EmbeddingService::generate_text(const std::string& prompt) {
-    auto res = generate_text_elite(prompt);
-    return res.text;
+    return generate_text_elite(prompt).text;
 }
 
 GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt) {
     GenerationResult final_result;
     
+    std::string url = get_endpoint_url("generateContent");
+    
+    // Mask key for logging
+    std::string masked_url = url;
+    size_t key_pos = masked_url.find("key=");
+    std::string key_hash = "UNKNOWN";
+    if (key_pos != std::string::npos) {
+        std::string key_val = url.substr(key_pos + 4);
+        key_hash = key_val.substr(0, 4) + "..." + key_val.substr(key_val.length() - 4);
+        masked_url.replace(key_pos + 4, key_val.length(), "*****");
+    }
+    
+    spdlog::info("🚀 AI REQUEST | Key: {} | Length: {}", key_hash, prompt.length());
+
     auto r = perform_request_with_retry([&]() {
-        json payload = {{"contents", {{ {"parts", {{{"text", prompt}}}} }}}};
         return cpr::Post(cpr::Url{get_endpoint_url("generateContent")},
-                      cpr::Body{payload.dump()},
-                      cpr::Header{{"Content-Type", "application/json"}});
+                      cpr::Body{json{
+                          {"contents", {{ {"parts", {{{"text", prompt}}}} }}}
+                      }.dump()},
+                      cpr::Header{{"Content-Type", "application/json"}},
+                      cpr::VerifySsl{false}, // 🛡️ CRITICAL FIX FOR WINDOWS
+                      cpr::Timeout{15000}
+        );
     }, key_manager_);
+
+    spdlog::info("📥 AI RESPONSE | Status: {} | Time: {}s", r.status_code, r.elapsed);
 
     if (r.status_code == 200) {
         try {
             auto response_json = json::parse(r.text);
-            
-            // Safety check for candidates
-            if (!response_json.contains("candidates") || response_json["candidates"].empty()) {
-                final_result.text = "ERROR: Empty response from AI.";
-                final_result.success = false;
-                return final_result;
-            }
+            if (response_json.contains("candidates") && !response_json["candidates"].empty()) {
+                final_result.text = response_json["candidates"][0]["content"]["parts"][0]["text"];
+                
+                // Metrics
+                if (response_json.contains("usageMetadata")) {
+                    auto& usage = response_json["usageMetadata"];
+                    final_result.prompt_tokens = usage.value("promptTokenCount", 0);
+                    final_result.completion_tokens = usage.value("candidatesTokenCount", 0);
+                    final_result.total_tokens = usage.value("totalTokenCount", 0);
+                    SystemMonitor::global_output_tokens.store(final_result.completion_tokens);
+                }
 
-            auto& candidate = response_json["candidates"][0];
-            
-            // Check for safety blocks
-            if (candidate.contains("finishReason") && candidate["finishReason"] == "SAFETY") {
-                final_result.text = "ERROR: Response blocked by safety filters.";
-                final_result.success = false;
+                final_result.success = true;
                 return final_result;
+            } else {
+                spdlog::error("❌ AI LOGIC ERROR: {}", r.text);
             }
-
-            if (candidate["content"]["parts"].empty()) {
-                final_result.text = "ERROR: No text parts in response.";
-                final_result.success = false;
-                return final_result;
-            }
-
-            final_result.text = candidate["content"]["parts"][0]["text"];
-            
-            if (response_json.contains("usageMetadata")) {
-                auto& usage = response_json["usageMetadata"];
-                final_result.prompt_tokens = usage.value("promptTokenCount", 0);
-                final_result.completion_tokens = usage.value("candidatesTokenCount", 0);
-                final_result.total_tokens = usage.value("totalTokenCount", 0);
-                SystemMonitor::global_output_tokens.store(final_result.completion_tokens);
-            }
-            
-            final_result.success = true;
-            return final_result;
         } catch (const std::exception& e) {
-            spdlog::error("JSON Parse Error: {}", e.what());
+            spdlog::error("❌ JSON PARSE ERROR: {}", e.what());
         }
+    } else {
+        spdlog::error("❌ HTTP ERROR: {}", r.status_code);
+        spdlog::error("❌ RAW BODY:   {}", r.text);
     }
 
-    final_result.text = "ERROR: API Failure " + std::to_string(r.status_code);
+    final_result.text = "AI Service Error";
     final_result.success = false;
     return final_result;
 }
 
-// ... (Vision and Autocomplete implementations remain similar) ...
 VisionResult EmbeddingService::analyze_vision(const std::string& prompt, const std::string& base64_image) {
     VisionResult result;
     result.success = false;

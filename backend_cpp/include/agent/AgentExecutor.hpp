@@ -11,6 +11,7 @@
 #include "agent/SubAgent.hpp"
 #include "tools/ToolRegistry.hpp"
 #include "agent/ContextManager.hpp"
+#include "memory/MemoryVault.hpp"
 
 namespace code_assistance {
 
