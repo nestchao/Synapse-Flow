@@ -15,6 +15,7 @@
 #include "PrefixTrie.hpp"
 #include "code_graph.hpp"
 #include "sync_service.hpp"
+#include "parser_elite.hpp" 
 #include "embedding_service.hpp"
 
 namespace code_assistance {
@@ -375,6 +376,8 @@ SyncResult SyncService::perform_sync(
     std::ofstream full_context_file(storage_dir / "_full_context.txt");
     full_context_file << "### AGGREGATED SOURCE CONTEXT\n";
 
+    code_assistance::elite::ASTBooster ast_parser;
+
     for (const auto& file_path : files_to_process) {
         std::string rel_path_str = fs::relative(file_path, source_dir).generic_string();
         std::string current_hash = calculate_file_hash(file_path);
@@ -395,13 +398,43 @@ SyncResult SyncService::perform_sync(
         if (is_changed) {
             spdlog::info("🔼 UPDATE: {}", rel_path_str);
             result.logs.push_back("UPDATE: " + rel_path_str);
-            auto new_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
-            for (auto& n : new_nodes) {
+            
+            std::vector<CodeNode> raw_nodes;
+            fs::path p(rel_path_str);
+            std::string ext = p.extension().string();
+
+            // 🚀 HYBRID PARSING LOGIC
+            // Use Tree-sitter for structured languages
+            if (ext == ".cpp" || ext == ".hpp" || ext == ".py" || ext == ".ts" || ext == ".js") {
+                raw_nodes = ast_parser.extract_symbols(rel_path_str, content);
+                if(raw_nodes.empty()) {
+                    // Fallback if AST extraction returns nothing (e.g. empty file)
+                    raw_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
+                }
+            } else {
+                // Use Regex for others
+                raw_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
+            }
+
+            // Always add the file itself as a node for "Full Context" retrieval
+            if (raw_nodes.empty() || raw_nodes[0].type != "file") {
+                CodeNode file_node;
+                file_node.name = p.filename().string();
+                file_node.file_path = rel_path_str;
+                file_node.id = rel_path_str;
+                file_node.content = content;
+                file_node.type = "file";
+                file_node.weights["structural"] = 1.0;
+                raw_nodes.push_back(file_node);
+            }
+
+            for (auto& n : raw_nodes) {
                 auto ptr = std::make_shared<CodeNode>(n);
                 result.nodes.push_back(ptr);
                 nodes_to_embed.push_back(ptr);
             }
             result.updated_count++;
+            
         } else {
             // Recover from existing map to avoid re-embedding
             for (const auto& [id, node] : existing_nodes_map) {

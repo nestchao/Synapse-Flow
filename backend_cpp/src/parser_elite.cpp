@@ -2,12 +2,16 @@
 #include <tree_sitter/api.h>
 #include <spdlog/spdlog.h>
 #include <stack>
+#include <filesystem>
 
-// 🚀 EXTERNAL LINKING
+// 🚀 EXTERNAL SYMBOL LINKING
+// NOTE: TS, JS, and JSON are disabled until their grammar libs are linked.
 extern "C" {
-    const TSLanguage* tree_sitter_cpp();
-    const TSLanguage* tree_sitter_python();
-    // const TSLanguage* tree_sitter_typescript(); // <--- COMMENT THIS OUT
+    TSLanguage* tree_sitter_cpp();
+    TSLanguage* tree_sitter_python();
+    // TSLanguage* tree_sitter_typescript(); // 🔴 DISABLED
+    // TSLanguage* tree_sitter_javascript(); // 🔴 DISABLED
+    // TSLanguage* tree_sitter_json();       // 🔴 DISABLED (This was causing LNK2019)
 }
 
 namespace code_assistance::elite {
@@ -24,8 +28,10 @@ const TSLanguage* ASTBooster::get_lang(const std::string& ext) {
     if (ext == ".cpp" || ext == ".hpp" || ext == ".h" || ext == ".cc") return tree_sitter_cpp();
     if (ext == ".py") return tree_sitter_python();
     
-    // 🚀 TEMPORARILY DISABLED until TS grammar is fully linked
-    // if (ext == ".ts" || ext == ".js" || ext == ".tsx" || ext == ".jsx") return tree_sitter_typescript();
+    // 🔴 DISABLED: Re-enable these once you compile parser.c for these langs
+    // if (ext == ".ts" || ext == ".tsx") return tree_sitter_typescript();
+    // if (ext == ".js" || ext == ".jsx") return tree_sitter_javascript();
+    // if (ext == ".json") return tree_sitter_json(); // 🔴 MUST BE COMMENTED OUT
     
     return nullptr;
 }
@@ -52,11 +58,11 @@ bool ASTBooster::validate_syntax(const std::string& content, const std::string& 
     return !has_error;
 }
 
-// ... rest of file (extract_symbols) ...
 std::vector<CodeNode> ASTBooster::extract_symbols(const std::string& path, const std::string& content) {
     std::vector<CodeNode> nodes;
     std::string ext = std::filesystem::path(path).extension().string();
     const TSLanguage* lang = get_lang(ext);
+    
     if (!lang) return {}; // Returns empty vector if language not supported
 
     ts_parser_set_language(parser_, lang);
@@ -72,25 +78,39 @@ std::vector<CodeNode> ASTBooster::extract_symbols(const std::string& path, const
 
         std::string type = ts_node_type(node);
         
-        if (type == "function_definition" || type == "class_specifier" || 
-            type == "method_definition" || type == "function_item" || type == "struct_specifier") {
-            
+        bool is_symbol = (
+            type == "function_definition" || 
+            type == "class_specifier" || 
+            type == "class_definition" ||
+            type == "method_definition" || 
+            type == "struct_specifier"
+        );
+        
+        if (is_symbol) {
             CodeNode info;
-            info.name = "unnamed_symbol";
-            info.type = type;
             info.file_path = path;
+            info.type = type;
 
+            info.name = "anonymous";
             uint32_t child_count = ts_node_child_count(node);
             for (uint32_t i = 0; i < child_count; i++) {
                 TSNode child = ts_node_child(node, i);
                 std::string c_type = ts_node_type(child);
-                if (c_type == "identifier" || c_type == "field_identifier" || c_type == "type_identifier") {
+                if (c_type == "identifier" || c_type == "type_identifier" || c_type == "name") {
                     uint32_t start = ts_node_start_byte(child);
                     uint32_t end = ts_node_end_byte(child);
                     info.name = content.substr(start, end - start);
                     break;
                 }
             }
+
+            uint32_t start = ts_node_start_byte(node);
+            uint32_t end = ts_node_end_byte(node);
+            info.content = content.substr(start, end - start);
+            
+            info.id = path + "::" + info.name;
+            info.weights["structural"] = 0.8;
+
             nodes.push_back(info);
         }
 

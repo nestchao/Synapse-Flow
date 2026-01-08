@@ -119,7 +119,8 @@ public:
     }
 
     void rotate_key() {
-        current_key_index++;
+        size_t prev = current_key_index.fetch_add(1);
+        spdlog::info("🔄 Manual Key Rotation: {} -> {}", prev % key_pool.size(), (prev + 1) % key_pool.size());
     }
 
     void rotate_model() {
@@ -135,18 +136,22 @@ public:
         
         size_t idx = current_key_index.load() % key_pool.size();
         
-        // Only penalize if currently considered active
         if (key_pool[idx].is_active) {
             key_pool[idx].fail_count++;
+            spdlog::warn("⚠️ Key #{} Rate Limited (Fail Count: {})", idx, key_pool[idx].fail_count);
             
-            // Tolerance threshold (allow 2 failures before ban)
             if (key_pool[idx].fail_count > 2) {
                 key_pool[idx].is_active = false;
-                spdlog::warn("⚠️ Key #{} Decommissioned due to Rate Limits", idx);
+                spdlog::error("💀 Key #{} Decommissioned due to excessive failures.", idx);
             }
         }
         
-        // 🚀 PHOENIX PROTOCOL: Check if we have burned the entire inventory
+        // Force move to next key
+        current_key_index++;
+        size_t next = current_key_index.load() % key_pool.size();
+        spdlog::info("🔄 Auto-Rotating to Key #{}", next);
+
+        // 🚀 PHOENIX PROTOCOL: Revive if all are dead
         bool any_active = false;
         for(const auto& k : key_pool) {
             if(k.is_active) { any_active = true; break; }
@@ -154,15 +159,11 @@ public:
         
         if (!any_active) {
             spdlog::error("🔥 PHOENIX PROTOCOL: All keys exhausted. Reviving Vault.");
-            // Reset everything to give it another shot
             for(auto& k : key_pool) { 
                 k.is_active = true; 
                 k.fail_count = 0; 
             }
         }
-
-        // Move to next key immediately
-        current_key_index++;
     }
 
     size_t get_active_key_count() const {

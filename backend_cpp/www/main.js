@@ -152,5 +152,50 @@ function escapeHtml(text) {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+async function updateAgentTrace() {
+    try {
+        const res = await fetch('/api/admin/telemetry');
+        const data = await res.json();
+        
+        // Safety check for logs
+        const traces = data.agent_traces || [];
+        if (traces.length === 0) return;
+
+        // NEW: Only update if we have new data to save DOM operations
+        const container = document.getElementById('trace-list');
+        const currentHTML = container.innerHTML;
+        
+        // Generate HTML
+        const newHTML = traces.slice().reverse().map(t => {
+            let colorClass = 'status-live';
+            let icon = 'fa-circle';
+            
+            // 🎨 Phase 3 Visualization Logic
+            if (t.state === 'ERROR_CATCH') { colorClass = 'status-error'; icon = 'fa-exclamation-triangle'; }
+            else if (t.state === 'TOOL_EXEC') { colorClass = 'status-tool'; icon = 'fa-cog'; }
+            else if (t.state === 'THINKING') { colorClass = 'status-think'; icon = 'fa-brain'; }
+            else if (t.state === 'FINAL') { colorClass = 'status-success'; icon = 'fa-flag-checkered'; }
+
+            return `
+                <div class="trace-item">
+                    <div class="trace-phase ${colorClass}">
+                        <i class="fas ${icon}"></i> ${t.state}
+                    </div>
+                    <div class="trace-payload">
+                        ${escapeHtml(t.detail)}
+                    </div>
+                    <div class="trace-time">${t.duration ? t.duration.toFixed(0) + 'ms' : ''}</div>
+                </div>
+            `;
+        }).join('');
+
+        // Simple diff to prevent flicker
+        if (newHTML.length !== currentHTML.length) {
+            container.innerHTML = newHTML;
+        }
+
+    } catch (e) { console.error("Trace Fetch Error", e); }
+}
+
 setInterval(pollTelemetry, 1000);
 pollTelemetry();

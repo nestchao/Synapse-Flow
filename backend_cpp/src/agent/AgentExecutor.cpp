@@ -30,31 +30,34 @@ AgentExecutor::AgentExecutor(
 
 // --- HELPERS ---
 nlohmann::json extract_json(const std::string& raw) {
+    std::string clean = raw;
+    
+    // 1. Strip Markdown
+    size_t code_start = clean.find("```json");
+    if (code_start != std::string::npos) {
+        size_t code_end = clean.find("```", code_start + 7);
+        if (code_end != std::string::npos) clean = clean.substr(code_start + 7, code_end - (code_start + 7));
+    }
+
     try {
-        std::stack<char> braces;
-        size_t start = std::string::npos;
-        size_t end = std::string::npos;
-
-        for (size_t i = 0; i < raw.length(); ++i) {
-            if (raw[i] == '{') {
-                if (braces.empty()) start = i;
-                braces.push('{');
-            } else if (raw[i] == '}') {
-                if (!braces.empty()) {
-                    braces.pop();
-                    if (braces.empty()) {
-                        end = i;
-                        break; 
-                    }
-                }
-            }
-        }
-
+        size_t start = clean.find("{");
+        size_t end = clean.rfind("}");
         if (start != std::string::npos && end != std::string::npos) {
-            std::string clean_json = raw.substr(start, end - start + 1);
-            return nlohmann::json::parse(clean_json);
+            return nlohmann::json::parse(clean.substr(start, end - start + 1));
         }
     } catch (...) {}
+
+    // 2. Python-Style Fallback
+    try {
+        if (raw.find("read_file") != std::string::npos) {
+            std::regex path_re(R"(path=['"]([^'"]+)['"])");
+            std::smatch match;
+            if (std::regex_search(raw, match, path_re)) {
+                return {{"thought", "Correcting python-style output..."}, {"tool", "read_file"}, {"parameters", {{"path", match[1].str()}}}};
+            }
+        }
+    } catch(...) {}
+
     return nlohmann::json::object();
 }
 
@@ -77,7 +80,6 @@ void AgentExecutor::notify(::grpc::ServerWriter<::code_assistance::AgentResponse
         res.set_payload(msg);
         w->Write(res);
     }
-    // Also push to trace log
     code_assistance::LogManager::instance().add_trace({"AGENT", "", phase, msg, duration_ms});
 }
 
@@ -85,11 +87,6 @@ void AgentExecutor::notify(::grpc::ServerWriter<::code_assistance::AgentResponse
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
     
-    ContextSnapshot ctx; 
-    ctx.history = ""; 
-    ctx.architectural_map = ""; 
-    ctx.focal_code = "";
-
     std::string tool_manifest = tool_registry_->get_manifest();
     std::string internal_monologue = "";
     std::unordered_set<size_t> action_history;
@@ -97,73 +94,63 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
     code_assistance::GenerationResult last_gen; 
     std::string final_output = "Mission Timed Out.";
-    std::string last_error = ""; // 🧠 SHORT-TERM FAILURE MEMORY
-
-    std::vector<float> prompt_embedding = ai_service_->generate_embedding(req.prompt());
-    std::string memories = memory_vault_->recall(prompt_embedding);
+    std::string last_error = ""; 
 
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
-    std::string relevant_memories = memory_vault_->recall(prompt_vec);
+    std::string memories = memory_vault_->recall(prompt_vec);
     
-    if (!memories.empty()) {
-        ctx.history += "\n[SYSTEM: I have handled similar tasks before. Consult MEMORY section.]\n";
-    }
-    
-    int max_steps = 8; // Reduce steps to force efficiency
+    int max_steps = 8;
     
     for (int step = 0; step < max_steps; ++step) {
-        // 🚀 DYNAMIC PROMPT CONSTRUCTION
+        
+        // 🚀 PHASE 4: COGNITIVE PROMPT (Chain of Thought)
         std::string prompt = 
-            "### ROLE: Synapse Autonomous Pilot\n"
-            "### TOOLS\n" + tool_manifest + "\n\n"
-            "### MISSION\n" + req.prompt() + "\n\n"
-            "### PROTOCOL\n"
-            "1. Format calls as JSON: {\"tool\": \"name\", \"parameters\": {...}}\n"
-            "2. If answer found, use FINAL_ANSWER.\n"
-            "3. If a tool fails, ANALYZE the error and FIX your parameters.\n";
+            "### SYSTEM ROLE\n"
+            "You are a C++ Autonomous Agent. You MUST plan before you act.\n\n"
+            "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
+            "### OBJECTIVE\n" + req.prompt() + "\n\n"
+            "### RESPONSE FORMAT (STRICT JSON)\n"
+            "{\n"
+            "  \"thought\": \"Briefly explain your reasoning here...\",\n"
+            "  \"tool\": \"tool_name\",\n"
+            "  \"parameters\": { ... }\n"
+            "}\n\n";
 
-        if (!memories.empty()) {
-            prompt += memories + "\n"; // Inject Past Successes
-        }
+        if (!memories.empty()) prompt += "### MEMORY\n" + memories + "\n"; 
+        if (!internal_monologue.empty()) prompt += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
 
-        if (!relevant_memories.empty()) {
-            prompt += relevant_memories; // The AI now sees its past victories
-        }
-
-        if (!internal_monologue.empty()) {
-            prompt += "### FLIGHT LOG (HISTORY)\n" + internal_monologue + "\n";
-        }
-
-        // 🧠 CRITICAL: INJECT ERROR FEEDBACK
         if (!last_error.empty()) {
-            prompt += "\n\n### ⚠️ CRITICAL SYSTEM ALERT\n"
-                      "The previous action FAILED. Error Trace:\n" + last_error + "\n"
-                      "INSTRUCTION: You MUST change your approach. Do not repeat the same invalid input.\n";
+            prompt += "\n### ⚠️ PREVIOUS ERROR\nTrace: " + last_error + "\nREQUIRED: Analyze the error in your 'thought' field and pivot strategy.\n";
         }
 
-        prompt += "\nNEXT ACTION (JSON):";
+        prompt += "\nNEXT JSON ACTION:";
 
+        this->notify(writer, "THINKING", "Planning next move...");
         last_gen = ai_service_->generate_text_elite(prompt);
         
         if (!last_gen.success) {
-            this->notify(writer, "ERROR", "AI Service Unreachable");
+            this->notify(writer, "FATAL", "Neural Link Severed");
             return "ERROR: AI Service Failure";
         }
 
-        std::string thought = last_gen.text;
-        this->notify(writer, "THOUGHT", "Step " + std::to_string(step + 1));
-
-        nlohmann::json action = extract_json(thought);
+        std::string raw_thought = last_gen.text;
+        nlohmann::json action = extract_json(raw_thought);
         
         if (action.contains("tool")) {
             std::string tool_name = action["tool"];
+            std::string reasoning = action.value("thought", "No reasoning provided.");
             
+            // 🚀 LOG REASONING
+            spdlog::info("🧠 STEP {}: {}", step+1, reasoning);
+            this->notify(writer, "PLANNING", reasoning); // Send thought to Dashboard
+
             // Loop Detection
             std::string action_sig = tool_name + action["parameters"].dump();
             size_t action_hash = hasher(action_sig);
             
             if (action_history.count(action_hash) && last_error.empty()) {
-                 internal_monologue += "\n[SYSTEM: Duplicate action detected. Try something else.]";
+                 internal_monologue += "\n[SYSTEM: Loop detected. Skipping.]";
+                 last_error = "Loop detected. Change strategy.";
                  continue; 
             }
             action_history.insert(action_hash);
@@ -177,37 +164,33 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             nlohmann::json params = action.value("parameters", nlohmann::json::object());
             params["project_id"] = req.project_id();
 
-            // 🛠️ EXECUTE TOOL
+            this->notify(writer, "TOOL_EXEC", "Engaging: " + tool_name);
             std::string observation = tool_registry_->dispatch(tool_name, params);
             
-            // 🧠 ANALYZE RESULT
-            if (observation.find("ERROR:") == 0) {
-                last_error = observation; // Store for next prompt injection
-                internal_monologue += "\n[SYSTEM ERROR: " + observation + "]";
+            // 🧠 ERROR HANDLING
+            std::string prefix = observation.substr(0, 50);
+            if (prefix.find("ERROR") != std::string::npos) {
+                last_error = observation; 
+                internal_monologue += "\n[STEP " + std::to_string(step+1) + " FAILED]\nThought: " + reasoning + "\nError: " + observation;
                 
-                // Telemetry for user visibility
-                this->notify(writer, "ERROR_CATCH", "Tool failed. Re-planning...");
+                this->notify(writer, "ERROR_CATCH", "Action failed. Re-planning...");
+                code_assistance::LogManager::instance().add_trace({req.session_id(), "", "ERROR_CATCH", observation, 0.0});
             } else {
-                last_error = ""; // Clear error on success
-                
-                if (tool_name == "read_file") {
-                    ctx.focal_code += "\nFile: " + params.value("path", "") + "\n" + observation;
-                }
-                internal_monologue += "\n[RESULT: " + tool_name + "]\n" + observation;
-                this->notify(writer, "TOOL_EXEC", "Used " + tool_name);
+                last_error = ""; 
+                internal_monologue += "\n[STEP " + std::to_string(step+1) + " SUCCESS]\nThought: " + reasoning + "\nResult: " + observation;
+                this->notify(writer, "SUCCESS", "Action confirmed.");
             }
             
         } else {
-            if (thought.find("FINAL_ANSWER") != std::string::npos) {
-                final_output = thought;
+            if (raw_thought.find("FINAL_ANSWER") != std::string::npos) {
+                final_output = raw_thought;
                 goto mission_complete;
             }
-            internal_monologue += "\n[SYSTEM: Invalid JSON format. Retry.]";
+            last_error = "Response was not valid JSON.";
         }
     }
 
 mission_complete:
-    // 🚀 LOGGING (Existing logic)
     auto mission_end_time = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(mission_end_time - mission_start_time).count();
 
@@ -218,31 +201,13 @@ mission_complete:
     log.user_query = req.prompt();
     log.ai_response = final_output;
     log.duration_ms = total_ms;
-    log.prompt_tokens = last_gen.prompt_tokens;
-    log.completion_tokens = last_gen.completion_tokens;
     log.total_tokens = last_gen.total_tokens;
-    log.full_prompt = "### HISTORY:\n" + internal_monologue + "\n### FOCAL CODE:\n" + ctx.focal_code;
+    log.full_prompt = "### HISTORY:\n" + internal_monologue;
 
     code_assistance::LogManager::instance().add_log(log);
 
-    if (last_gen.success && final_output != "Mission Timed Out.") {
-        // We calculate a score: 1.0 if no errors occurred, 0.8 if we had to self-correct
-        double score = (internal_monologue.find("SYSTEM ERROR") == std::string::npos) ? 1.0 : 0.8;
-        
-        // We memorize the User Prompt -> Final Answer mapping
-        // This helps the agent "shortcut" directly to the answer next time
-        memory_vault_->add_experience(req.prompt(), final_output, prompt_embedding, score);
-    }
-
-    if (final_output != "Mission Timed Out.") {
-        // Calculate Score:
-        // 1.0 = Flawless run (No "SYSTEM ERROR" in logs)
-        // 0.8 = Self-Corrected run (Had errors but fixed them)
-        double score = (internal_monologue.find("SYSTEM ERROR") == std::string::npos) ? 1.0 : 0.8;
-        
-        // We store the Prompt -> Result mapping
-        // Next time, the AI will see this Result immediately
-        memory_vault_->add_experience(req.prompt(), final_output, prompt_vec, score);
+    if (final_output != "Mission Timed Out." && last_error.empty()) {
+        memory_vault_->add_experience(req.prompt(), final_output, prompt_vec, 1.0);
     }
 
     return final_output;
@@ -252,15 +217,12 @@ std::string AgentExecutor::run_autonomous_loop_internal(const nlohmann::json& bo
     ::code_assistance::UserQuery fake_req;
     fake_req.set_prompt(body.value("prompt", ""));
     fake_req.set_project_id(body.value("project_id", "default"));
+    fake_req.set_session_id("internal_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
     return this->run_autonomous_loop(fake_req, nullptr); 
 }
 
-void AgentExecutor::determineContextStrategy(const std::string& query, ContextSnapshot& ctx, const std::string& project_id) {
-    // Implementation placeholder
-}
+void AgentExecutor::determineContextStrategy(const std::string& query, ContextSnapshot& ctx, const std::string& project_id) {}
+bool AgentExecutor::check_reflection(const std::string& query, const std::string& topo, std::string& reason) { return true; }
+std::string AgentExecutor::construct_reasoning_prompt(const std::string& task, const std::string& history, const std::string& last_error) { return ""; }
 
-bool AgentExecutor::check_reflection(const std::string& query, const std::string& topo, std::string& reason) {
-    reason = "Pass"; return true; 
 }
-
-} // namespace code_assistance
