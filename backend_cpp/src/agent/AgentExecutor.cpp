@@ -121,50 +121,86 @@ void AgentExecutor::ingest_sync_results(const std::string& project_id, const std
     spdlog::info("✅ Graph Knowledge Updated.");
 }
 
+std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> graph, const std::string& session_id) {
+    // Query graph for nodes with this session_id metadata
+    // In a real DB, this is fast. With flat JSON, it's O(N), but acceptable for startup.
+    auto nodes = graph->query_by_metadata("session_id", session_id);
+    
+    if (nodes.empty()) return "";
+
+    // Find the most recent node (highest timestamp)
+    PointerNode latest = nodes[0];
+    for(const auto& n : nodes) {
+        if (n.timestamp > latest.timestamp) latest = n;
+    }
+    
+    spdlog::info("🔄 Restored Session '{}' cursor to node: {}", session_id, latest.id);
+    return latest.id;
+}
+
+
 // --- CORE ENGINE ---
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
     
-    // 1. Get Project Graph (This is the specific brain for this project)
     auto graph = get_or_create_graph(req.project_id());
+
+    // 🚀 SESSION MANAGEMENT
+    std::string session_id = req.session_id();
+    std::string parent_node_id = "";
+    
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        if (session_cursors_.find(session_id) == session_cursors_.end()) {
+            // Try to restore from disk if not in RAM
+            session_cursors_[session_id] = restore_session_cursor(graph, session_id);
+        }
+        parent_node_id = session_cursors_[session_id];
+    }
 
     std::string tool_manifest = tool_registry_->get_manifest();
     std::string internal_monologue = "";
     std::unordered_set<size_t> action_history;
     std::hash<std::string> hasher;
-
-    code_assistance::GenerationResult last_gen; 
     std::string final_output = "Mission Timed Out.";
     std::string last_error = ""; 
+    code_assistance::GenerationResult last_gen; 
 
-    // 2. Memory Recall (Hybrid: Code + Episodic)
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
     
+    // 🚀 LINK TO PARENT (Continuity)
     std::string root_node_id = graph->add_node(
         req.prompt(), 
         NodeType::PROMPT, 
-        "", 
+        parent_node_id, // Link to previous conversation
         prompt_vec, 
-        {{"session_id", req.session_id()}}
+        {{"session_id", session_id}}
     );
     std::string last_graph_node = root_node_id;
 
-    // Search Graph for Context
-    auto related_nodes = graph->semantic_search(prompt_vec, 3);
+    // Memory Recall (Smart Filter)
+    auto related_nodes = graph->semantic_search(prompt_vec, 5);
     std::string memories = "";
+    std::string warnings = ""; 
+
     if (!related_nodes.empty()) {
         memories = "### RELEVANT CONTEXT (From Knowledge Graph):\n";
         for(const auto& node : related_nodes) {
+            bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
             if (node.type == NodeType::CONTEXT_CODE) {
-                // 🚀 FIXED: Use .at() or check existence, also ensure file_path exists
                 std::string fpath = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
                 memories += "- [CODE] " + fpath + ":\n" + node.content.substr(0, 300) + "...\n";
             } else if (node.type == NodeType::RESPONSE) {
-                memories += "- [PAST SOLUTION] " + node.content + "\n";
+                if (!is_failure) memories += "- [PAST SOLUTION] " + node.content + "\n";
+            } else if (node.type == NodeType::TOOL_CALL) {
+                if (is_failure) warnings += "⚠️ AVOID: " + node.content + " (This failed previously)\n";
+                else memories += "- [SUCCESSFUL ACTION] " + node.content + "\n";
             }
         }
     }
     
+    if (!warnings.empty()) memories += "\n### ⛔ NEGATIVE CONSTRAINTS (HISTORY):\n" + warnings;
+
     int max_steps = 8;
     
     for (int step = 0; step < max_steps; ++step) {
@@ -205,13 +241,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             std::string tool_name = action["tool"];
             std::string reasoning = action.value("thought", "No reasoning provided.");
             
-            // Record Thought in Graph
-            last_graph_node = graph->add_node(
-                reasoning, 
-                NodeType::SYSTEM_THOUGHT, 
-                last_graph_node
-            );
-
+            last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
             spdlog::info("🧠 STEP {}: {}", step+1, reasoning);
             this->notify(writer, "PLANNING", reasoning);
 
@@ -226,57 +256,37 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
             if (tool_name == "FINAL_ANSWER") {
                 final_output = action["parameters"].value("answer", "Done.");
-                
-                // Record Success
-                graph->add_node(
-                    final_output,
-                    NodeType::RESPONSE,
-                    last_graph_node,
-                    {}, 
-                    {{"status", "success"}}
-                );
-                
+                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
                 this->notify(writer, "FINAL", final_output);
                 goto mission_complete; 
             }
 
-            // Record Tool Call
-            last_graph_node = graph->add_node(
-                action_sig,
-                NodeType::TOOL_CALL,
-                last_graph_node,
-                {},
-                {{"tool", tool_name}}
-            );
-
+            last_graph_node = graph->add_node(action_sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
             nlohmann::json params = action.value("parameters", nlohmann::json::object());
             params["project_id"] = req.project_id();
 
             this->notify(writer, "TOOL_EXEC", "Engaging: " + tool_name);
             std::string observation = tool_registry_->dispatch(tool_name, params);
-            
-            // Record Result
-            last_graph_node = graph->add_node(
-                observation,
-                NodeType::CONTEXT_CODE, 
-                last_graph_node
-            );
+            last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
-            if (observation.find("ERROR:") != std::string::npos || observation.find("Error:") != std::string::npos) {
+            std::string prefix = observation.substr(0, 50);
+            if (prefix.find("ERROR") != std::string::npos || prefix.find("Error:") != std::string::npos) {
                 last_error = observation; 
                 internal_monologue += "\n[STEP " + std::to_string(step+1) + " FAILED]\nThought: " + reasoning + "\nError: " + observation;
                 this->notify(writer, "ERROR_CATCH", "Action failed. Re-planning...");
-                code_assistance::LogManager::instance().add_trace({req.session_id(), "", "ERROR_CATCH", observation, 0.0});
+                code_assistance::LogManager::instance().add_trace({session_id, "", "ERROR_CATCH", observation, 0.0});
+                graph->update_metadata(last_graph_node, "status", "failed"); // Mark observation as failed
             } else {
                 last_error = ""; 
                 internal_monologue += "\n[STEP " + std::to_string(step+1) + " SUCCESS]\nThought: " + reasoning + "\nResult: " + observation;
                 this->notify(writer, "SUCCESS", "Action confirmed.");
+                graph->update_metadata(last_graph_node, "status", "success");
             }
             
         } else {
             if (raw_thought.find("FINAL_ANSWER") != std::string::npos) {
                 final_output = raw_thought;
-                graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
+                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
                 goto mission_complete;
             }
             last_error = "Response was not valid JSON.";
@@ -289,16 +299,18 @@ mission_complete:
 
     code_assistance::InteractionLog log;
     log.request_type = "AGENT";
-    log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     log.project_id = req.project_id();
     log.user_query = req.prompt();
     log.ai_response = final_output;
     log.duration_ms = total_ms;
     log.full_prompt = "### HISTORY:\n" + internal_monologue;
-
     code_assistance::LogManager::instance().add_log(log);
 
-    // Save the specific project graph
+    // 🚀 UPDATE CURSOR
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        session_cursors_[session_id] = last_graph_node;
+    }
     graph->save();
 
     return final_output;
@@ -308,7 +320,11 @@ std::string AgentExecutor::run_autonomous_loop_internal(const nlohmann::json& bo
     ::code_assistance::UserQuery fake_req;
     fake_req.set_prompt(body.value("prompt", ""));
     fake_req.set_project_id(body.value("project_id", "default"));
-    fake_req.set_session_id("internal_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
+    
+    // Use "REST_SESSION" as default ID to maintain continuity for VS Code unless specified
+    std::string sid = body.value("session_id", "REST_SESSION");
+    fake_req.set_session_id(sid);
+    
     return this->run_autonomous_loop(fake_req, nullptr); 
 }
 
