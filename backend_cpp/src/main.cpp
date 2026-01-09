@@ -146,20 +146,30 @@ private:
             std::string store_path = config.value("storage_path", "");
             if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
             
-            thread_pool_.enqueue([this, project_id, config, store_path]() {
+            thread_pool_.enqueue([this, project_id, store_path]() {
+                auto t_start = std::chrono::high_resolution_clock::now();
+
+                // A. Run Sync
+                json config = load_project_config(project_id);
                 code_assistance::SyncService sync(ai_service_);
-                // Pass empty vectors for filters for now, or load from config
-                auto res = sync.perform_sync(project_id, config.value("local_path",""), store_path, {}, {}, {});
-                if (!res.nodes.empty()) {
-                    auto store = std::make_shared<code_assistance::FaissVectorStore>(768);
-                    store->add_nodes(res.nodes);
-                    fs::path p = fs::path(store_path) / "vector_store";
-                    fs::create_directories(p);
-                    store->save(p.string());
-                    std::lock_guard<std::mutex> lock(store_mutex);
-                    project_stores_[project_id] = store;
+                
+                // Perform Sync
+                auto sync_res = sync.perform_sync(project_id, config.value("local_path",""), store_path, {}, {}, {});
+                
+                // B. 🚀 UNIFIED INGESTION: Feed results to AgentExecutor's Graph
+                if (!sync_res.nodes.empty()) {
+                    executor_->ingest_sync_results(project_id, sync_res.nodes);
                 }
+
+                // C. Hot-Load RAM Context (Optional now, as Graph handles retrieval)
+                this->refresh_context_cache(project_id, store_path);
+
+                auto t_end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                code_assistance::SystemMonitor::global_sync_latency_ms.store(ms);
+                spdlog::info("⏱️ Sync Complete in {:.2f} ms", ms);
             });
+
             res.set_content(json{{"success", true}}.dump(), "application/json");
         } catch(...) { res.status = 500; }
     }
@@ -271,7 +281,6 @@ private:
                 std::string store_path = body.value("storage_path", "");
                 if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
                 
-                // Async Task (Flattened - No Nested Enqueue)
                 thread_pool_.enqueue([this, project_id, store_path]() {
                     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -280,33 +289,14 @@ private:
                     code_assistance::SyncService sync(ai_service_);
                     auto sync_res = sync.perform_sync(project_id, config.value("local_path",""), store_path, {}, {}, {});
                     
-                    // B. Vector Store Update (If needed)
+                    // B. 🚀 UNIFIED INGESTION: Feed results to AgentExecutor's Graph
                     if (!sync_res.nodes.empty()) {
-                        std::lock_guard<std::mutex> lock(store_mutex);
-                        
-                        std::shared_ptr<code_assistance::FaissVectorStore> store;
-                        if (project_stores_.count(project_id)) {
-                            store = project_stores_[project_id];
-                        } else {
-                            store = std::make_shared<code_assistance::FaissVectorStore>(768);
-                            fs::path p = fs::path(store_path) / "vector_store";
-                            if (fs::exists(p / "faiss.index")) try { store->load(p.string()); } catch(...) {}
-                        }
-
-                        store->add_nodes(sync_res.nodes);
-                        
-                        fs::path p = fs::path(store_path) / "vector_store";
-                        fs::create_directories(p);
-                        store->save(p.string());
-
-                        project_stores_[project_id] = store;
-                        spdlog::info("💾 Vector Store Updated. Total Nodes: {}", store->get_all_nodes().size());
+                        executor_->ingest_sync_results(project_id, sync_res.nodes);
                     }
 
                     // C. Hot-Load RAM Context
                     this->refresh_context_cache(project_id, store_path);
 
-                    // D. Update Metrics
                     auto t_end = std::chrono::high_resolution_clock::now();
                     double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
                     code_assistance::SystemMonitor::global_sync_latency_ms.store(ms);
@@ -339,9 +329,9 @@ private:
         server_.Get("/api/admin/telemetry", [this](const httplib::Request&, httplib::Response& res) {
             auto m = system_monitor_.get_latest_snapshot();
             auto logs = code_assistance::LogManager::instance().get_logs_json();
+            auto traces = code_assistance::LogManager::instance().get_traces_json(); 
             
             json payload;
-            // Map C++ struct fields to JS expected keys
             payload["metrics"] = {
                 {"cpu", m.cpu_usage},
                 {"ram_mb", m.ram_usage_mb},
@@ -352,6 +342,7 @@ private:
                 {"vector_latency", m.vector_latency_ms}
             };
             payload["logs"] = logs;
+            payload["agent_traces"] = traces;
 
             res.set_content(payload.dump(), "application/json");
         });
