@@ -100,6 +100,7 @@ set(CORE_SOURCES
     src/tools/FileSystemTools.cpp
     src/tools/WebSearchTool.cpp
     src/tools/VisionTool.cpp
+    src/memory/PointerGraph.cpp
 )
 
 # 🚀 TARGET 1: REST API SERVER
