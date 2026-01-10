@@ -79,6 +79,14 @@ std::string PointerGraph::add_node(const std::string& content,
     return node.id;
 }
 
+std::string PointerGraph::get_relevant_context(const std::string& query, int max_chars) {
+    // Placeholder: In a real high-frequency scenario, we can't run BERT/Gecko every 50ms.
+    // We will stick to the "Project Cache" strategy for now, but filter it using the graph later.
+    // For this specific turn, let's keep the Architecture Simple.
+    
+    return ""; // Placeholder to allow compilation
+}
+
 void PointerGraph::update_metadata(const std::string& node_id, const std::string& key, const std::string& value) {
     std::unique_lock lock(data_mutex_);
     if (nodes_.count(node_id)) {

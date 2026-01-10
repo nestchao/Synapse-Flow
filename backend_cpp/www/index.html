@@ -5,11 +5,16 @@
     <title>Synapse-Flow | Mission Control</title>
     <link rel="stylesheet" href="style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <!-- 🚀 VIS.JS IMPORT -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        #graph-container { width: 100%; height: 100%; background: #0d1117; }
+    </style>
 </head>
 <body>
     <div class="app-container">
         
-        <!-- 1. GLOBAL NAVIGATION RAIL -->
+        <!-- GLOBAL NAVIGATION RAIL -->
         <aside class="icon-nav">
             <div class="nav-brand"><i class="fas fa-brain"></i></div>
             
@@ -23,29 +28,24 @@
                 <span class="tooltip">Live Trace</span>
             </div>
 
-            <div class="nav-spacer"></div>
-
-            <div class="nav-item">
-                <i class="fas fa-cog"></i>
+            <!-- 🚀 GRAPH ICON -->
+            <div class="nav-item" onclick="switchPage('graph')">
+                <i class="fas fa-project-diagram"></i>
+                <span class="tooltip">Neural Graph</span>
             </div>
+
+            <div class="nav-spacer"></div>
+            <div class="nav-item"><i class="fas fa-cog"></i></div>
         </aside>
 
-        <!-- PAGE 1: MISSION CONTROL (DASHBOARD) -->
+        <!-- DASHBOARD VIEW -->
         <div id="view-dashboard" class="view-section active">
-            <!-- Sidebar: Logs & Vitals -->
             <nav class="sidebar">
                 <div class="section-title">SYSTEM VITALS</div>
                 <div class="kpi-grid">
-                    <div class="kpi-mini">
-                        <label>CPU</label>
-                        <div id="kpi-cpu" class="val-text">0%</div>
-                    </div>
-                    <div class="kpi-mini">
-                        <label>RAM</label>
-                        <div id="kpi-ram" class="val-text">0MB</div>
-                    </div>
+                    <div class="kpi-mini"><label>CPU</label><div id="kpi-cpu" class="val-text">0%</div></div>
+                    <div class="kpi-mini"><label>RAM</label><div id="kpi-ram" class="val-text">0MB</div></div>
                 </div>
-
                 <div class="section-title">ENGINE METRICS</div>
                 <div class="kpi-box">
                     <div class="kpi-row">
@@ -59,14 +59,10 @@
                         <div><label>Tokens/Sec</label><div id="kpi-tps" class="kpi-val">0</div></div>
                     </div>
                 </div>
-                
                 <div class="list-header">TRANSMISSION LOG</div>
-                <div id="log-list" class="log-list">
-                    <!-- Logs injected via JS -->
-                </div>
+                <div id="log-list" class="log-list"></div>
             </nav>
 
-            <!-- Main: Inspector -->
             <main class="inspector">
                 <header>
                     <div class="breadcrumbs">
@@ -79,14 +75,10 @@
                         <span><i class="fas fa-database"></i> <span id="insp-context-size">0 chars</span></span>
                     </div>
                 </header>
-
                 <div class="grid-layout">
-                    <!-- Split Pane: Context vs Output -->
                     <div class="panel full-height">
                         <h3><i class="fas fa-eye"></i> AI Retina View (Full Context)</h3>
-                        <div class="code-window" id="insp-full-prompt">
-                            <span class="placeholder-text">Select a log to see the exact payload sent to Gemini...</span>
-                        </div>
+                        <div class="code-window" id="insp-full-prompt"><span class="placeholder-text">Select a log to see payload...</span></div>
                     </div>
                     <div class="panel full-height">
                         <div class="sub-section" style="flex:1;">
@@ -106,16 +98,25 @@
             </main>
         </div>
 
-        <!-- PAGE 2: LIVE TRACE (HIDDEN BY DEFAULT) -->
+        <!-- LIVE TRACE VIEW -->
         <div id="view-trace" class="view-section">
             <div class="trace-container">
                 <div class="trace-header">
                     <h2>🚀 Live Flight Trace</h2>
                     <span id="trace-status" class="status-live">LISTENING</span>
                 </div>
-                <div id="trace-list" class="trace-list">
-                    <div style="padding:40px; text-align:center; color:#555">Waiting for Agentic events...</div>
-                </div>
+                <div id="trace-list" class="trace-list"></div>
+            </div>
+        </div>
+
+        <!-- 🚀 GRAPH VIEW -->
+        <div id="view-graph" class="view-section">
+            <div style="display:flex; flex-direction:column; width:100%; height:100%">
+                <header style="padding:15px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                    <h3 style="margin:0; color:#58a6ff"><i class="fas fa-project-diagram"></i> Cognitive Graph Topology</h3>
+                    <button onclick="refreshGraph()" style="background:var(--accent); border:none; color:white; padding:6px 15px; border-radius:4px; cursor:pointer; font-weight:bold;">Refresh Network</button>
+                </header>
+                <div id="graph-container"></div>
             </div>
         </div>
 

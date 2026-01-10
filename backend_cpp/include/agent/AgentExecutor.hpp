@@ -39,7 +39,10 @@ private:
     std::unique_ptr<ContextManager> context_mgr_;
     std::unordered_map<std::string, std::shared_ptr<PointerGraph>> graphs_;
     std::mutex graph_mutex_;
+    std::unordered_map<std::string, std::string> session_cursors_;
+    std::mutex cursor_mutex_;
 
+    std::string restore_session_cursor(std::shared_ptr<PointerGraph> graph, const std::string& session_id);
     void notify(::grpc::ServerWriter<::code_assistance::AgentResponse>* w, const std::string& phase, const std::string& msg, double duration_ms = 0.0);
     bool check_reflection(const std::string& query, const std::string& topo, std::string& reason);
     std::string construct_reasoning_prompt(

@@ -42,6 +42,9 @@ public:
     // Metadata Filter: "Find all failed tool calls"
     std::vector<PointerNode> query_by_metadata(const std::string& key, const std::string& value);
 
+    // Returns concatenated code snippets relevant to the query
+    std::string get_relevant_context(const std::string& query, int max_chars = 4000);
+
     // --- PERSISTENCE ---
     void save();
     void load();
