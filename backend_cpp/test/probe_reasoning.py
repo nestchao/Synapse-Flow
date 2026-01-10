@@ -2,6 +2,7 @@ import grpc
 import agent_pb2
 import agent_pb2_grpc
 import time
+import base64 # 🚀 IMPORT ADDED
 from termcolor import colored
 
 # Connect to local gRPC
@@ -9,17 +10,19 @@ channel = grpc.insecure_channel('127.0.0.1:50051')
 stub = agent_pb2_grpc.AgentServiceStub(channel)
 
 # 🚀 TARGET CONFIG
-TARGET_PROJECT = "D:/Projects/SA_ETF"
+TARGET_RAW = "D:/Projects/SA_ETF"
+# ENCODE IT to match the folder created by setup_config.py
+TARGET_PROJECT_ID = base64.b64encode(TARGET_RAW.encode('utf-8')).decode('utf-8')
 
 def run_reasoning_test():
-    print(colored(f"🧠 PH3: Starting Reasoning Probe on {TARGET_PROJECT}...", "cyan", attrs=['bold']))
+    print(colored(f"🧠 PH3: Starting Reasoning Probe on {TARGET_RAW} (ID: {TARGET_PROJECT_ID})...", "cyan", attrs=['bold']))
     
     # 1. THE TRAP
-    # Ask for a file that doesn't exist to force error handling + directory listing
-    prompt = "Read 'config/missing_settings.json'. If it fails, list the root directory to find the real file."
+    # Write to an ignored file.
+    prompt = "Write to 'ignore01/test01.py'. If it fails, list the root directory to find the real file."
     
     query = agent_pb2.UserQuery(
-        project_id=TARGET_PROJECT, 
+        project_id=TARGET_PROJECT_ID, # 🚀 SEND BASE64 ID
         prompt=prompt,
         session_id=f"PHOENIX_{int(time.time())}"
     )

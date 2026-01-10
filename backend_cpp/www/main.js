@@ -24,18 +24,92 @@ const UI = {
     inspResponse: document.getElementById('insp-response'),
     inspUserInput: document.getElementById('insp-user-input'),
     inspVector: document.getElementById('insp-vector'),
+    
+    // Graph
+    graphContainer: document.getElementById('graph-container')
 };
 
 let currentLogs = [];
-let lastLogCount = -1; // Start at -1 to force initial render
+let lastLogCount = -1; 
+let network = null;
+// Default to your test ID, but will update dynamically
+let activeProjectId = "RDovUHJvamVjdHMvU0FfRVRG"; 
 
 // --- NAVIGATION ---
 window.switchPage = (pageName) => {
     UI.navItems.forEach(el => el.classList.remove('active'));
-    document.querySelector(`.nav-item[onclick*="${pageName}"]`).classList.add('active');
+    // Handle the specific click case
+    const btn = document.querySelector(`.nav-item[onclick*="${pageName}"]`);
+    if(btn) btn.classList.add('active');
 
     UI.pages.forEach(el => el.classList.remove('active'));
-    document.getElementById(`view-${pageName}`).classList.add('active');
+    const page = document.getElementById(`view-${pageName}`);
+    if(page) page.classList.add('active');
+    
+    if(pageName === 'graph') refreshGraph();
+}
+
+// --- GRAPH VISUALIZER ---
+async function refreshGraph() {
+    try {
+        // Fetch graph for the active project
+        const res = await fetch(`/api/admin/graph/${activeProjectId}`);
+        const nodesData = await res.json();
+        
+        if (!nodesData || nodesData.length === 0) {
+            UI.graphContainer.innerHTML = '<div style="color:#666; text-align:center; padding-top:50px">No graph data found for this project.</div>';
+            return;
+        }
+
+        const nodes = new vis.DataSet();
+        const edges = new vis.DataSet();
+        
+        nodesData.forEach(n => {
+            let color = '#97c2fc'; 
+            let shape = 'box';
+            let label = n.type;
+
+            // 🎨 Color Coding
+            if (n.type === 'PROMPT') { color = '#bc8cff'; shape = 'ellipse'; label = 'USER'; }
+            if (n.type === 'SYSTEM_THOUGHT') { color = '#58a6ff'; label = 'THINK'; }
+            if (n.type === 'TOOL_CALL') { color = '#d29922'; label = 'TOOL'; }
+            if (n.type === 'RESPONSE') { color = '#2ea043'; label = 'REPLY'; }
+            if (n.type === 'CONTEXT_CODE') { color = '#30363d'; label = 'DATA'; }
+
+            if (n.metadata && n.metadata.status === 'failed') color = '#ff7b72';
+
+            nodes.add({ 
+                id: n.id, 
+                label: label, 
+                title: formatCode(n.content), 
+                color: color,
+                shape: shape,
+                font: { color: '#ffffff' }
+            });
+
+            if (n.parent_id) {
+                edges.add({ from: n.parent_id, to: n.id, arrows: 'to', color: {color:'#555'} });
+            }
+        });
+
+        const data = { nodes: nodes, edges: edges };
+        const options = {
+            layout: {
+                hierarchical: {
+                    direction: "UD",
+                    sortMethod: "directed",
+                    nodeSpacing: 180,
+                    levelSeparation: 120
+                }
+            },
+            physics: false,
+            interaction: { hover: true }
+        };
+        
+        if(network) network.destroy();
+        network = new vis.Network(UI.graphContainer, data, options);
+        
+    } catch(e) { console.error("Graph Load Failed", e); }
 }
 
 // --- DATA POLLING ---
@@ -44,10 +118,6 @@ async function pollTelemetry() {
         const res = await fetch('/api/admin/telemetry');
         const data = await res.json();
         
-        // Debugging: Uncomment if still having issues
-        // console.log("Backend Data:", data);
-
-        // 1. Update KPIs (Add safety checks)
         if(data.metrics) {
             UI.kpiCpu.innerText = (data.metrics.cpu || 0).toFixed(1) + '%';
             UI.kpiRam.innerText = (data.metrics.ram_mb || 0).toFixed(0) + 'MB';
@@ -57,12 +127,19 @@ async function pollTelemetry() {
             UI.kpiTps.innerText = (data.metrics.tps || 0).toFixed(1);
         }
 
-        // 2. Render Logs
         renderLogs(data.logs || []);
+        updateAgentTrace(data.agent_traces || []);
+
+        // Dynamic Project ID update: Grab ID from most recent log
+        if (data.logs && data.logs.length > 0) {
+            const lastLog = data.logs[data.logs.length - 1];
+            if (lastLog.project_id && lastLog.project_id !== "default") {
+                activeProjectId = lastLog.project_id;
+            }
+        }
 
     } catch(e) { 
-        console.error("Telemetry Poll Error (Check Console for details)", e); 
-        UI.logList.innerHTML = `<div style="padding:20px; color:#ff7b72; text-align:center">Connection Lost</div>`;
+        console.error("Telemetry Poll Error", e); 
     }
 }
 
@@ -72,15 +149,13 @@ function renderLogs(logs) {
     currentLogs = logs;
 
     if (logs.length === 0) {
-        UI.logList.innerHTML = `<div style="padding:20px; color:#8b949e; text-align:center; font-size:12px">Waiting for transmission...<br>(Use the Extension to generate data)</div>`;
+        UI.logList.innerHTML = `<div style="padding:20px; color:#8b949e; text-align:center; font-size:12px">Waiting for transmission...</div>`;
         return;
     }
 
     UI.logList.innerHTML = logs.slice().reverse().map((log, index) => {
         const originalIndex = logs.length - 1 - index;
         const time = new Date(log.timestamp * 1000).toLocaleTimeString();
-        
-        // Handle undefined types gracefully
         const reqType = log.request_type || log.type || 'UNKNOWN';
         const typeClass = reqType === 'GHOST' ? 'type-GHOST' : 'type-AGENT';
         
@@ -98,6 +173,42 @@ function renderLogs(logs) {
     }).join('');
 }
 
+let lastTraceCount = 0;
+function updateAgentTrace(traces) {
+    if (traces.length === lastTraceCount) return;
+    lastTraceCount = traces.length;
+
+    const container = document.getElementById('trace-list');
+    if (!container) return;
+
+    if (traces.length === 0) {
+        container.innerHTML = '<div style="padding:40px; text-align:center; color:#555">Waiting for Agentic events...</div>';
+        return;
+    }
+
+    container.innerHTML = traces.slice().reverse().map(t => {
+        let colorClass = 'status-live';
+        let icon = 'fa-circle';
+        
+        if (t.state === 'ERROR_CATCH') { colorClass = 'status-error'; icon = 'fa-exclamation-triangle'; }
+        else if (t.state === 'TOOL_EXEC') { colorClass = 'status-tool'; icon = 'fa-cog'; }
+        else if (t.state === 'THINKING') { colorClass = 'status-think'; icon = 'fa-brain'; }
+        else if (t.state === 'FINAL') { colorClass = 'status-success'; icon = 'fa-flag-checkered'; }
+
+        return `
+            <div class="trace-item">
+                <div class="trace-phase ${colorClass}">
+                    <i class="fas ${icon}"></i> ${t.state}
+                </div>
+                <div class="trace-payload">
+                    ${escapeHtml(t.detail)}
+                </div>
+                <div class="trace-time">${t.duration ? t.duration.toFixed(0) + 'ms' : ''}</div>
+            </div>
+        `;
+    }).join('');
+}
+
 window.inspect = (index, element) => {
     const log = currentLogs[index];
     if(!log) return;
@@ -105,9 +216,7 @@ window.inspect = (index, element) => {
     document.querySelectorAll('.log-item').forEach(el => el.classList.remove('active'));
     if(element) element.classList.add('active');
 
-    // Fill Inspector
     UI.inspId.innerText = log.project_id || "UNKNOWN";
-    
     const reqType = log.request_type || log.type || 'AGENT';
     UI.inspType.className = `badge type-${reqType}`;
     UI.inspType.innerText = reqType;
@@ -152,50 +261,6 @@ function escapeHtml(text) {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-async function updateAgentTrace() {
-    try {
-        const res = await fetch('/api/admin/telemetry');
-        const data = await res.json();
-        
-        // Safety check for logs
-        const traces = data.agent_traces || [];
-        if (traces.length === 0) return;
-
-        // NEW: Only update if we have new data to save DOM operations
-        const container = document.getElementById('trace-list');
-        const currentHTML = container.innerHTML;
-        
-        // Generate HTML
-        const newHTML = traces.slice().reverse().map(t => {
-            let colorClass = 'status-live';
-            let icon = 'fa-circle';
-            
-            // 🎨 Phase 3 Visualization Logic
-            if (t.state === 'ERROR_CATCH') { colorClass = 'status-error'; icon = 'fa-exclamation-triangle'; }
-            else if (t.state === 'TOOL_EXEC') { colorClass = 'status-tool'; icon = 'fa-cog'; }
-            else if (t.state === 'THINKING') { colorClass = 'status-think'; icon = 'fa-brain'; }
-            else if (t.state === 'FINAL') { colorClass = 'status-success'; icon = 'fa-flag-checkered'; }
-
-            return `
-                <div class="trace-item">
-                    <div class="trace-phase ${colorClass}">
-                        <i class="fas ${icon}"></i> ${t.state}
-                    </div>
-                    <div class="trace-payload">
-                        ${escapeHtml(t.detail)}
-                    </div>
-                    <div class="trace-time">${t.duration ? t.duration.toFixed(0) + 'ms' : ''}</div>
-                </div>
-            `;
-        }).join('');
-
-        // Simple diff to prevent flicker
-        if (newHTML.length !== currentHTML.length) {
-            container.innerHTML = newHTML;
-        }
-
-    } catch (e) { console.error("Trace Fetch Error", e); }
-}
-
+// 🚀 Start the Loop
 setInterval(pollTelemetry, 1000);
 pollTelemetry();

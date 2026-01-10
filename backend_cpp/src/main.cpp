@@ -346,6 +346,28 @@ private:
 
             res.set_content(payload.dump(), "application/json");
         });
+
+        // 6. 🚀 GRAPH DATA ENDPOINT
+        server_.Get("/api/admin/graph/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
+            std::string project_id = req.path_params.at("project_id");
+            
+            // Sanitize ID (same logic as AgentExecutor)
+            std::string safe_id = project_id;
+            std::replace(safe_id.begin(), safe_id.end(), ':', '_');
+            std::replace(safe_id.begin(), safe_id.end(), '/', '_');
+            std::replace(safe_id.begin(), safe_id.end(), '\\', '_');
+            
+            fs::path graph_path = fs::path("data/graphs") / safe_id / "graph.json";
+            
+            if (fs::exists(graph_path)) {
+                std::ifstream f(graph_path);
+                std::stringstream buffer;
+                buffer << f.rdbuf();
+                res.set_content(buffer.str(), "application/json");
+            } else {
+                res.set_content("[]", "application/json"); // Return empty graph if new
+            }
+        });
         
         server_.Get("/api/hello", [](const httplib::Request&, httplib::Response& res) { res.set_content(R"({"status": "nominal"})", "application/json"); });
         server_.set_mount_point("/", "./www");

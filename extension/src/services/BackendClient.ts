@@ -4,11 +4,9 @@ import FormData from 'form-data';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-// Define the ports for your local servers
 const CPP_BACKEND_URL = 'http://localhost:5002';
 const PYTHON_BACKEND_URL = 'http://localhost:5000';
 
-// Create separate axios instances for each backend
 const cppClient = axios.create({ baseURL: CPP_BACKEND_URL });
 const pythonClient = axios.create({ baseURL: PYTHON_BACKEND_URL });
 
@@ -21,7 +19,6 @@ export class BackendClient {
                 const response = await client.get('/api/hello', { timeout: 1000 });
                 return response.status === 200;
             } catch (error) {
-                // console.warn(`[BackendClient] ${name} backend is offline.`);
                 return false;
             }
         };
@@ -32,13 +29,14 @@ export class BackendClient {
         return { cpp: cppStatus, python: pythonStatus };
     }
 
+    // --- Ghost Text ---
     async getAutocomplete(prefix: string, suffix: string, projectId: string, filePath: string): Promise<string> {
         try {
             const response = await cppClient.post('/complete', { 
                 prefix, 
                 suffix,
                 project_id: projectId,
-                file_path: filePath // 🚀 NEW
+                file_path: filePath
             });
             return response.data.completion || "";
         } catch (error) {
@@ -46,6 +44,7 @@ export class BackendClient {
         }
     }
 
+    // --- Configuration & Sync ---
     async registerCodeProject(
         projectId: string, 
         workspacePath: string, 
@@ -56,44 +55,58 @@ export class BackendClient {
         const filterConfig = {
             local_path: workspacePath,
             allowed_extensions: extensions,
-            // Aligned with C++ SyncService FilterConfig spec
             ignored_paths: ignoredPaths,
             included_paths: includedPaths
         };
-
         return await cppClient.post(`/sync/register/${projectId}`, filterConfig);
     }
 
     async syncCodeProject(projectId: string, workspacePath: string): Promise<any> {
         const storagePath = path.join(workspacePath, '.study_assistant');
-        
         const response = await cppClient.post(`/sync/run/${projectId}`, {
             storage_path: storagePath 
         });
         return response.data;
     }
 
-    async getCodeSuggestion(projectId: string, prompt: string, activeContext?: any): Promise<string> {
-        const response = await cppClient.post('/generate-code-suggestion', {
-            project_id: projectId,
-            prompt: prompt,
-            active_file_path: activeContext?.filePath || "",
-            active_file_content: activeContext?.content || "",
-            active_selection: activeContext?.selection || ""
+    async syncSingleFile(projectId: string, relativePath: string): Promise<void> {
+        await cppClient.post(`/sync/file/${projectId}`, {
+            file_path: relativePath
         });
-        return response.data.suggestion;
+    }
+
+    // --- 🚀 COGNITIVE AGENT INTERFACE ---
+    async getCodeSuggestion(
+        projectId: string, 
+        prompt: string, 
+        sessionId: string, // New: Required for Graph Continuity
+        activeContext?: any
+    ): Promise<string> {
+        try {
+            // 60s Timeout to allow C++ "Thinking" time
+            const response = await cppClient.post('/generate-code-suggestion', {
+                project_id: projectId,
+                prompt: prompt,
+                session_id: sessionId, 
+                active_file_path: activeContext?.filePath || "",
+                active_file_content: activeContext?.content || "",
+                active_selection: activeContext?.selection || ""
+            }, { timeout: 60000 }); // Increase timeout for complex reasoning
+
+            return response.data.suggestion;
+        } catch (error: any) {
+            console.error("Agent Error:", error);
+            if (error.code === 'ECONNABORTED') {
+                return "⚠️ The Agent timed out while thinking. It might be a complex task.";
+            }
+            if (error.response?.status === 500) {
+                return "❌ Internal Engine Error. Check the C++ terminal.";
+            }
+            return `Error: ${error.message}`;
+        }
     }
     
-    async getContextCandidates(projectId: string, prompt: string): Promise<any[]> {
-        const response = await cppClient.post('/retrieve-context-candidates', {
-            project_id: projectId,
-            prompt,
-        });
-        return response.data.candidates;
-    }
-
-
-    // --- Python Backend Methods ---
+    // --- Legacy / Python Features ---
     async getStudyProjects(): Promise<{ id: string, name: string }[]> {
         const response = await pythonClient.get('/get-projects');
         return response.data;
@@ -104,43 +117,20 @@ export class BackendClient {
         return response.data.id;
     }
 
-    async getProjectSources(projectId: string): Promise<any[]> {
-        const response = await pythonClient.get(`/get-sources/${projectId}`);
-        return response.data;
-    }
-
     async uploadPDF(projectId: string, filePath: string): Promise<void> {
         const form = new FormData();
         form.append('pdfs', fs.createReadStream(filePath));
-
         await pythonClient.post(`/upload-source/${projectId}`, form, {
             headers: form.getHeaders(),
         });
-    }
-
-    async getNote(projectId: string, sourceId: string): Promise<string> {
-        const response = await pythonClient.get(`/get-note/${projectId}/${sourceId}`);
-        return response.data.note_html;
-    }
-
-    async getPastPapers(projectId: string): Promise<any[]> {
-        const response = await pythonClient.get(`/get-papers/${projectId}`);
-        return response.data;
     }
 
     async uploadPastPaper(projectId: string, filePath: string, mode: 'multimodal' | 'text_only'): Promise<void> {
         const form = new FormData();
         form.append('paper', fs.createReadStream(filePath));
         form.append('analysis_mode', mode);
-
         await pythonClient.post(`/upload-paper/${projectId}`, form, {
             headers: form.getHeaders(),
-        });
-    }
-
-    async syncSingleFile(projectId: string, relativePath: string): Promise<void> {
-        await cppClient.post(`/sync/file/${projectId}`, {
-            file_path: relativePath
         });
     }
 }
