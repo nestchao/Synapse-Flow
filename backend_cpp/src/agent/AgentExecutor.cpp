@@ -201,7 +201,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     
     if (!warnings.empty()) memories += "\n### ⛔ NEGATIVE CONSTRAINTS (HISTORY):\n" + warnings;
 
-    int max_steps = 8;
+    int max_steps = 16;
     
     for (int step = 0; step < max_steps; ++step) {
         
@@ -210,11 +210,16 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "You are a C++ Autonomous Agent. You MUST plan before you act.\n\n"
             "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
             "### OBJECTIVE\n" + req.prompt() + "\n\n"
+            "### WORKFLOW GUIDELINES\n"
+            "1. **Execution**: Use `execute_code` (Python) to verify logic, calculate math, or reproduce bugs. The environment is stateless (variables are lost between calls).\n"
+            "2. **Safety**: Do not execute code that deletes files unless explicitly instructed.\n"
+            "3. **Navigation**: Use `list_dir` and `pattern_search` to find files.\n"
+            "4. **Editing**: Use `apply_edit` to modify files.\n\n"
             "### RESPONSE FORMAT (STRICT JSON)\n"
             "{\n"
-            "  \"thought\": \"Briefly explain your reasoning here...\",\n"
-            "  \"tool\": \"tool_name\",\n"
-            "  \"parameters\": { ... }\n"
+            "  \"thought\": \"I will write a python script to test the logic...\",\n"
+            "  \"tool\": \"execute_code\",\n"
+            "  \"parameters\": { \"code\": \"print(2 + 2)\", \"language\": \"python\" }\n"
             "}\n\n";
 
         if (!memories.empty()) prompt += memories + "\n"; 
