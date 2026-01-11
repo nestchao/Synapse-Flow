@@ -2,30 +2,23 @@ import os
 import json
 import base64
 
-# 🚀 CONFIGURATION
-TARGET_PATH = "D:/Projects/SA_ETF"
-# Explicitly encode to match what VS Code sends
+# 🚀 TARGET CONFIG: SWITCH TO OOP ASSIGNMENT
+TARGET_PATH = "D:/Projects/OOPAssignment"
+# Base64 Encode the ID
 PROJECT_ID = base64.b64encode(TARGET_PATH.encode('utf-8')).decode('utf-8')
 
-# 🚀 DEFINING THE RULES
 CONFIG_DATA = {
     "local_path": TARGET_PATH,
-    "allowed_extensions": ["txt", "html", "ts", "json", "py", "cpp"],
+    # Ensure 'java' is included
+    "allowed_extensions": ["java", "json", "xml", "txt", "md"],
     "ignored_paths": [
-        "ignore01",           # <--- BLOCK THIS
-        "test01/ignore01",
-        "test02",
-        "node_modules",
-        ".git"
+        "node_modules", ".git", "bin", "obj", ".vscode", ".idea"
     ],
-    "included_paths": [
-        "test02/exception01"  # <--- ALLOW THIS
-    ]
+    "included_paths": [] 
 }
 
 def setup_config():
-    # 1. Determine where the server looks for data
-    # Assuming running from 'test' folder, we go up to 'build/Release/data'
+    # Locate the server's data directory (relative to this script in 'test')
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../build/Release/data"))
     project_dir = os.path.join(base_dir, PROJECT_ID)
     
@@ -35,12 +28,11 @@ def setup_config():
 
     config_path = os.path.join(project_dir, "config.json")
 
-    # 2. Write the JSON
     with open(config_path, "w") as f:
         json.dump(CONFIG_DATA, f, indent=4)
     
-    print(f"✅ Configuration Saved: {config_path}")
-    print(f"🔒 Ignore Rules Active: {CONFIG_DATA['ignored_paths']}")
+    print(f"✅ Configuration Saved for: {TARGET_PATH}")
+    print(f"🆔 Project ID: {PROJECT_ID}")
 
 if __name__ == "__main__":
     setup_config()

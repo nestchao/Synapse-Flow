@@ -18,6 +18,7 @@
 #include "agent/SubAgent.hpp"
 #include "tools/ToolRegistry.hpp"
 #include "tools/FileSurgicalTool.hpp"
+#include "tools/PatternSearchTool.hpp"
 #include "tools/FileSystemTools.hpp"
 #include "faiss_vector_store.hpp"
 
@@ -39,6 +40,7 @@ public:
         tool_registry_->register_tool(std::make_unique<code_assistance::ReadFileTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::ListDirTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::PatternSearchTool>());
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
             nullptr, ai_service_, sub_agent_, tool_registry_
@@ -284,12 +286,30 @@ private:
                 thread_pool_.enqueue([this, project_id, store_path]() {
                     auto t_start = std::chrono::high_resolution_clock::now();
 
-                    // A. Run Sync
+                    // A. Load Config
                     json config = load_project_config(project_id);
-                    code_assistance::SyncService sync(ai_service_);
-                    auto sync_res = sync.perform_sync(project_id, config.value("local_path",""), store_path, {}, {}, {});
                     
-                    // B. 🚀 UNIFIED INGESTION: Feed results to AgentExecutor's Graph
+                    // 🚀 EXTRACT LISTS (FIXED PART)
+                    std::vector<std::string> ext = config.value("allowed_extensions", std::vector<std::string>{});
+                    std::vector<std::string> ign = config.value("ignored_paths", std::vector<std::string>{});
+                    std::vector<std::string> inc = config.value("included_paths", std::vector<std::string>{});
+
+                    // Ensure defaults if empty (Backend Safety)
+                    if (ext.empty()) ext = {"java", "json", "py", "cpp", "h", "ts", "js", "txt", "md"};
+                    
+                    code_assistance::SyncService sync(ai_service_);
+                    
+                    // Pass the extracted lists to the sync engine
+                    auto sync_res = sync.perform_sync(
+                        project_id, 
+                        config.value("local_path", ""), 
+                        store_path, 
+                        ext, 
+                        ign, 
+                        inc
+                    );
+                    
+                    // B. Unified Ingestion
                     if (!sync_res.nodes.empty()) {
                         executor_->ingest_sync_results(project_id, sync_res.nodes);
                     }
