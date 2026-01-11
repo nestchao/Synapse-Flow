@@ -11,16 +11,19 @@
 #include "KeyManager.hpp"
 #include "LogManager.hpp"
 #include "ThreadPool.hpp"
-#include "embedding_service.hpp"
 #include "sync_service.hpp"
 #include "SystemMonitor.hpp"
-#include "agent/AgentExecutor.hpp"
+#include "embedding_service.hpp"
+#include "faiss_vector_store.hpp"
+
 #include "agent/SubAgent.hpp"
+#include "agent/AgentExecutor.hpp"
+
 #include "tools/ToolRegistry.hpp"
+#include "tools/FileSystemTools.hpp"
 #include "tools/FileSurgicalTool.hpp"
 #include "tools/PatternSearchTool.hpp"
-#include "tools/FileSystemTools.hpp"
-#include "faiss_vector_store.hpp"
+#include "tools/CodeExecutionTool.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -41,6 +44,7 @@ public:
         tool_registry_->register_tool(std::make_unique<code_assistance::ListDirTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::PatternSearchTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::CodeExecutionTool>());
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
             nullptr, ai_service_, sub_agent_, tool_registry_
