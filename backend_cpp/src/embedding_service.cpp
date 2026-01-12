@@ -150,8 +150,8 @@ GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt
                           {"contents", {{ {"parts", {{{"text", prompt}}}} }}}
                       }.dump()},
                       cpr::Header{{"Content-Type", "application/json"}},
-                      cpr::VerifySsl{false}, // 🛡️ CRITICAL FIX FOR WINDOWS
-                      cpr::Timeout{15000}
+                      cpr::VerifySsl{false}, 
+                      cpr::Timeout{120000}
         );
     }, key_manager_);
 
