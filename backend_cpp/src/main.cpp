@@ -24,6 +24,7 @@
 #include "tools/FileSurgicalTool.hpp"
 #include "tools/PatternSearchTool.hpp"
 #include "tools/CodeExecutionTool.hpp"
+#include "tools/ShellExecutionTool.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -45,6 +46,7 @@ public:
         tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::PatternSearchTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::CodeExecutionTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::ShellExecutionTool>());
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
             nullptr, ai_service_, sub_agent_, tool_registry_
