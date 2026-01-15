@@ -50,6 +50,11 @@ private:
         const std::string& history, 
         const std::string& last_error
     );
+    std::string safe_execute_tool(
+        const std::string& tool_name, 
+        const nlohmann::json& params, 
+        const std::string& session_id
+    );
 };
 
 }
