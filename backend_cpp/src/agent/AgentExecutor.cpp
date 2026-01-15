@@ -144,7 +144,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     
     auto graph = get_or_create_graph(req.project_id());
 
-    // --- Session Management (Graph Continuity) ---
+    // Session Management
     std::string session_id = req.session_id();
     std::string parent_node_id = "";
     {
@@ -155,16 +155,25 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         parent_node_id = session_cursors_[session_id];
     }
 
-    // --- Record Prompt ---
+    // --- VARIABLE DECLARATIONS (Previously Missing) ---
+    std::string tool_manifest = tool_registry_->get_manifest();
+    std::string internal_monologue = "";
+    std::unordered_set<size_t> action_history;
+    std::hash<std::string> hasher;
+    std::string final_output = "Mission Timed Out.";
+    std::string last_error = ""; 
+    code_assistance::GenerationResult last_gen; 
+
+    // Record Prompt
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
     std::string root_node_id = graph->add_node(req.prompt(), NodeType::PROMPT, parent_node_id, prompt_vec, {{"session_id", session_id}});
     std::string last_graph_node = root_node_id;
 
-    // --- Memory Recall (Same as before) ---
+    // Memory Recall
     auto related_nodes = graph->semantic_search(prompt_vec, 5);
     std::string memories = "";
     std::string warnings = ""; 
-    // ... (Your existing loop to populate memories/warnings) ...
+
     if (!related_nodes.empty()) {
         for(const auto& node : related_nodes) {
             bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
@@ -180,11 +189,10 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     
     for (int step = 0; step < max_steps; ++step) {
         
-        // 🚀 3. INTERACTIVE SYSTEM PROMPT
         std::string prompt_template = 
             "### SYSTEM ROLE\n"
             "You are 'Synapse', a C++ Autonomous Agent. You act within a persistent session.\n\n"
-            "### TOOL MANIFEST\n" + tool_registry_->get_manifest() + "\n\n"
+            "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
             "### USER REQUEST\n" + req.prompt() + "\n\n"
             "### INTERACTIVE WORKFLOW\n"
             "1. **Analyze**: Understand the goal.\n"
@@ -200,11 +208,18 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
         if (!memories.empty()) prompt_template += "### CONTEXT MEMORY\n" + memories + "\n";
         if (!warnings.empty()) prompt_template += "### ⛔ ACTIVE WARNINGS\n" + warnings + "\n";
+        if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
+        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
 
-        // ... (Send Request to AI) ...
+        prompt_template += "\nNEXT JSON ACTION:";
+
         this->notify(writer, "THINKING", "Processing logic...");
-        auto last_gen = ai_service_->generate_text_elite(prompt_template);
-        if (!last_gen.success) return "ERROR: AI Service Failure";
+        last_gen = ai_service_->generate_text_elite(prompt_template);
+        
+        if (!last_gen.success) {
+            final_output = "ERROR: AI Service Failure";
+            goto mission_complete;
+        }
 
         std::string raw_thought = last_gen.text;
         nlohmann::json action = extract_json(raw_thought);
@@ -217,56 +232,62 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
             this->notify(writer, "PLANNING", reasoning);
 
-            // Handle Final Answer (Wait for user)
+            // Handle Final Answer
             if (tool_name == "FINAL_ANSWER") {
-                std::string ans = action["parameters"].value("answer", "");
-                last_graph_node = graph->add_node(ans, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
-                this->notify(writer, "FINAL", ans);
+                final_output = action["parameters"].value("answer", "");
+                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
+                this->notify(writer, "FINAL", final_output);
                 goto mission_complete; 
             }
 
-            // Record Tool Intent
+            // Record Intent
             std::string sig = tool_name + action["parameters"].dump();
             last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
 
-            // 🚀 4. SAFE EXECUTION
+            // Execution
             nlohmann::json params = action.value("parameters", nlohmann::json::object());
             params["project_id"] = req.project_id();
 
             this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             
-            // Call the Sentinel Wrapper
+            // 🚀 Call Sentinel
             std::string observation = safe_execute_tool(tool_name, params, session_id);
             
             // Record Result
             last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
-            // 🚀 5. SELF-CHECK LOGIC
+            // Self-Check
             if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
-                // Mark in graph for negative learning
+                last_error = observation;
                 graph->update_metadata(last_graph_node, "status", "failed");
+                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
                 this->notify(writer, "ERROR_CATCH", "Detected failure. Self-correcting...");
-                
-                // Add explicit error context for next loop
-                prompt_template += "\n### ⚠️ PREVIOUS STEP FAILED\nTool: " + tool_name + "\nError: " + observation + "\nINSTRUCTION: Fix parameters or try a different approach.\n";
             } else {
+                last_error = "";
                 graph->update_metadata(last_graph_node, "status", "success");
+                internal_monologue += "\n[OK] " + tool_name + " -> " + observation.substr(0, 200) + "...";
                 this->notify(writer, "SUCCESS", "Action confirmed.");
             }
             
         } else {
             // No tool = Chat response
-            std::string ans = last_gen.text;
-            last_graph_node = graph->add_node(ans, NodeType::RESPONSE, last_graph_node);
-            this->notify(writer, "FINAL", ans);
+            final_output = last_gen.text;
+            last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
+            this->notify(writer, "FINAL", final_output);
             goto mission_complete;
         }
     }
 
 mission_complete:
+    // Update cursor for continuity
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        session_cursors_[session_id] = last_graph_node;
+    }
+    
+    // Telemetry log
     auto mission_end_time = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(mission_end_time - mission_start_time).count();
-
     code_assistance::InteractionLog log;
     log.request_type = "AGENT";
     log.project_id = req.project_id();
@@ -276,13 +297,7 @@ mission_complete:
     log.full_prompt = "### HISTORY:\n" + internal_monologue;
     code_assistance::LogManager::instance().add_log(log);
 
-    // 🚀 UPDATE CURSOR
-    {
-        std::lock_guard<std::mutex> lock(cursor_mutex_);
-        session_cursors_[session_id] = last_graph_node;
-    }
     graph->save();
-
     return final_output;
 }
 
