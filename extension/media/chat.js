@@ -66,7 +66,7 @@
 
     // ... handleSend logic ...
     function handleSend() {
-        const text = promptInput.value.trim();
+        const text = promptInput.value.trim();  
         if (!text) return;
         const div = document.createElement('div');
         div.className = 'message user';
