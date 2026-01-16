@@ -142,11 +142,11 @@ std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> 
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
     
+    // 1. Setup Graph & Session
     auto graph = get_or_create_graph(req.project_id());
-
-    // Session Management
     std::string session_id = req.session_id();
     std::string parent_node_id = "";
+    
     {
         std::lock_guard<std::mutex> lock(cursor_mutex_);
         if (session_cursors_.find(session_id) == session_cursors_.end()) {
@@ -155,21 +155,27 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         parent_node_id = session_cursors_[session_id];
     }
 
-    // --- VARIABLE DECLARATIONS (Previously Missing) ---
+    // 2. DECLARE ALL STATE VARIABLES HERE (To fix C2065 errors)
     std::string tool_manifest = tool_registry_->get_manifest();
     std::string internal_monologue = "";
-    std::unordered_set<size_t> action_history;
-    std::hash<std::string> hasher;
     std::string final_output = "Mission Timed Out.";
     std::string last_error = ""; 
     code_assistance::GenerationResult last_gen; 
+    std::unordered_set<size_t> action_history;
+    std::hash<std::string> hasher;
 
-    // Record Prompt
+    // 3. Record User Prompt
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
-    std::string root_node_id = graph->add_node(req.prompt(), NodeType::PROMPT, parent_node_id, prompt_vec, {{"session_id", session_id}});
+    std::string root_node_id = graph->add_node(
+        req.prompt(), 
+        NodeType::PROMPT, 
+        parent_node_id, 
+        prompt_vec, 
+        {{"session_id", session_id}}
+    );
     std::string last_graph_node = root_node_id;
 
-    // Memory Recall
+    // 4. Memory Recall
     auto related_nodes = graph->semantic_search(prompt_vec, 5);
     std::string memories = "";
     std::string warnings = ""; 
@@ -177,14 +183,19 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     if (!related_nodes.empty()) {
         for(const auto& node : related_nodes) {
             bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
-            if (node.type == NodeType::TOOL_CALL && is_failure) {
-                warnings += "⚠️ AVOID: " + node.content + "\n";
-            } else if (node.type == NodeType::RESPONSE && !is_failure) {
-                memories += "- " + node.content + "\n";
+            if (node.type == NodeType::CONTEXT_CODE) {
+                std::string fpath = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
+                memories += "- [CODE] " + fpath + ":\n" + node.content.substr(0, 300) + "...\n";
+            } else if (node.type == NodeType::RESPONSE) {
+                if (!is_failure) memories += "- [PAST SOLUTION] " + node.content + "\n";
+            } else if (node.type == NodeType::TOOL_CALL) {
+                if (is_failure) warnings += "⚠️ AVOID: " + node.content + " (This failed previously)\n";
+                else memories += "- [SUCCESSFUL ACTION] " + node.content + "\n";
             }
         }
     }
 
+    // 5. Execution Loop
     int max_steps = 16;
     
     for (int step = 0; step < max_steps; ++step) {
@@ -196,7 +207,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "### USER REQUEST\n" + req.prompt() + "\n\n"
             "### INTERACTIVE WORKFLOW\n"
             "1. **Analyze**: Understand the goal.\n"
-            "2. **Drafting Mode**: If the user asks to generate code or tests, use `read_file` to gather context, then OUTPUT the proposed plan/code in your thought/answer. DO NOT execute edits yet unless explicitly told.\n"
+            "2. **Drafting Mode**: If the user asks to generate code, use `read_file` to gather context, then OUTPUT the proposed plan/code in your thought. DO NOT execute edits yet unless explicitly told.\n"
             "3. **Execution Mode**: If the user says 'Run', 'Fix', 'Apply', or 'Continue', execute the tools (`apply_edit`, `run_command`).\n"
             "4. **Self-Correction**: If a tool returns an ERROR, analyze it and retry with fixed parameters.\n\n"
             "### RESPONSE FORMAT (STRICT JSON)\n"
