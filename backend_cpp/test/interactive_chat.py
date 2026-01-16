@@ -36,7 +36,7 @@ def interactive_session():
 
         try:
             # Note: We use a long timeout because the agent might run tests/edits
-            res = requests.post(f"{API_URL}/generate-code-suggestion", json=payload, timeout=180)
+            res = requests.post(f"{API_URL}/generate-code-suggestion", json=payload, timeout=18000)
             
             if res.status_code == 200:
                 data = res.json()
