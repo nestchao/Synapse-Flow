@@ -86,6 +86,8 @@ int main() {
     auto sub_agent = std::make_shared<code_assistance::SubAgent>();
     auto tools = std::make_shared<code_assistance::ToolRegistry>();
 
+    auto memory_vault = std::make_shared<code_assistance::MemoryVault>("data/memory_vault");
+
     // 2. Wire Tools
     tools->register_tool(std::make_unique<code_assistance::ReadFileTool>());
     tools->register_tool(std::make_unique<code_assistance::ListDirTool>());
@@ -107,7 +109,8 @@ int main() {
         nullptr, 
         ai_service,
         sub_agent,
-        tools
+        tools,
+        memory_vault 
     );
 
     // 4. Ignite Server
