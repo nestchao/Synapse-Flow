@@ -21,8 +21,10 @@ AgentExecutor::AgentExecutor(
     std::shared_ptr<RetrievalEngine> engine,
     std::shared_ptr<EmbeddingService> ai,
     std::shared_ptr<SubAgent> sub_agent,
-    std::shared_ptr<ToolRegistry> tool_registry
-) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry) {
+    std::shared_ptr<ToolRegistry> tool_registry,
+    std::shared_ptr<MemoryVault> memory_vault
+
+) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry), memory_vault_(memory_vault) {
 
     context_mgr_ = std::make_unique<ContextManager>();
 }
@@ -155,16 +157,14 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         parent_node_id = session_cursors_[session_id];
     }
 
-    // 2. DECLARE ALL STATE VARIABLES HERE (To fix C2065 errors)
+    // 2. Variables
     std::string tool_manifest = tool_registry_->get_manifest();
     std::string internal_monologue = "";
     std::string final_output = "Mission Timed Out.";
     std::string last_error = ""; 
     code_assistance::GenerationResult last_gen; 
-    std::unordered_set<size_t> action_history;
-    std::hash<std::string> hasher;
 
-    // 3. Record User Prompt
+    // 3. Record User Prompt & Embed
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
     std::string root_node_id = graph->add_node(
         req.prompt(), 
@@ -175,20 +175,32 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     );
     std::string last_graph_node = root_node_id;
 
-    // 4. Memory Recall
+    // 4. Memory Recall (Hybrid: Short-term Graph + Long-term Vault)
+    
+    // A. Long Term (Experience Vault)
+    MemoryRecallResult long_term = memory_vault_->recall(prompt_vec);
+
+    // B. Short Term (Graph Context)
     auto related_nodes = graph->semantic_search(prompt_vec, 5);
     std::string memories = "";
     std::string warnings = ""; 
+    std::string episodic_memories = "";
 
     if (!related_nodes.empty()) {
         for(const auto& node : related_nodes) {
             bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
+            
+            // Code Context
             if (node.type == NodeType::CONTEXT_CODE) {
                 std::string fpath = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
                 memories += "- [CODE] " + fpath + ":\n" + node.content.substr(0, 300) + "...\n";
-            } else if (node.type == NodeType::RESPONSE) {
-                if (!is_failure) memories += "- [PAST SOLUTION] " + node.content + "\n";
-            } else if (node.type == NodeType::TOOL_CALL) {
+            } 
+            // Recent Chat History
+            else if (node.type == NodeType::RESPONSE) {
+                if (!is_failure) episodic_memories += "- [RECENT CHAT] " + node.content + "\n";
+            } 
+            // Past Actions
+            else if (node.type == NodeType::TOOL_CALL) {
                 if (is_failure) warnings += "⚠️ AVOID: " + node.content + " (This failed previously)\n";
                 else memories += "- [SUCCESSFUL ACTION] " + node.content + "\n";
             }
@@ -202,29 +214,36 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         
         std::string prompt_template = 
             "### SYSTEM ROLE\n"
-            "You are 'Synapse', a C++ Autonomous Agent. You act within a persistent session.\n\n"
+            "You are 'Synapse', an Autonomous Coding Agent.\n\n"
             "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
-            "### USER REQUEST\n" + req.prompt() + "\n\n"
-            "### INTERACTIVE WORKFLOW\n"
-            "1. **Analyze**: Understand the goal.\n"
-            "2. **Drafting Mode**: If the user asks to generate code, use `read_file` to gather context, then OUTPUT the proposed plan/code in your thought. DO NOT execute edits yet unless explicitly told.\n"
-            "3. **Execution Mode**: If the user says 'Run', 'Fix', 'Apply', or 'Continue', execute the tools (`apply_edit`, `run_command`).\n"
-            "4. **Self-Correction**: If a tool returns an ERROR, analyze it and retry with fixed parameters.\n\n"
-            "### RESPONSE FORMAT (STRICT JSON)\n"
-            "{\n"
-            "  \"thought\": \"Reasoning...\",\n"
-            "  \"tool\": \"tool_name\",\n"
-            "  \"parameters\": { ... }\n"
-            "}\n\n";
+            "### USER REQUEST\n" + req.prompt() + "\n\n";
 
-        if (!memories.empty()) prompt_template += "### CONTEXT MEMORY\n" + memories + "\n";
-        if (!warnings.empty()) prompt_template += "### ⛔ ACTIVE WARNINGS\n" + warnings + "\n";
+        // 🚀 INJECT EXPERIENCE VAULT (Long Term)
+        if (long_term.has_memories) {
+            if(!long_term.positive_hints.empty()) 
+                prompt_template += "### 🧠 SUCCESSFUL STRATEGIES (Verified Patterns)\n" + long_term.positive_hints + "\n";
+            if(!long_term.negative_warnings.empty()) 
+                prompt_template += "### ⛔ KNOWN PITFALLS (Avoid These)\n" + long_term.negative_warnings + "\n";
+        }
+
+        // 🚀 INJECT EPISODIC MEMORY (Short Term)
+        if (!episodic_memories.empty()) prompt_template += "### EPISODIC CONTEXT (Recent)\n" + episodic_memories + "\n";
+        if (!memories.empty()) prompt_template += "### RELEVANT CODE/ACTIONS\n" + memories + "\n";
+        
+        // 🚀 INJECT EXECUTION STATE
         if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
-        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
+        if (!warnings.empty()) prompt_template += "### ⛔ ACTIVE WARNINGS\n" + warnings + "\n";
+        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error using a different strategy.\n";
 
-        prompt_template += "\nNEXT JSON ACTION:";
+        prompt_template += "\n### INSTRUCTIONS\n"
+                           "1. Analyze the Context and Memory.\n"
+                           "2. Choose the best Tool or Final Answer.\n"
+                           "3. Respond in STRICT JSON.\n"
+                           "\nNEXT JSON ACTION:";
 
+        spdlog::debug("📝 FULL PROMPT SENT TO AI:\n{}", prompt_template);
         this->notify(writer, "THINKING", "Processing logic...");
+        
         last_gen = ai_service_->generate_text_elite(prompt_template);
         
         if (!last_gen.success) {
@@ -247,6 +266,12 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             if (tool_name == "FINAL_ANSWER") {
                 final_output = action["parameters"].value("answer", "");
                 last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
+                
+                // 🚀 LEARNING: If we reached success without crashing, record it as a positive pattern
+                if (last_error.empty()) {
+                    memory_vault_->add_success(req.prompt(), "Solved via: " + internal_monologue.substr(0, 500), prompt_vec);
+                }
+
                 this->notify(writer, "FINAL", final_output);
                 goto mission_complete; 
             }
@@ -267,8 +292,11 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             // Record Result
             last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
-            // Self-Check
+            // Self-Check & Learning
             if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
+                // 🚀 LEARNING: Record Negative Pattern
+                memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name + " Params: " + params.dump(), prompt_vec);
+                
                 last_error = observation;
                 graph->update_metadata(last_graph_node, "status", "failed");
                 internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;

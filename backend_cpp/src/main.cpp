@@ -41,6 +41,8 @@ public:
         sub_agent_ = std::make_shared<code_assistance::SubAgent>();
         tool_registry_ = std::make_shared<code_assistance::ToolRegistry>();
         
+        auto memory_vault = std::make_shared<code_assistance::MemoryVault>("data/memory_vault");
+        
         tool_registry_->register_tool(std::make_unique<code_assistance::ReadFileTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::ListDirTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
@@ -49,7 +51,7 @@ public:
         tool_registry_->register_tool(std::make_unique<code_assistance::ShellExecutionTool>());
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
-            nullptr, ai_service_, sub_agent_, tool_registry_
+            nullptr, ai_service_, sub_agent_, tool_registry_, memory_vault // 🚀 Pass Vault
         );
 
         setup_routes();
