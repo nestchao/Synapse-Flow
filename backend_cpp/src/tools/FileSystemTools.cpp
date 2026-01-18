@@ -173,7 +173,12 @@ std::string FileSystemTools::list_dir_deep(const std::string& project_id, const 
     if (root_str.empty()) return "ERROR: Project path invalid or not registered.";
 
     fs::path base_root = fs::path(root_str);
-    fs::path target_path = (base_root / sub);
+    fs::path target_path;
+    if (sub == "." || sub.empty() || sub == "/" || sub == "\\") {
+        target_path = base_root;
+    } else {
+        target_path = (base_root / sub);
+    }
 
     if (!is_safe_path(base_root, target_path)) return "ERROR: Access Denied (Outside Workspace).";
     if (!fs::exists(target_path)) return "ERROR: Path not found.";
@@ -200,9 +205,9 @@ std::string FileSystemTools::list_dir_deep(const std::string& project_id, const 
             
             auto depth_rel = fs::relative(current, target_path, ec);
             if (ec) continue;
+
             int depth = 0;
             for (auto it = depth_rel.begin(); it != depth_rel.end(); ++it) depth++;
-            
             if (depth > max_depth) continue;
 
             auto rel_path = fs::relative(current, base_root, ec);
@@ -289,7 +294,14 @@ std::string FileSystemTools::read_file_safe(const std::string& project_id, const
 std::string ReadFileTool::execute(const std::string& args_json) {
     try {
         auto j = nlohmann::json::parse(args_json);
-        return FileSystemTools::read_file_safe(j.value("project_id", ""), j.value("path", ""));
+        std::string pid = j.value("project_id", "");
+        std::string path = j.value("path", "."); // Default to "."
+        
+        // Normalize root request
+        if (path == "/" || path == "\\" || path.empty()) path = ".";
+        
+        auto filter = FileSystemTools::load_config(pid);
+        return FileSystemTools::list_dir_deep(pid, path, filter, j.value("depth", 2));
     } catch (...) { return "ERROR: Invalid JSON."; }
 }
 

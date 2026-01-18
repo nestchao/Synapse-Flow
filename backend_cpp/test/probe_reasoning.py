@@ -1,57 +1,59 @@
-import grpc
-import agent_pb2
-import agent_pb2_grpc
+import requests
+import json
+import base64 
 import time
-import base64 # 🚀 IMPORT ADDED
 from termcolor import colored
 
-# Connect to local gRPC
-channel = grpc.insecure_channel('127.0.0.1:50051')
-stub = agent_pb2_grpc.AgentServiceStub(channel)
-
-# 🚀 TARGET CONFIG
+# 🚀 CONFIGURATION
+API_URL = "http://127.0.0.1:5002" # REST Port (Connected to Dashboard)
 TARGET_RAW = "D:/Projects/SA_ETF"
-# ENCODE IT to match the folder created by setup_config.py
 TARGET_PROJECT_ID = base64.b64encode(TARGET_RAW.encode('utf-8')).decode('utf-8')
 
-def run_reasoning_test():
-    print(colored(f"🧠 PH3: Starting Reasoning Probe on {TARGET_RAW} (ID: {TARGET_PROJECT_ID})...", "cyan", attrs=['bold']))
+def run_rest_reasoning():
+    print(colored(f"🧠 Starting REST Reasoning Probe on {TARGET_RAW}...", "cyan", attrs=['bold']))
     
-    # 1. THE TRAP
-    # Write to an ignored file.
-    prompt = "Write to 'ignore01/test01.py'. If it fails, list the root directory to find the real file."
-    
-    query = agent_pb2.UserQuery(
-        project_id=TARGET_PROJECT_ID, # 🚀 SEND BASE64 ID
-        prompt=prompt,
-        session_id=f"PHOENIX_{int(time.time())}"
+    # 🚀 SCENARIO:
+    # 1. Try to write to a forbidden zone.
+    # 2. Fallback to valid file.
+    prompt = (
+        "Try to write the text 'SECRET' to 'ignore01/secret_rest.txt'. "
+        "If that operation fails or is blocked, create a file named 'recovery_log_rest.txt' "
+        "in the root directory with the content 'REST API Verified'."
     )
+    
+    # Session ID allows us to filter in the dashboard
+    session_id = f"REST_PROBE_{int(time.time())}"
+
+    payload = {
+        "project_id": TARGET_PROJECT_ID,
+        "prompt": prompt,
+        "session_id": session_id
+    }
 
     try:
-        # Increased timeout for debugging
-        responses = stub.ExecuteTask(query, timeout=120)
+        print("\n🚀 Sending Request to REST Brain...")
+        start = time.time()
         
-        print("\n📡 MONITORING AGENT STREAM:")
-        print("-" * 60)
+        # Long timeout for reasoning loop
+        res = requests.post(f"{API_URL}/generate-code-suggestion", json=payload, timeout=120)
         
-        for res in responses:
-            if res.phase == "ERROR_CATCH":
-                print(colored(f"   🛡️  [SELF-CORRECTION] {res.payload}", "green"))
-            elif res.phase == "TOOL_EXEC":
-                print(colored(f"   🛠️  [TOOL] {res.payload}", "yellow"))
-            elif res.phase == "THINKING":
-                print(colored(f"   💭 [AI] {res.payload}", "blue"))
-            elif res.phase == "FATAL":
-                print(colored(f"   ❌ [FATAL] {res.payload}", "red", attrs=['bold']))
-            elif res.phase == "FINAL":
-                print(colored(f"   🏁 [FINAL] {res.payload}", "white", attrs=['bold']))
-            else:
-                print(f"   [{res.phase}] {res.payload}")
-                
-        print("-" * 60)
+        duration = time.time() - start
+        
+        if res.status_code == 200:
+            data = res.json()
+            suggestion = data.get("suggestion", "")
+            
+            print(f"\n✅ Mission Success ({duration:.2f}s)")
+            print(colored("-" * 60, "yellow"))
+            print(suggestion)
+            print(colored("-" * 60, "yellow"))
+            print(f"\n👀 NOW CHECK DASHBOARD: http://localhost:5002/admin")
+            print(f"   Look for Session ID: {session_id}")
+        else:
+            print(f"❌ Error {res.status_code}: {res.text}")
 
     except Exception as e:
         print(colored(f"❌ Connection Failed: {e}", "red"))
 
 if __name__ == "__main__":
-    run_reasoning_test()
+    run_rest_reasoning()

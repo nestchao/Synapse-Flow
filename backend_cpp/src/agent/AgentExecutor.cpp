@@ -11,6 +11,7 @@
 #include <stack>
 #include <unordered_set>
 #include "parser_elite.hpp"
+#include "tools/FileSystemTools.hpp"
 
 namespace code_assistance {
 
@@ -27,6 +28,7 @@ AgentExecutor::AgentExecutor(
 ) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry), memory_vault_(memory_vault) {
 
     context_mgr_ = std::make_unique<ContextManager>();
+    planning_engine_ = std::make_unique<PlanningEngine>();
 }
 
 // --- HELPERS (Kept same as your code) ---
@@ -73,6 +75,27 @@ void AgentExecutor::notify(::grpc::ServerWriter<::code_assistance::AgentResponse
     }
     code_assistance::LogManager::instance().add_trace({"AGENT", "", phase, msg, duration_ms});
 }
+
+std::shared_ptr<SkillLibrary> AgentExecutor::get_skill_library(const std::string& project_id) {
+    std::lock_guard<std::mutex> lock(skill_mutex_);
+    
+    if (skill_libraries_.find(project_id) == skill_libraries_.end()) {
+        std::string root_str = FileSystemTools::resolve_project_root(project_id);
+        
+        // Default to data folder if resolution fails, otherwise use project-specific folder
+        fs::path skill_path;
+        if (root_str.empty()) {
+            skill_path = fs::path("data") / "business_metadata";
+        } else {
+            skill_path = fs::path(root_str) / ".study_assistant" / "business_metadata";
+        }
+
+        spdlog::info("🧠 Loading Skills for {} from {}", project_id, skill_path.string());
+        skill_libraries_[project_id] = std::make_shared<SkillLibrary>(skill_path.string(), ai_service_);
+    }
+    return skill_libraries_[project_id];
+}
+
 
 // 🚀 GRAPH MANAGEMENT IMPLEMENTATION
 std::shared_ptr<PointerGraph> AgentExecutor::get_or_create_graph(const std::string& project_id) {
@@ -166,21 +189,29 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
     // 3. Record User Prompt & Embed
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
-    std::string root_node_id = graph->add_node(
-        req.prompt(), 
-        NodeType::PROMPT, 
-        parent_node_id, 
-        prompt_vec, 
-        {{"session_id", session_id}}
-    );
+    std::string root_node_id = graph->add_node(req.prompt(), NodeType::PROMPT, parent_node_id, prompt_vec, {{"session_id", session_id}});
     std::string last_graph_node = root_node_id;
 
-    // 4. Memory Recall (Hybrid: Short-term Graph + Long-term Vault)
+    // --- SKILL RETRIEVAL ---
+    auto skill_lib = get_skill_library(req.project_id());
+    std::string business_context = skill_lib->retrieve_skills(req.prompt(), prompt_vec);
     
-    // A. Long Term (Experience Vault)
-    MemoryRecallResult long_term = memory_vault_->recall(prompt_vec);
+    if (!business_context.empty()) {
+        this->notify(writer, "SKILL_LOAD", "Loaded relevant business rules & patterns.");
+    }
 
-    // B. Short Term (Graph Context)
+    // Check Plan Approval via Chat
+    if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved()) {
+        std::string p_lower = req.prompt();
+        std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
+        if (p_lower.find("approve") != std::string::npos || p_lower.find("yes") != std::string::npos || p_lower.find("proceed") != std::string::npos) {
+            planning_engine_->approve_plan();
+            this->notify(writer, "PLANNING", "Plan approved. Commencing execution.");
+        }
+    }
+
+    // 4. Memory Recall
+    MemoryRecallResult long_term = memory_vault_->recall(prompt_vec);
     auto related_nodes = graph->semantic_search(prompt_vec, 5);
     std::string memories = "";
     std::string warnings = ""; 
@@ -190,16 +221,13 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         for(const auto& node : related_nodes) {
             bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
             
-            // Code Context
             if (node.type == NodeType::CONTEXT_CODE) {
                 std::string fpath = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
                 memories += "- [CODE] " + fpath + ":\n" + node.content.substr(0, 300) + "...\n";
             } 
-            // Recent Chat History
             else if (node.type == NodeType::RESPONSE) {
                 if (!is_failure) episodic_memories += "- [RECENT CHAT] " + node.content + "\n";
             } 
-            // Past Actions
             else if (node.type == NodeType::TOOL_CALL) {
                 if (is_failure) warnings += "⚠️ AVOID: " + node.content + " (This failed previously)\n";
                 else memories += "- [SUCCESSFUL ACTION] " + node.content + "\n";
@@ -215,35 +243,39 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         std::string prompt_template = 
             "### SYSTEM ROLE\n"
             "You are 'Synapse', an Autonomous Coding Agent.\n\n"
-            "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
+            "### TOOL MANIFEST\n" + tool_manifest + "\n"
+            "Added Tool: `propose_plan` -> Input: { \"steps\": [ {\"description\": \"...\", \"files\": \"...\"} ] }\n\n"
+            
             "### USER REQUEST\n" + req.prompt() + "\n\n";
 
-        // 🚀 INJECT EXPERIENCE VAULT (Long Term)
+        if (!business_context.empty()) prompt_template += business_context + "\n";
+
+        std::string plan_ctx = planning_engine_->get_plan_context_for_ai();
+        if (!plan_ctx.empty()) prompt_template += plan_ctx + "\n";
+
         if (long_term.has_memories) {
             if(!long_term.positive_hints.empty()) 
-                prompt_template += "### 🧠 SUCCESSFUL STRATEGIES (Verified Patterns)\n" + long_term.positive_hints + "\n";
+                prompt_template += "### 🧠 SUCCESSFUL STRATEGIES\n" + long_term.positive_hints + "\n";
             if(!long_term.negative_warnings.empty()) 
-                prompt_template += "### ⛔ KNOWN PITFALLS (Avoid These)\n" + long_term.negative_warnings + "\n";
+                prompt_template += "### ⛔ KNOWN PITFALLS\n" + long_term.negative_warnings + "\n";
         }
 
-        // 🚀 INJECT EPISODIC MEMORY (Short Term)
-        if (!episodic_memories.empty()) prompt_template += "### EPISODIC CONTEXT (Recent)\n" + episodic_memories + "\n";
-        if (!memories.empty()) prompt_template += "### RELEVANT CODE/ACTIONS\n" + memories + "\n";
-        
-        // 🚀 INJECT EXECUTION STATE
+        if (!episodic_memories.empty()) prompt_template += "### EPISODIC CONTEXT\n" + episodic_memories + "\n";
+        if (!memories.empty()) prompt_template += "### RELEVANT CODE\n" + memories + "\n";
         if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
         if (!warnings.empty()) prompt_template += "### ⛔ ACTIVE WARNINGS\n" + warnings + "\n";
-        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error using a different strategy.\n";
+        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
 
         prompt_template += "\n### INSTRUCTIONS\n"
-                           "1. Analyze the Context and Memory.\n"
-                           "2. Choose the best Tool or Final Answer.\n"
-                           "3. Respond in STRICT JSON.\n"
+                           "1. **Planning**: If task is complex and NO plan exists, use `propose_plan`.\n"
+                           "2. **Review**: If plan is PENDING, ask user to review. Do not execute.\n"
+                           "3. **Execution**: If plan APPROVED, execute current step.\n"
+                           "4. **Strict Protocol**: JSON { \"tool\": ..., \"parameters\": ... } only. No Python.\n"
                            "\nNEXT JSON ACTION:";
 
-        spdlog::debug("📝 FULL PROMPT SENT TO AI:\n{}", prompt_template);
-        this->notify(writer, "THINKING", "Processing logic...");
+        spdlog::debug("📝 PROMPT TO AI (Truncated):\n{}", prompt_template.substr(0, 1000));
         
+        this->notify(writer, "THINKING", "Processing logic...");
         last_gen = ai_service_->generate_text_elite(prompt_template);
         
         if (!last_gen.success) {
@@ -253,21 +285,64 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
         std::string raw_thought = last_gen.text;
         nlohmann::json action = extract_json(raw_thought);
-        
+
+        // 🛡️ HALLUCINATION TRAP
+        if (action.contains("tool_code")) {
+            internal_monologue += "\n[SYSTEM ERROR] Invalid JSON Format (tool_code). Use {\"tool\": ..., \"parameters\": ...}.";
+            this->notify(writer, "ERROR_CATCH", "Invalid Protocol (tool_code). Retrying...");
+            continue; 
+        }
+
         if (action.contains("tool")) {
             std::string tool_name = action["tool"];
             std::string reasoning = action.value("thought", "");
             
-            // Record Thought
+            // 🚀 FIX: EXTRACT PARAMS HERE (Scope Fix)
+            nlohmann::json params = action.value("parameters", nlohmann::json::object());
+            params["project_id"] = req.project_id();
+
+            // 1. Propose Plan
+            if (tool_name == "propose_plan") {
+                if (params.contains("steps")) {
+                    planning_engine_->propose_plan(req.prompt(), params["steps"]);
+                    
+                    ::code_assistance::AgentResponse plan_res;
+                    plan_res.set_phase("PROPOSAL");
+                    plan_res.set_payload(planning_engine_->current_plan.to_json().dump());
+                    writer->Write(plan_res);
+                    
+                    final_output = "I have proposed a plan based on the business rules. Please review and approve.";
+                    goto mission_complete; 
+                }
+            }
+
+            // 2. Block Unapproved Plans
+            if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved() && tool_name != "read_file" && tool_name != "web_search" && tool_name != "propose_plan") {
+                this->notify(writer, "BLOCKED", "Plan not approved. Waiting for user.");
+                final_output = "Please approve the plan before I modify files.";
+                goto mission_complete;
+            }
+
+            // 3. Execute Tool (Params is now visible)
+            this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
+            std::string observation = safe_execute_tool(tool_name, params, session_id);
+
+            // 4. Update Plan Step
+            if (planning_engine_->is_plan_approved() && observation.find("SUCCESS") != std::string::npos) {
+                if (tool_name == "apply_edit") {
+                    planning_engine_->mark_step_complete(planning_engine_->current_plan.current_step_index);
+                }
+            }
+            
+            // 5. Record Thought
             last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
             this->notify(writer, "PLANNING", reasoning);
 
-            // Handle Final Answer
+            // 6. Handle Final Answer
             if (tool_name == "FINAL_ANSWER") {
-                final_output = action["parameters"].value("answer", "");
+                final_output = params.value("answer", "");
                 last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
                 
-                // 🚀 LEARNING: If we reached success without crashing, record it as a positive pattern
                 if (last_error.empty()) {
                     memory_vault_->add_success(req.prompt(), "Solved via: " + internal_monologue.substr(0, 500), prompt_vec);
                 }
@@ -276,35 +351,23 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                 goto mission_complete; 
             }
 
-            // Record Intent
-            std::string sig = tool_name + action["parameters"].dump();
+            // 7. Record Intent & Result
+            std::string sig = tool_name + params.dump();
             last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
-
-            // Execution
-            nlohmann::json params = action.value("parameters", nlohmann::json::object());
-            params["project_id"] = req.project_id();
-
-            this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             
-            // 🚀 Call Sentinel
-            std::string observation = safe_execute_tool(tool_name, params, session_id);
-            
-            // Record Result
             last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
-            // Self-Check & Learning
+            // 8. Self-Check & Learning
             if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
-                // 🚀 LEARNING: Record Negative Pattern
                 memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name + " Params: " + params.dump(), prompt_vec);
-                
                 last_error = observation;
                 graph->update_metadata(last_graph_node, "status", "failed");
-                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
+                internal_monologue += "\n[FAILED] " + tool_name + " " + params.dump() + " -> " + observation;
                 this->notify(writer, "ERROR_CATCH", "Detected failure. Self-correcting...");
             } else {
                 last_error = "";
                 graph->update_metadata(last_graph_node, "status", "success");
-                internal_monologue += "\n[OK] " + tool_name + " -> " + observation.substr(0, 200) + "...";
+                internal_monologue += "\n[OK] " + tool_name + " " + params.dump() + " -> " + observation.substr(0, 200) + "...";
                 this->notify(writer, "SUCCESS", "Action confirmed.");
             }
             
@@ -318,13 +381,11 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     }
 
 mission_complete:
-    // Update cursor for continuity
     {
         std::lock_guard<std::mutex> lock(cursor_mutex_);
         session_cursors_[session_id] = last_graph_node;
     }
     
-    // Telemetry log
     auto mission_end_time = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(mission_end_time - mission_start_time).count();
     code_assistance::InteractionLog log;
