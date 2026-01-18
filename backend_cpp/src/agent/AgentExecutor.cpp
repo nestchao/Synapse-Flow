@@ -27,6 +27,8 @@ AgentExecutor::AgentExecutor(
 ) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry), memory_vault_(memory_vault) {
 
     context_mgr_ = std::make_unique<ContextManager>();
+    skill_library_ = std::make_unique<SkillLibrary>("data/business_metadata", ai);
+    planning_engine_ = std::make_unique<PlanningEngine>();
 }
 
 // --- HELPERS (Kept same as your code) ---
@@ -175,6 +177,21 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     );
     std::string last_graph_node = root_node_id;
 
+    // --- SKILL RETRIEVAL ---
+    std::string business_context = skill_library_->retrieve_skills(req.prompt(), prompt_vec);
+    if (!business_context.empty()) {
+        this->notify(writer, "SKILL_LOAD", "Loaded relevant business rules & patterns.");
+    }
+
+    if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved()) {
+        std::string p_lower = req.prompt();
+        std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
+        if (p_lower.find("approve") != std::string::npos || p_lower.find("yes") != std::string::npos || p_lower.find("proceed") != std::string::npos) {
+            planning_engine_->approve_plan();
+            this->notify(writer, "PLANNING", "Plan approved. Commencing execution.");
+        }
+    }
+
     // 4. Memory Recall (Hybrid: Short-term Graph + Long-term Vault)
     
     // A. Long Term (Experience Vault)
@@ -218,6 +235,11 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "### TOOL MANIFEST\n" + tool_manifest + "\n\n"
             "### USER REQUEST\n" + req.prompt() + "\n\n";
 
+        if (!business_context.empty()) prompt_template += business_context + "\n";
+
+        std::string plan_ctx = planning_engine_->get_plan_context_for_ai();
+        if (!plan_ctx.empty()) prompt_template += plan_ctx + "\n";
+
         // 🚀 INJECT EXPERIENCE VAULT (Long Term)
         if (long_term.has_memories) {
             if(!long_term.positive_hints.empty()) 
@@ -238,7 +260,9 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         prompt_template += "\n### INSTRUCTIONS\n"
                            "1. Analyze the Context and Memory.\n"
                            "2. Choose the best Tool or Final Answer.\n"
-                           "3. Respond in STRICT JSON.\n"
+                           "3. **CRITICAL**: Do NOT write Python code. Return JSON only.\n"
+                           "4. **CRITICAL**: Do NOT use the key \"tool_code\". Use \"tool\" and \"parameters\".\n"
+                           "5. **CRITICAL**: If the history shows you have already completed the fallback action, STOP and return FINAL_ANSWER.\n"
                            "\nNEXT JSON ACTION:";
 
         spdlog::debug("📝 FULL PROMPT SENT TO AI:\n{}", prompt_template);
@@ -253,10 +277,52 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
         std::string raw_thought = last_gen.text;
         nlohmann::json action = extract_json(raw_thought);
+
+        if (action.contains("tool_code")) {
+            std::string bad_output = action["tool_code"].is_string() ? action["tool_code"].get<std::string>() : action["tool_code"].dump();
+            spdlog::warn("⚠️ Agent Hallucination detected: tool_code");
+            
+            internal_monologue += "\n[SYSTEM ERROR] Invalid JSON Format. You returned 'tool_code'. You MUST return {\"tool\": \"...\", \"parameters\": {...}}. Do not write Python code.";
+            
+            this->notify(writer, "ERROR_CATCH", "Invalid Protocol (tool_code detected). Retrying...");
+            continue; // 🔄 Force Retry immediately without counting as a step
+        }
+
+        if (action.contains("tool") && action["tool"] == "propose_plan") {
+            auto params = action["parameters"];
+            if (params.contains("steps")) {
+                planning_engine_->propose_plan(req.prompt(), params["steps"]);
+                
+                // Send specific Plan payload to UI
+                ::code_assistance::AgentResponse plan_res;
+                plan_res.set_phase("PROPOSAL");
+                plan_res.set_payload(planning_engine_->current_plan.to_json().dump());
+                writer->Write(plan_res);
+                
+                final_output = "I have proposed a plan based on the business rules. Please review and approve.";
+                goto mission_complete; // Stop and wait for user
+            }
+        }
         
         if (action.contains("tool")) {
             std::string tool_name = action["tool"];
             std::string reasoning = action.value("thought", "");
+
+            if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved() && tool_name != "read_file" && tool_name != "web_search") {
+                this->notify(writer, "BLOCKED", "Plan not approved. Waiting for user.");
+                final_output = "Please approve the plan before I modify files.";
+                goto mission_complete;
+            }
+
+            std::string observation = safe_execute_tool(tool_name, params, session_id);
+
+            // If successful execution of a step, mark it
+            if (planning_engine_->is_plan_approved() && observation.find("SUCCESS") != std::string::npos) {
+                // Heuristic: If we used apply_edit, we probably finished a step
+                if (tool_name == "apply_edit") {
+                    planning_engine_->mark_step_complete(planning_engine_->current_plan.current_step_index);
+                }
+            }
             
             // Record Thought
             last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
@@ -286,25 +352,26 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
             this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             
-            // 🚀 Call Sentinel
-            std::string observation = safe_execute_tool(tool_name, params, session_id);
-            
             // Record Result
             last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
             // Self-Check & Learning
             if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
-                // 🚀 LEARNING: Record Negative Pattern
+
                 memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name + " Params: " + params.dump(), prompt_vec);
                 
                 last_error = observation;
                 graph->update_metadata(last_graph_node, "status", "failed");
-                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
+                
+                internal_monologue += "\n[FAILED] " + tool_name + " " + params.dump() + " -> " + observation;
+                
                 this->notify(writer, "ERROR_CATCH", "Detected failure. Self-correcting...");
             } else {
                 last_error = "";
                 graph->update_metadata(last_graph_node, "status", "success");
-                internal_monologue += "\n[OK] " + tool_name + " -> " + observation.substr(0, 200) + "...";
+                
+                internal_monologue += "\n[OK] " + tool_name + " " + params.dump() + " -> " + observation.substr(0, 200) + "...";
+                
                 this->notify(writer, "SUCCESS", "Action confirmed.");
             }
             

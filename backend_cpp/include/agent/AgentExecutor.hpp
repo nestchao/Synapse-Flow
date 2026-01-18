@@ -15,6 +15,8 @@
 #include "agent/ContextManager.hpp"
 #include "memory/PointerGraph.hpp"
 #include "memory/MemoryVault.hpp"
+#include "skills/SkillLibrary.hpp"
+#include "planning/PlanningEngine.hpp"
 
 namespace code_assistance {
 
@@ -46,6 +48,8 @@ private:
     std::shared_ptr<SubAgent> sub_agent_;
     std::shared_ptr<ToolRegistry> tool_registry_;
     std::shared_ptr<MemoryVault> memory_vault_; // Added member
+    std::unique_ptr<SkillLibrary> skill_library_;
+    std::unique_ptr<PlanningEngine> planning_engine_;
     
     std::unique_ptr<ContextManager> context_mgr_;
     std::unordered_map<std::string, std::shared_ptr<PointerGraph>> graphs_;
