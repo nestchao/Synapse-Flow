@@ -294,6 +294,12 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         }
 
         if (action.contains("tool")) {
+            if (!action["tool"].is_string()) {
+                internal_monologue += "\n[SYSTEM ERROR] 'tool' field must be a string.";
+                this->notify(writer, "ERROR_CATCH", "Invalid JSON type for 'tool'. Retrying...");
+                continue;
+            }
+
             std::string tool_name = action["tool"];
             std::string reasoning = action.value("thought", "");
             
@@ -309,8 +315,12 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                     ::code_assistance::AgentResponse plan_res;
                     plan_res.set_phase("PROPOSAL");
                     plan_res.set_payload(planning_engine_->current_plan.to_json().dump());
-                    writer->Write(plan_res);
+                    if (writer) {
+                        writer->Write(plan_res);
+                    }
                     
+                    // Optionally append the plan to text for REST clients if needed
+                    // For now, the text notification is enough for the probe
                     final_output = "I have proposed a plan based on the business rules. Please review and approve.";
                     goto mission_complete; 
                 }

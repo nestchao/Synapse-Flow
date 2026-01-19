@@ -41,11 +41,14 @@ public:
                             safe_cmd.find("javac") == 0 || 
                             safe_cmd.find("java") == 0 || 
                             safe_cmd.find("gradle") == 0 ||
+                            safe_cmd.find("python") == 0 ||  
+                            safe_cmd.find("python3") == 0 ||
+                            safe_cmd.find("pip") == 0 ||     
                             safe_cmd.find("dir") == 0 || 
                             safe_cmd.find("ls") == 0);
 
             if (!is_safe) {
-                return "ERROR: Security Block. Only 'mvn', 'javac', 'java', 'gradle' commands are allowed.";
+                return "ERROR: Security Block. Only 'mvn', 'java', 'python', 'pip', 'gradle' commands are allowed.";
             }
 
             // 3. Construct Command (CD into root first)

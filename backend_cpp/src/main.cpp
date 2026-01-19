@@ -189,7 +189,15 @@ private:
             auto body = json::parse(req.body);
             std::string result = executor_->run_autonomous_loop_internal(body);
             res.set_content(json{{"suggestion", result}}.dump(), "application/json");
-        } catch(...) { res.status = 500; }
+        } catch(const std::exception& e) { 
+            spdlog::error("🔥 REST HANDLER ERROR: {}", e.what()); // 🚀 Log the error
+            res.status = 500; 
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json"); // Return JSON error
+        } catch(...) {
+            spdlog::error("🔥 REST HANDLER CRASH: Unknown Exception"); 
+            res.status = 500;
+            res.set_content(json{{"error", "Unknown server exception"}}.dump(), "application/json");
+        }
     }
 
     void handle_retrieve_candidates(const httplib::Request& req, httplib::Response& res) {
