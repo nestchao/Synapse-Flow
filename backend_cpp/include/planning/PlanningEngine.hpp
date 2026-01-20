@@ -1,18 +1,35 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <mutex>
+#include <algorithm>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 namespace code_assistance {
 
-enum class PlanStatus { DRAFT, REVIEW_REQUIRED, APPROVED, IN_PROGRESS, COMPLETED };
+enum class PlanStatus { DRAFT, REVIEW_REQUIRED, APPROVED, IN_PROGRESS, COMPLETED, FAILED };
+enum class StepStatus { PENDING, APPROVED, IN_PROGRESS, SUCCESS, FAILED };
 
 struct PlanStep {
     std::string id;
     std::string description;
-    std::string files_touched;
-    bool completed = false;
+    std::string tool_name;
+    nlohmann::json params;
+    StepStatus status = StepStatus::PENDING;
+    std::string result_summary;
+
+    // ✅ REQUIRED: JSON Serialization for API Response
+    nlohmann::json to_json() const {
+        return {
+            {"id", id},
+            {"description", description},
+            {"tool", tool_name},
+            {"params", params},
+            {"status", status == StepStatus::SUCCESS ? "SUCCESS" : "PENDING"}, 
+            {"result", result_summary}
+        };
+    }
 };
 
 struct ExecutionPlan {
@@ -20,96 +37,117 @@ struct ExecutionPlan {
     std::string goal;
     std::vector<PlanStep> steps;
     PlanStatus status = PlanStatus::DRAFT;
-    int current_step_index = 0;
+    size_t current_step_idx = 0;
 
+    // ✅ REQUIRED: JSON Serialization for API Response
     nlohmann::json to_json() const {
-        nlohmann::json j;
-        j["id"] = id;
-        j["goal"] = goal;
-        j["status"] = (status == PlanStatus::APPROVED || status == PlanStatus::IN_PROGRESS) ? "APPROVED" : "REVIEW_REQUIRED";
-        j["current_step"] = current_step_index;
-        j["steps"] = nlohmann::json::array();
-        for(const auto& s : steps) {
-            j["steps"].push_back({
-                {"id", s.id},
-                {"description", s.description},
-                {"files", s.files_touched},
-                {"completed", s.completed}
-            });
-        }
-        return j;
+        nlohmann::json steps_json = nlohmann::json::array();
+        for(const auto& s : steps) steps_json.push_back(s.to_json());
+        
+        return {
+            {"id", id},
+            {"goal", goal},
+            {"status", status == PlanStatus::APPROVED ? "APPROVED" : "REVIEW_REQUIRED"},
+            {"current_step", current_step_idx},
+            {"steps", steps_json}
+        };
     }
 };
 
 class PlanningEngine {
+private:
+    ExecutionPlan current_plan_;
+    std::mutex plan_mutex_;
+
 public:
-    ExecutionPlan current_plan;
-
-    bool has_active_plan() const {
-        return !current_plan.id.empty() && current_plan.status != PlanStatus::COMPLETED;
-    }
-
-    bool is_plan_approved() const {
-        return current_plan.status == PlanStatus::APPROVED || current_plan.status == PlanStatus::IN_PROGRESS;
-    }
-
-    // Called by the Agent when it wants to propose a plan
     void propose_plan(const std::string& goal, const std::vector<nlohmann::json>& raw_steps) {
-        current_plan.id = "PLAN_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-        current_plan.goal = goal;
-        current_plan.steps.clear();
-        current_plan.status = PlanStatus::REVIEW_REQUIRED;
-        current_plan.current_step_index = 0;
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        
+        current_plan_ = ExecutionPlan();
+        current_plan_.id = "PLAN_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+        current_plan_.goal = goal;
+        current_plan_.status = PlanStatus::REVIEW_REQUIRED;
 
-        for(const auto& j : raw_steps) {
-            current_plan.steps.push_back({
-                std::to_string(current_plan.steps.size() + 1),
-                j.value("description", ""),
-                j.value("files", ""),
-                false
-            });
+        int idx = 1;
+        for (const auto& j : raw_steps) {
+            PlanStep step;
+            step.id = std::to_string(idx++);
+            step.description = j.value("description", "Unknown Step");
+            step.tool_name = j.value("tool", "unknown");
+            step.params = j.value("parameters", nlohmann::json::object());
+            current_plan_.steps.push_back(step);
         }
-        spdlog::info("📝 New Plan Proposed: {} steps for '{}'", current_plan.steps.size(), goal);
+        spdlog::info("📝 PlanningEngine: Proposed plan with {} steps. Waiting for User Approval.", current_plan_.steps.size());
     }
 
-    // Called when User clicks "Approve" in UI
     void approve_plan() {
-        current_plan.status = PlanStatus::APPROVED;
-        spdlog::info("✅ Plan Approved by User. Execution unlocking.");
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        if (current_plan_.status == PlanStatus::REVIEW_REQUIRED) {
+            current_plan_.status = PlanStatus::APPROVED;
+            for(auto& step : current_plan_.steps) step.status = StepStatus::APPROVED;
+            spdlog::info("✅ PlanningEngine: Plan APPROVED by User.");
+        }
     }
 
-    void mark_step_complete(int index) {
-        if (index >= 0 && index < current_plan.steps.size()) {
-            current_plan.steps[index].completed = true;
-            current_plan.current_step_index = index + 1;
+    // Helper: Check if plan exists
+    bool has_active_plan() {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        return !current_plan_.id.empty() && 
+               current_plan_.status != PlanStatus::COMPLETED && 
+               current_plan_.status != PlanStatus::FAILED;
+    }
+
+    // Helper: Check if approved
+    bool is_plan_approved() {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        return current_plan_.status == PlanStatus::APPROVED || 
+               current_plan_.status == PlanStatus::IN_PROGRESS;
+    }
+
+    ExecutionPlan get_snapshot() {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        return current_plan_;
+    }
+
+    void mark_step_status(size_t index, StepStatus status, const std::string& result) {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        if (index < current_plan_.steps.size()) {
+            current_plan_.steps[index].status = status;
+            current_plan_.steps[index].result_summary = result;
             
-            if (current_plan.current_step_index >= current_plan.steps.size()) {
-                current_plan.status = PlanStatus::COMPLETED;
-            } else {
-                current_plan.status = PlanStatus::IN_PROGRESS;
+            if (status == StepStatus::SUCCESS) {
+                current_plan_.current_step_idx++;
+                if (current_plan_.current_step_idx >= current_plan_.steps.size()) {
+                    current_plan_.status = PlanStatus::COMPLETED;
+                } else {
+                    current_plan_.status = PlanStatus::IN_PROGRESS;
+                }
             }
         }
     }
 
     std::string get_plan_context_for_ai() {
-        if (!has_active_plan()) return "";
-        
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        if (current_plan_.status == PlanStatus::DRAFT) return "";
+
         std::stringstream ss;
-        ss << "### 📋 ACTIVE EXECUTION PLAN (Strictly Follow)\n";
-        ss << "GOAL: " << current_plan.goal << "\n";
+        ss << "\n### 📋 CURRENT EXECUTION PLAN\n";
+        ss << "Status: " << (current_plan_.status == PlanStatus::APPROVED || current_plan_.status == PlanStatus::IN_PROGRESS ? "APPROVED (Execute now)" : "PENDING REVIEW (Do not execute)") << "\n";
         
-        for (size_t i = 0; i < current_plan.steps.size(); ++i) {
-            const auto& s = current_plan.steps[i];
-            ss << (i + 1) << ". [" << (s.completed ? "x" : " ") << "] " << s.description 
-               << " (Target: " << s.files_touched << ")\n";
+        for (size_t i = 0; i < current_plan_.steps.size(); ++i) {
+            const auto& s = current_plan_.steps[i];
+            ss << (i + 1) << ". " << (i == current_plan_.current_step_idx ? "👉 " : "   ");
+            ss << "[" << s.tool_name << "] " << s.description;
+            if (s.status == StepStatus::SUCCESS) ss << " (DONE)";
+            ss << "\n";
         }
         
-        if (!is_plan_approved()) {
-            ss << "\n⚠️ STATUS: PENDING USER APPROVAL. Do NOT execute code yet. Ask user to review.\n";
+        if (current_plan_.status != PlanStatus::APPROVED && current_plan_.status != PlanStatus::IN_PROGRESS) {
+            ss << "\n⚠️ CONSTRAINT: You must ask the user to approve this plan before running any side-effect tools (edit, run).\n";
         } else {
-            ss << "\n✅ STATUS: APPROVED. Execute Step " << (current_plan.current_step_index + 1) << " now.\n";
+            ss << "\n✅ AUTHORIZATION: You are authorized to execute step " << (current_plan_.current_step_idx + 1) << ".\n";
         }
-        
+
         return ss.str();
     }
 };

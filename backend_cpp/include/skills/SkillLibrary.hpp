@@ -70,20 +70,41 @@ public:
 
     // Retrieve relevant business rules based on user query
     std::string retrieve_skills(const std::string& query, const std::vector<float>& query_vec) {
-        auto results = vector_store_->search(query_vec, 3); // Top 3 relevant skills
+        // 1. Search Vector Store
+        auto results = vector_store_->search(query_vec, 3); // Top 3
         std::stringstream ss;
+        bool header_added = false;
         
+        spdlog::info("🔍 [SKILL CHECK] Querying skills for: '{}'", query.substr(0, 50) + "...");
+
         if (!results.empty()) {
-            ss << "### 🏢 BUSINESS CONTEXT & SKILLS (Strictly Follow These)\n";
             for (const auto& res : results) {
-                // Threshold to ensure relevance
-                if (res.faiss_score < 1.2) { 
+                // 2. Strict Threshold (Lower is better in L2 distance)
+                // 1.0 is a tight match, 1.4 is loose. 
+                // Let's set it to 1.1 to avoid "Noise".
+                if (res.faiss_score < 1.1) { 
+                    
+                    if (!header_added) {
+                        ss << "### 🏢 BUSINESS CONTEXT & SKILLS (Strictly Follow)\n";
+                        header_added = true;
+                    }
+
+                    // 3. Log what the Agent sees
+                    spdlog::info("✅ [SKILL MATCH] File: {} | Score: {:.4f} (Accepted)", res.node->name, res.faiss_score);
+                    
+                    // 4. Inject Content (This is what the agent sees)
                     ss << "SOURCE: " << res.node->name << "\n"
-                       << "CONTENT:\n" << res.node->content << "\n"
+                       << "RULES:\n" << res.node->content << "\n"
                        << "--------------------------------------------------\n";
+                } else {
+                    // Log rejected skills to prove we are filtering
+                    spdlog::info("❌ [SKILL REJECT] File: {} | Score: {:.4f} (Too irrelevant)", res.node->name, res.faiss_score);
                 }
             }
+        } else {
+            spdlog::info("⚪ [SKILL CHECK] No skills found in index.");
         }
+        
         return ss.str();
     }
 

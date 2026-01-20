@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include "parser_elite.hpp"
 #include "tools/FileSystemTools.hpp"
+#include "planning/ExecutionGuard.hpp"
 
 namespace code_assistance {
 
@@ -301,11 +302,24 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             }
 
             std::string tool_name = action["tool"];
+            
+            // ✅ FIX 1: 'reasoning' variable scope fixed
             std::string reasoning = action.value("thought", "");
             
-            // 🚀 FIX: EXTRACT PARAMS HERE (Scope Fix)
             nlohmann::json params = action.value("parameters", nlohmann::json::object());
             params["project_id"] = req.project_id();
+
+            // --- 🛡️ EXECUTION GUARD CHECK START ---
+            GuardResult guard = ExecutionGuard::validate_tool_call(tool_name, params, planning_engine_.get());
+            
+            if (!guard.allowed) {
+                spdlog::warn("🛑 Guard Blocked Action: {}", guard.reason);
+                this->notify(writer, "BLOCKED", guard.reason);
+                internal_monologue += "\n[SYSTEM BLOCK] " + guard.reason;
+                last_error = guard.reason; 
+                continue; 
+            }
+            // --- 🛡️ EXECUTION GUARD CHECK END ---
 
             // 1. Propose Plan
             if (tool_name == "propose_plan") {
@@ -314,34 +328,34 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                     
                     ::code_assistance::AgentResponse plan_res;
                     plan_res.set_phase("PROPOSAL");
-                    plan_res.set_payload(planning_engine_->current_plan.to_json().dump());
+                    // ✅ FIX 2: Correct call to serialization chain
+                    plan_res.set_payload(planning_engine_->get_snapshot().to_json().dump()); 
                     if (writer) {
                         writer->Write(plan_res);
                     }
                     
-                    // Optionally append the plan to text for REST clients if needed
-                    // For now, the text notification is enough for the probe
                     final_output = "I have proposed a plan based on the business rules. Please review and approve.";
                     goto mission_complete; 
                 }
             }
 
-            // 2. Block Unapproved Plans
-            if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved() && tool_name != "read_file" && tool_name != "web_search" && tool_name != "propose_plan") {
+            // 2. Block Unapproved Plans (Redundant due to Guard, but safe)
+            if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved() && 
+                tool_name != "read_file" && tool_name != "web_search" && tool_name != "propose_plan" && tool_name != "pattern_search") {
+                
                 this->notify(writer, "BLOCKED", "Plan not approved. Waiting for user.");
                 final_output = "Please approve the plan before I modify files.";
                 goto mission_complete;
             }
 
-            // 3. Execute Tool (Params is now visible)
+            // 3. Execute Tool
             this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             std::string observation = safe_execute_tool(tool_name, params, session_id);
 
             // 4. Update Plan Step
-            if (planning_engine_->is_plan_approved() && observation.find("SUCCESS") != std::string::npos) {
-                if (tool_name == "apply_edit") {
-                    planning_engine_->mark_step_complete(planning_engine_->current_plan.current_step_index);
-                }
+            if (planning_engine_->is_plan_approved()) {
+               StepStatus result_status = (observation.find("ERROR") == 0) ? StepStatus::FAILED : StepStatus::SUCCESS;
+               planning_engine_->mark_step_status(planning_engine_->get_snapshot().current_step_idx, result_status, observation);
             }
             
             // 5. Record Thought
