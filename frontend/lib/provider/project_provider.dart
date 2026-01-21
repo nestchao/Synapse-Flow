@@ -1150,22 +1150,43 @@ class ProjectProvider with ChangeNotifier {
   _isLoadingModels = true;
   notifyListeners();
   try {
-    // This now works because we defined it in ApiService
     final response = await _api.getAvailableModelsWithState(); 
     
-    _availableModels = List<String>.from(response['models'] ?? []);
+    // 1. Clean the list from the backend
+    _availableModels = List<String>.from(response['models'] ?? [])
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
     
-    // Logic: If the bridge reports a model is already selected, use that.
-    // Otherwise, and only if we don't have a model yet, pick the first one.
-    if (response['current_active'] != null) {
-      _currentModel = response['current_active'];
+    String? scrapedActive = response['current_active']?.trim();
+    
+    if (scrapedActive != null && scrapedActive.isNotEmpty) {
+      // 2. SAFETY CHECK: Does the scraped name exist in our list?
+      if (!_availableModels.contains(scrapedActive)) {
+        // Try fuzzy match (case-insensitive)
+        final match = _availableModels.firstWhere(
+          (m) => m.toLowerCase() == scrapedActive.toLowerCase(),
+          orElse: () => "",
+        );
+        
+        if (match.isNotEmpty) {
+          _currentModel = match;
+        } else {
+          // 3. EMERGENCY FIX: If the model name is totally different from list items,
+          // add it to the list to prevent the Flutter Dropdown crash.
+          _availableModels.add(scrapedActive);
+          _currentModel = scrapedActive;
+        }
+      } else {
+        _currentModel = scrapedActive;
+      }
     } else if (_availableModels.isNotEmpty && _currentModel == null) {
       _currentModel = _availableModels.first;
     }
     
-    print("Model Synced: $_currentModel");
+    print("Model Synced Successfully: $_currentModel");
   } catch (e) {
-    print("Error: $e");
+    print("Model Sync Error: $e");
   } finally {
     _isLoadingModels = false;
     notifyListeners();

@@ -14,7 +14,6 @@ code_converter_bp = Blueprint('code_converter_bp', __name__)
 CODE_PROJECTS_COLLECTION = "code_projects"
 CODE_FILES_SUBCOLLECTION = "synced_code_files"
 
-
 @code_converter_bp.route('/code-converter/structure/<project_id>', methods=['GET'])
 def get_dynamic_project_structure(project_id):
     """Builds file tree including special files (tree.txt and _full_context.txt)"""
