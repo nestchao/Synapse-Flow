@@ -213,8 +213,10 @@ window.inspect = (index, element) => {
     const log = currentLogs[index];
     if(!log) return;
 
-    document.querySelectorAll('.log-item').forEach(el => el.classList.remove('active'));
-    if(element) element.classList.add('active');
+    if (element) {
+        document.querySelectorAll('.log-item').forEach(el => el.classList.remove('active'));
+        element.classList.add('active');
+    }
 
     UI.inspId.innerText = log.project_id || "UNKNOWN";
     const reqType = log.request_type || log.type || 'AGENT';
@@ -226,7 +228,24 @@ window.inspect = (index, element) => {
     UI.inspContextSize.innerText = (log.full_prompt ? log.full_prompt.length : 0).toLocaleString() + " chars";
 
     UI.inspUserInput.innerText = log.user_query;
-    UI.inspFullPrompt.innerHTML = formatCode(log.full_prompt || "(No context captured)");
+    
+    // 🚀 NEW: Apply color formatting to the prompt
+    // We use a custom format function here that handles the specific markers
+    let formattedPrompt = escapeHtml(log.full_prompt || "(No context captured)");
+    
+    // Apply syntax highlighting regex
+    formattedPrompt = formattedPrompt
+        .replace(/(&#35;&#35;&#35; SYSTEM ROLE)/g, '<span class="hl-system">$1</span>')
+        .replace(/(&#35;&#35;&#35; TOOL MANIFEST)/g, '<span class="hl-tools">$1</span>')
+        .replace(/(&#35;&#35;&#35; USER REQUEST)/g, '<span class="hl-user">$1</span>')
+        .replace(/(&#35;&#35;&#35; 🛑 MANDATORY BUSINESS RULES)/g, '<span class="hl-alert">$1</span>')
+        .replace(/(&#35;&#35;&#35; 📋 CURRENT EXECUTION PLAN)/g, '<span class="hl-plan">$1</span>')
+        .replace(/(&#35;&#35;&#35; EXECUTION HISTORY)/g, '<span class="hl-history">$1</span>')
+        .replace(/(&#35;&#35;&#35; ⚠️ PREVIOUS ERROR)/g, '<span class="hl-error">$1</span>');
+
+    UI.inspFullPrompt.innerHTML = formattedPrompt;
+    
+    // Format response code blocks
     UI.inspResponse.innerHTML = formatCode(log.ai_response || "");
 
     renderVector(log.vector_snapshot);
@@ -250,9 +269,9 @@ function renderVector(vec) {
 function formatCode(text) {
     if (!text) return "";
     let safe = escapeHtml(text);
-    safe = safe.replace(/\b(class|struct|if|else|return|void|int|string|const|auto)\b/g, '<span class="hl-k">$1</span>');
-    safe = safe.replace(/(\/\/[^\n]*)/g, '<span class="hl-c">$1</span>');
-    safe = safe.replace(/(###.*)/g, '<span class="hl-m">$1</span>');
+    // Basic syntax highlighting for the response view
+    safe = safe.replace(/\b(class|struct|if|else|return|void|int|string|const|auto|def|import|from)\b/g, '<span class="hl-k">$1</span>');
+    safe = safe.replace(/(\/\/[^\n]*|#[^\n]*)/g, '<span class="hl-c">$1</span>'); // C++ and Python comments
     return safe;
 }
 

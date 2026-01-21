@@ -28,8 +28,13 @@ public:
         auto plan = planner->get_snapshot();
 
         // 3. Check if Plan exists and is Approved
-        if (plan.status != PlanStatus::APPROVED && plan.status != PlanStatus::IN_PROGRESS) {
-            return {false, "BLOCKED: Active plan is not approved. Please review and approve the plan first."};
+        if (!plan.id.empty() && plan.status != PlanStatus::APPROVED && plan.status != PlanStatus::IN_PROGRESS) {
+            return {false, "BLOCKED: Plan exists but is not approved. Ask user for approval."};
+        }
+
+        // Check if Plan is missing (The case hitting you now)
+        if (plan.id.empty()) {
+            return {false, "BLOCKED: No active plan. You cannot use 'apply_edit' without a plan. Use 'propose_plan' first."};
         }
 
         // 4. Check if we are executing the expected step
@@ -49,6 +54,15 @@ public:
         // This prevents the AI from saying "I'll edit file A" but editing "file B"
         if (tool_name == "apply_edit" || tool_name == "file_surgical_tool") {
             std::string planned_file = current_step.params.value("path", "");
+            
+            // ✅ FIX: Allow empty planned path if it was inferred as "unknown" originally
+            // This prevents hard-locks if the AI forgot the path in the plan but provided it now.
+            // BUT: We should log a warning.
+            if (planned_file.empty()) {
+                 spdlog::warn("⚠️ ExecutionGuard: Allowing action despite missing plan path (AI forgot to specify it in plan).");
+                 return {true, "Allowed (Plan path was empty)."};
+            }
+
             std::string actual_file = params.value("path", "");
             
             if (planned_file != actual_file) {

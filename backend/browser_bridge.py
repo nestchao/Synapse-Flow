@@ -213,147 +213,109 @@ class AIStudioBridge:
     def _internal_send_prompt(self, page, message, use_clipboard=False, skip_nav=False):
         """Logic executed strictly inside the worker thread."""
         try:
-            # Navigation logic depends on whether we are continuing a flow (file upload) or starting new
+            # 1. Navigation
             if not skip_nav:
-                if "aistudio.google.com" not in page.url:
-                     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+                try:
+                    if page.is_closed() or "aistudio.google.com" not in page.url:
+                        page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+                except:
+                    page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
 
-            # Ensure prompt box is ready
-            prompt_box = page.get_by_placeholder("Start typing a prompt")
-            prompt_box.wait_for(state="visible", timeout=30000)
-            time.sleep(1.5)
+            # 2. Input
+            # Wake up UI
+            try:
+                page.get_by_text("Start typing a prompt").click(timeout=3000)
+            except:
+                page.locator("textarea").last.click()
+            
+            time.sleep(0.5)
 
-            # Inject text
             page.evaluate("""
                 (text) => {
-                    const el = document.querySelector('textarea, [placeholder*="Start typing"]');
+                    const els = document.querySelectorAll('textarea');
+                    const el = els[els.length - 1]; 
                     if (el) {
                         el.value = text;
+                        el.innerText = text;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
                     }
                 }
             """, message)
-
-            time.sleep(1.0)
             
-            # Press Enter to send
-            # page.keyboard.press("Enter")
-            
-            # Fallback: Click "Run" button if Enter didn't work (sometimes focus issues)
-            # The "Run" button usually has aria-label="Run"
-            run_btn = page.locator('ms-run-button button[aria-label="Run"]')
-            if run_btn.is_visible():
-                 # If run button is still visible 1s after pressing enter, click it
-                 time.sleep(1)
-                 if run_btn.is_visible():
-                     print("   [Thread] 'Enter' didn't trigger run. Clicking Run button...")
-                     run_btn.click()
+            page.keyboard.press("Space")
+            page.keyboard.press("Backspace")
+            time.sleep(0.5)
 
-            print("   [Thread] Waiting for AI response...", end="", flush=True)
+            # 3. Send
+            run_btn = page.locator('button[aria-label="Run"], button[aria-label="Send message"], mat-icon:has-text("send")').last
+            if run_btn.is_visible() and not run_btn.is_disabled():
+                 run_btn.click(force=True)
+            else:
+                 page.keyboard.press("Enter")
 
-            try:
-                # Wait up to 120 seconds (2 mins) for the text bubble to appear
-                page.locator('ms-text-chunk').last.wait_for(state="visible", timeout=120000)
-            except:
-                return "Error: AI took too long to start generating text."
-            
-            stop_btn = page.locator("ms-run-button button").filter(has_text="Stop")
-            run_btn = page.locator("ms-run-button button").filter(has_text="Run")
+            print("   [Thread] Waiting for response...", end="", flush=True)
 
+            # 4. ROBUST LOOP: Wait for NON-PROMPT response
             start_time = time.time()
-            last_len = 0
-            stable_count = 0
-
-            while True:
-                if time.time() - start_time > 300: # Extended timeout
-                    return "Error: Timeout waiting for response."
-
-                # Keep scrolling to trigger lazy load if needed
-                current_chunks = page.locator('ms-text-chunk').all()
-                current_count = len(current_chunks)
-                
-                if current_count > 0:
-                    page.evaluate("""
-                        () => {
-                            const chunks = document.querySelectorAll('ms-text-chunk');
-                            if (chunks.length > 0) {
-                                const lastChunk = chunks[chunks.length - 1];
-                                lastChunk.scrollIntoView({ block: 'end', behavior: 'instant' });
-                                let parent = lastChunk.parentElement;
-                                while (parent) {
-                                    if (parent.scrollHeight > parent.clientHeight) {
-                                        parent.scrollTop = parent.scrollHeight;
-                                    }
-                                    parent = parent.parentElement;
-                                }
-                                const editor = document.querySelector('ms-prompt-editor');
-                                if (editor) editor.scrollTop = editor.scrollHeight;
-                            }
-                        }
-                    """)
-
-                current_chunks = page.locator('ms-text-chunk').all()
-                
-                # Check busy state
-                is_stopping = stop_btn.is_visible()
-                is_run_ready = run_btn.is_visible()
-                
-                print(is_stopping, is_run_ready, end=" | ", flush=True)
-
-                current_text = current_chunks[-1].inner_text().strip() if current_chunks else ""
-                current_len = len(current_text)
-
-                print(".", end="", flush=True)
-
-                # Heuristic: If Run button is visible AND stop button is NOT visible AND we have text
-                if is_stopping:
-                    stable_count = 0 # Reset counter, we are definitely busy
-                
-                elif is_run_ready:
-                    # Even if buttons say "Ready", we double check text stability 
-                    # just in case of a UI glitch.
-                    if current_len == last_len and current_len > 0:
-                        stable_count += 1
-                        
-                        # Wait 4 ticks (4 seconds) of total stability to be safe
-                        if stable_count >= 8:
-                            break
-                    else:
-                        stable_count = 0
-                
-                # CASE C: Ambiguous State (No Run button, No Stop button)
-                # This happens during transitions. Assume busy.
-                else:
-                    stable_count = 0
-                
-                last_len = current_len
-                time.sleep(1)
-
-            print("\n   [Thread] Captured.")
-
-            if use_clipboard:
-                # Use the new Clipboard logic ONLY if requested
-                clipboard_content = self._internal_get_markdown_via_clipboard(page)
-                if clipboard_content and len(clipboard_content) > 10:
-                    return clipboard_content
-                print("   [Thread] Clipboard failed or empty. Falling back to scraping.")
-
-            final_chunks = page.locator('ms-text-chunk').all()
-            if not final_chunks: return "Error: No response chunks found."
+            last_valid_len = 0
+            stability_counter = 0
             
-            raw_answer = final_chunks[-1].inner_text()
+            while True:
+                if time.time() - start_time > 400: return "Error: Timeout."
 
-            # Cleanup
-            clean_answer = raw_answer
-            if "Expand to view model thoughts" in clean_answer:
-                clean_answer = clean_answer.split("Expand to view model thoughts")[-1]
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except: pass
 
-            ui_keywords = ["expand_more", "expand_less", "content_copy", "share", "edit", "thumb_up", "thumb_down"]
-            for junk in ui_keywords:
-                clean_answer = clean_answer.replace(junk, "")
+                # Get all text chunks
+                # We use a broad selector to catch everything
+                chunks = page.locator('ms-text-chunk, .model-thoughts, .chat-bubble, .message-content').all()
+                
+                if not chunks:
+                    time.sleep(1)
+                    continue
 
-            return clean_answer.strip()
+                # Grab the LAST chunk (most likely the new one)
+                last_chunk_text = chunks[-1].inner_text().strip()
+                
+                # 🚀 CRITICAL CHECK: Are we looking at the System Prompt?
+                # The user prompt contains "### SYSTEM ROLE" or "You are 'Synapse'"
+                # The AI response SHOULD NOT contain this (unless it's hallucinating badly)
+                is_user_prompt = "### SYSTEM ROLE" in last_chunk_text or "You are 'Synapse'" in last_chunk_text
+                
+                if is_user_prompt:
+                    # We are seeing our own message. Wait for AI.
+                    print("p", end="", flush=True) # 'p' for prompt
+                    time.sleep(1.0)
+                    continue
+
+                # If we are here, 'last_chunk_text' is likely the AI response
+                current_len = len(last_chunk_text)
+
+                if current_len > 0:
+                    if current_len == last_valid_len:
+                        stability_counter += 1
+                        print(".", end="", flush=True)
+                        
+                        # Stop button check
+                        stop_visible = page.locator('button[aria-label="Stop"]').first.is_visible()
+                        
+                        if stability_counter >= 4 and not stop_visible:
+                            print(" Captured.")
+                            
+                            # 5. Cleanup & Return
+                            clean_answer = last_chunk_text.replace("Expand to view model thoughts", "").replace("Model", "").strip()
+                            return clean_answer
+                    else:
+                        stability_counter = 0
+                        print("*", end="", flush=True)
+                    
+                    last_valid_len = current_len
+                else:
+                    print("_", end="", flush=True)
+                    stability_counter = 0
+                
+                time.sleep(1.0)
 
         except Exception as e:
             return f"Browser Error: {str(e)}"

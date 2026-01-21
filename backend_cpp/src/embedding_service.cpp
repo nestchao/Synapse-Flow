@@ -63,6 +63,46 @@ cpr::Response perform_request_with_retry(Func request_factory, std::shared_ptr<K
     return r;
 }
 
+GenerationResult EmbeddingService::call_python_bridge(const std::string& prompt) {
+    spdlog::warn("🌉 Switching to Python Browser Bridge (Free Tier)...");
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // High timeout (180s) because Browser automation is slower than API
+    cpr::Response r = cpr::Post(
+        cpr::Url{python_bridge_url_},
+        cpr::Body{json{{"prompt", prompt}}.dump()},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::Timeout{180000} 
+    );
+
+    auto end = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    GenerationResult result;
+    if (r.status_code == 200) {
+        try {
+            auto j = json::parse(r.text);
+            if (j.value("success", false)) {
+                result.text = j.value("text", "");
+                result.success = true;
+                
+                // Estimate tokens since Bridge doesn't provide exact usage
+                result.completion_tokens = j.value("estimated_tokens", 0);
+                result.prompt_tokens = prompt.length() / 4;
+                result.total_tokens = result.prompt_tokens + result.completion_tokens;
+                
+                spdlog::info("✅ [Bridge] Success in {:.2f}s", ms / 1000.0);
+                return result;
+            }
+        } catch (...) {}
+    }
+
+    spdlog::error("❌ [Bridge] Failed. Status: {} | Body: {}", r.status_code, r.text);
+    result.success = false;
+    result.text = "Bridge Failure";
+    return result;
+}
+
 std::vector<float> EmbeddingService::generate_embedding(const std::string& text) {
     if (auto cached = cache_manager_->get_embedding(text)) return *cached;
     
@@ -130,6 +170,24 @@ std::string EmbeddingService::generate_text(const std::string& prompt) {
 GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt) {
     GenerationResult final_result;
     
+    // ---------------------------------------------------------
+    // 1. PRIORITY: Try Python Browser Bridge (Scraper) First
+    // ---------------------------------------------------------
+    // This allows massive context (1M+ tokens) without hitting API cost/limits.
+    spdlog::info("🌉 Routing request via Python Bridge (Priority Mode)...");
+    
+    GenerationResult bridge_res = call_python_bridge(prompt);
+    
+    if (bridge_res.success) {
+        spdlog::info("✅ Bridge execution successful.");
+        return bridge_res;
+    }
+
+    // ---------------------------------------------------------
+    // 2. FALLBACK: Try Official Gemini API
+    // ---------------------------------------------------------
+    spdlog::warn("⚠️ Bridge failed or timed out. Falling back to Gemini API...");
+
     std::string url = get_endpoint_url("generateContent");
     
     // Mask key for logging
@@ -142,7 +200,7 @@ GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt
         masked_url.replace(key_pos + 4, key_val.length(), "*****");
     }
     
-    spdlog::info("🚀 AI REQUEST | Key: {} | Length: {}", key_hash, prompt.length());
+    spdlog::info("🚀 API FALLBACK REQUEST | Key: {} | Length: {}", key_hash, prompt.length());
 
     auto r = perform_request_with_retry([&]() {
         return cpr::Post(cpr::Url{get_endpoint_url("generateContent")},
@@ -155,7 +213,7 @@ GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt
         );
     }, key_manager_);
 
-    spdlog::info("📥 AI RESPONSE | Status: {} | Time: {}s", r.status_code, r.elapsed);
+    spdlog::info("📥 API RESPONSE | Status: {} | Time: {}s", r.status_code, r.elapsed);
 
     if (r.status_code == 200) {
         try {
@@ -185,7 +243,7 @@ GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt
         spdlog::error("❌ RAW BODY:   {}", r.text);
     }
 
-    final_result.text = "AI Service Error";
+    final_result.text = "AI Service Failure (Bridge & API both failed)";
     final_result.success = false;
     return final_result;
 }

@@ -46,6 +46,9 @@ private:
     std::shared_ptr<KeyManager> key_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
     const std::string base_url_ = "https://generativelanguage.googleapis.com/v1beta/models/";
+    const std::string python_bridge_url_ = "http://127.0.0.1:5000/bridge/generate";
+    GenerationResult call_python_bridge(const std::string& prompt);
+
     std::string get_endpoint_url(const std::string& action);
 };
 
