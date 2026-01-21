@@ -9,13 +9,14 @@
     --green: #2ea043;
     --purple: #bc8cff;
     --yellow: #d29922;
+    --red: #f85149; /* Added standard red */
 }
 
 body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; overflow: hidden; }
 
 .app-container { display: flex; height: 100%; }
 
-/* --- 1. ICON NAVIGATION RAIL (NEW) --- */
+/* --- 1. ICON NAVIGATION RAIL --- */
 .icon-nav {
     width: 50px;
     background: var(--nav-rail);
@@ -50,6 +51,7 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe
     position: absolute; left: 50px; background: #30363d; color: #fff;
     padding: 4px 8px; border-radius: 4px; font-size: 11px;
     visibility: hidden; opacity: 0; transition: 0.2s; white-space: nowrap;
+    z-index: 20; /* Ensure tooltip is above other elements */
 }
 .nav-item:hover .tooltip { visibility: visible; opacity: 1; left: 45px; }
 
@@ -110,11 +112,21 @@ h3 { margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase; color: #8b9
 .vec-cell { flex: 1; height: 100%; transition: 0.3s; }
 .vec-val { font-size: 10px; text-align: center; color: #555; font-family: monospace; }
 
-/* Syntax Highlights */
+/* Syntax Highlights - Extended for Prompt Coloring */
 .hl-c { color: #8b949e; font-style: italic; }
 .hl-k { color: #ff7b72; }
 .hl-s { color: #a5d6ff; }
 .hl-m { color: #d29922; }
+
+/* Prompt Color Coding Styles */
+.hl-system { color: #ff7b72; font-weight: bold; }
+.hl-tools { color: #d29922; font-weight: bold; }
+.hl-user { color: #7ee787; font-weight: bold; }
+.hl-plan { color: #58a6ff; font-weight: bold; }
+.hl-history { color: #bc8cff; font-weight: bold; }
+.hl-error { color: #f85149; font-weight: bold; }
+.hl-alert { color: #f85149; font-weight: bold; background: rgba(248, 81, 73, 0.1); padding: 2px 4px; border-radius: 3px; }
+
 
 /* --- 4. TRACE PAGE STYLES --- */
 .trace-container { flex: 1; display: flex; flex-direction: column; padding: 40px; }
@@ -125,3 +137,33 @@ h3 { margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase; color: #8b9
 .trace-phase { width: 80px; font-size: 11px; font-weight: bold; color: var(--accent); }
 .trace-payload { flex: 1; font-family: monospace; font-size: 13px; color: #e6edf3; }
 .trace-time { font-size: 11px; color: #8b949e; }
+
+/* Status Colors for Traces */
+.status-error { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+.status-tool { background: rgba(210, 153, 34, 0.15); color: var(--yellow); }
+.status-think { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+.status-success { background: rgba(46, 160, 67, 0.15); color: var(--green); }
+.status-proposal { background: rgba(188, 140, 255, 0.15); color: var(--purple); } /* New status for Proposal */
+
+/* --- 5. PROGRESS BAR (NEW) --- */
+.progress-bar {
+    background: #21262d;
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 5px;
+    position: relative;
+}
+
+.progress-fill {
+    height: 100%;
+    background: var(--green);
+    border-radius: 3px;
+    transition: width 0.3s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    color: #0d1117;
+    font-weight: bold;
+}

@@ -19,7 +19,6 @@ struct PlanStep {
     StepStatus status = StepStatus::PENDING;
     std::string result_summary;
 
-    // ✅ REQUIRED: JSON Serialization for API Response
     nlohmann::json to_json() const {
         return {
             {"id", id},
@@ -39,7 +38,6 @@ struct ExecutionPlan {
     PlanStatus status = PlanStatus::DRAFT;
     size_t current_step_idx = 0;
 
-    // ✅ REQUIRED: JSON Serialization for API Response
     nlohmann::json to_json() const {
         nlohmann::json steps_json = nlohmann::json::array();
         for(const auto& s : steps) steps_json.push_back(s.to_json());
@@ -59,6 +57,20 @@ private:
     ExecutionPlan current_plan_;
     std::mutex plan_mutex_;
 
+    // ✅ NEW: Helper to guess tool from description
+    std::string infer_tool(const std::string& desc) {
+        std::string d = desc;
+        std::transform(d.begin(), d.end(), d.begin(), ::tolower);
+        
+        if (d.find("read") != std::string::npos || d.find("check") != std::string::npos || d.find("cat") != std::string::npos) return "read_file";
+        if (d.find("list") != std::string::npos || d.find("dir") != std::string::npos) return "list_dir";
+        if (d.find("write") != std::string::npos || d.find("create") != std::string::npos || d.find("edit") != std::string::npos || d.find("update") != std::string::npos || d.find("modify") != std::string::npos) return "apply_edit";
+        if (d.find("run") != std::string::npos || d.find("execute") != std::string::npos || d.find("test") != std::string::npos || d.find("compile") != std::string::npos) return "run_command";
+        if (d.find("search") != std::string::npos) return "pattern_search";
+        
+        return "unknown";
+    }
+
 public:
     void propose_plan(const std::string& goal, const std::vector<nlohmann::json>& raw_steps) {
         std::lock_guard<std::mutex> lock(plan_mutex_);
@@ -73,11 +85,18 @@ public:
             PlanStep step;
             step.id = std::to_string(idx++);
             step.description = j.value("description", "Unknown Step");
-            step.tool_name = j.value("tool", "unknown");
+            
+            // ✅ FIX: Use provided tool OR infer it
+            step.tool_name = j.value("tool", "");
+            if (step.tool_name.empty()) {
+                step.tool_name = infer_tool(step.description);
+                spdlog::info("🔍 PlanningEngine: Inferred tool '{}' for step '{}'", step.tool_name, step.description);
+            }
+
             step.params = j.value("parameters", nlohmann::json::object());
             current_plan_.steps.push_back(step);
         }
-        spdlog::info("📝 PlanningEngine: Proposed plan with {} steps. Waiting for User Approval.", current_plan_.steps.size());
+        spdlog::info("📝 PlanningEngine: Proposed plan with {} steps.", current_plan_.steps.size());
     }
 
     void approve_plan() {
@@ -89,7 +108,6 @@ public:
         }
     }
 
-    // Helper: Check if plan exists
     bool has_active_plan() {
         std::lock_guard<std::mutex> lock(plan_mutex_);
         return !current_plan_.id.empty() && 
@@ -97,7 +115,6 @@ public:
                current_plan_.status != PlanStatus::FAILED;
     }
 
-    // Helper: Check if approved
     bool is_plan_approved() {
         std::lock_guard<std::mutex> lock(plan_mutex_);
         return current_plan_.status == PlanStatus::APPROVED || 
