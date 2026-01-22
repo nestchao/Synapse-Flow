@@ -166,6 +166,50 @@ class AIStudioBridge:
             page.keyboard.press("Escape")
             return f"Upload/Extract Failed: {str(e)}"
     
+    def _internal_get_markdown(self, page):
+        """Clicks 'Copy as Markdown' on the last response and returns clipboard content."""
+        print("   [Thread] Copying answer as Markdown...")
+        try:
+            # 1. Find the options button for the LAST turn
+            # Targeting ms-chat-turn-options
+            options_buttons = page.locator("ms-chat-turn-options button[aria-label='Open options']").all()
+            if not options_buttons:
+                return "Error: No chat options button found. Ensure chat has started."
+            
+            last_option_btn = options_buttons[-1]
+            last_option_btn.scroll_into_view_if_needed()
+            last_option_btn.click()
+            time.sleep(0.5) 
+            
+            # 2. Wait for the menu item 'Copy as markdown'
+            # Using text filter is safer than nth-child index which can change
+            copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as markdown")
+            
+            if not copy_btn.is_visible():
+                # Fallback: sometimes it's just 'Copy'
+                print("   [Thread] 'Copy as markdown' not found, checking raw Copy...")
+                copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy").first
+            
+            if not copy_btn.is_visible():
+                page.keyboard.press("Escape")
+                return "Error: Copy option not found in menu."
+
+            # 3. Click Copy
+            copy_btn.click()
+            time.sleep(0.5) # Wait for clipboard write
+            
+            # 4. Read from clipboard
+            # This requires 'clipboard-read' permission set in launch_persistent_context
+            markdown_content = page.evaluate("navigator.clipboard.readText()")
+            
+            print(f"   [Thread] Markdown copied ({len(markdown_content)} chars).")
+            return markdown_content
+
+        except Exception as e:
+            # Attempt to close menu if open
+            page.keyboard.press("Escape")
+            return f"Error getting markdown: {str(e)}"
+
     def _internal_send_prompt(self, page, message, use_clipboard=False, skip_nav=False):
         """Logic executed strictly inside the worker thread."""
         try:
@@ -411,10 +455,21 @@ class AIStudioBridge:
         specific span.title inside the model selector button.
         """
         try:
+            # We use a combined selector: Look for span.title specifically 
+            # inside the ms-model-selector button.
+            # This matches your provided path but is more resilient to small UI changes.
             selector = "ms-model-selector button span.title"
+            
             model_el = page.locator(selector).first
+            
+            # Ensure the element is attached and visible
             model_el.wait_for(state="visible", timeout=5000)
+            
+            # Get the text (e.g., "Gemini 3 Flash Preview")
             text = model_el.inner_text().strip()
+            
+            # Final cleanup: Remove hidden characters or extra newlines
+            # which sometimes appear in Angular spans
             clean_text = " ".join(text.split())
             
             print(f"   [Thread] Scraped Active Model: {clean_text}")
@@ -422,6 +477,8 @@ class AIStudioBridge:
             
         except Exception as e:
             print(f"   [Thread] Warning: Could not scrape active model name: {e}")
+            
+            # Fallback to the exact full path you provided if the short one fails
             try:
                 full_path_selector = "body > app-root > ms-app > div > div > div.layout-wrapper > div > span > ms-prompt-renderer > ms-chunk-editor > ms-right-side-panel > div > ms-run-settings > div.settings-items-wrapper > div > ms-prompt-run-settings-switcher > ms-prompt-run-settings > div.settings-item.settings-model-selector > div > ms-model-selector > button > span.title"
                 text = page.locator(full_path_selector).first.inner_text().strip()
@@ -430,8 +487,8 @@ class AIStudioBridge:
                 return None
     
     def _internal_get_markdown_via_clipboard(self, page):
-        """Hovers over the last message and clicks 'Copy text' or 'Copy' (RAW)."""
-        print("   [Thread] Attempting 'Copy text' via Clipboard...")
+        """Hovers over the last message and clicks 'Copy as markdown'."""
+        print("   [Thread] Attempting 'Copy as Markdown' via Clipboard...")
         try:
             latest_turn = page.locator("ms-chat-turn").last
             latest_turn.scroll_into_view_if_needed()
@@ -442,20 +499,7 @@ class AIStudioBridge:
             options_btn.wait_for(state="visible", timeout=3000)
             options_btn.click()
             
-            # 🚀 CHANGE: Look for "Copy text" instead of "Copy as markdown"
-            # Some versions use "Copy text", others just "Copy". We check both.
-            
-            # 1. Try specific "Copy text"
-            copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy text")
-            
-            # 2. Fallback to just "Copy" (exact match preferred to avoid clicking 'Copy as markdown')
-            if not copy_btn.is_visible():
-                copy_btn = page.locator("button[role='menuitem']").filter(has_text=re.compile(r"^Copy$"))
-
-            if not copy_btn.is_visible():
-                # Last resort fallback if regex fails
-                copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy").first
-
+            copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as markdown")
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
@@ -467,7 +511,7 @@ class AIStudioBridge:
             return clipboard_text
 
         except Exception as e:
-            print(f"   [Thread] ⚠️ Copy text failed: {e}")
+            print(f"   [Thread] ⚠️ Copy as Markdown failed: {e}")
             page.keyboard.press("Escape")
             return None
 
@@ -500,6 +544,16 @@ class AIStudioBridge:
         except queue.Empty:
             return {"models": [], "active": None}
     
+    def get_last_response_as_markdown(self):
+        """Retrieves the last AI response formatted as Markdown."""
+        self.start()
+        result_queue = queue.Queue()
+        self.cmd_queue.put(("get_markdown", None, result_queue))
+        try:
+            return result_queue.get(timeout=30)
+        except queue.Empty:
+            return "Error: Timeout retrieving markdown."
+
     def reset(self):
         self.start()
         result_queue = queue.Queue()

@@ -285,7 +285,9 @@ class AiChatPanel extends StatelessWidget {
               ),
               child: DropdownButtonHideUnderline(
                 child: DropdownButton<String>(
-                  value: p.currentModel,
+                  value: p.availableModels.contains(p.currentModel) 
+                      ? p.currentModel 
+                      : p.availableModels.first, 
                   icon: const Icon(Icons.arrow_drop_down, color: Colors.purple, size: 18),
                   style: TextStyle(fontSize: 12, color: Colors.purple.shade900, fontWeight: FontWeight.bold),
                   isDense: true,

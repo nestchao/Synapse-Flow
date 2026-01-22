@@ -10,7 +10,6 @@ import time
 from pathlib import Path 
 import google.api_core.exceptions
 from browser_bridge import browser_bridge
-# --- FIX: Added convert_pptx_to_pdf_windows to imports ---
 from utils import extract_text, delete_collection, split_chunks, convert_pptx_to_pdf_windows
 import redis
 from google.genai import types 
@@ -65,54 +64,69 @@ def get_original_text(project_id, source_id):
     except Exception as e:
         print(f"  ❌ An error occurred while fetching original text: {e}")
         return "" # Return empty on failure
+"""
+    🛑 ABSOLUTE OUTPUT RULE (MUST FOLLOW):
 
+    - Your ENTIRE response MUST be inside ONE Markdown code block.
+    - NOTHING is allowed outside the code block.
+    - No explanations, no comments, no greetings outside the code block.
+    - If any text appears outside the code block, the answer is WRONG.
+    - DO NOT use triple backticks (```) anywhere inside the note.
+    - If the original note contains code:
+        - Rewrite the code as plain text
+        - Indent it with spaces OR
+        - Put it under a bullet point
+        - Label it clearly as **Code Example (Plain Text)**
+        """
 def generate_note(text):
     """Generates a simplified study note using the Browser Bridge (Direct)."""
     print("  🤖 Generating AI study note via Browser Bridge...")
     prompt = f"""
-    You are an expert study assistant. Your goal is to convert original study notes into "Simplified Notes" that are visually engaging and easy for a beginner to understand.
+    You are given a raw study note.
 
-    Your output must be in the **same language as the source text**. Follow these rules meticulously.
+    Your task is to rewrite it into a simpler and clearer version for students, WITHOUT removing, skipping, summarizing away, or merging any information from the original note.
 
-    ### 📝 CRITICAL OUTPUT RULE (The "Wrapper"):
-    1.  **Markdown Syntax:** To preserve formatting, you **MUST** wrap your ENTIRE response inside a Markdown code block.
-    2.  **Headings:** Use `#` for main titles and `##` for sections. Start every heading with an **Emoji**.
-    3.  **Bold Keywords:** You **MUST** bold (`**text**`) all key terms, definitions, and important concepts. Do not output plain text for important parts.
-    4.  **Dividers:** Insert a horizontal rule (`---`) between every major section to separate topics visually.
-    5.  **Lists:** Use bullet points (`*` or `-`) for lists. Avoid long paragraphs.
+    ⚠️ ABSOLUTE RULE (Very Important):
+
+    - Every sentence, explanation, example, and detail in the raw note MUST appear in the output.
+
+    - You may reword sentences using simpler words, but you are NOT allowed to delete or shorten ideas.
+
+    - If something exists in the raw note, it must also exist in the final note.
+
+    📝 CRITICAL OUTPUT RULE (The "Wrapper"):
+    1. Headings:
+        - Use # for main titles
+        - Use ## for sections
     
-   1. 💡 Simplify Language (NO Over-Shortening)
+    2. Bold Keywords:
+        - You MUST bold (**text**) all key terms, definitions, and important concepts
 
-        Main Rule: DO NOT make the notes much shorter.
-        Keep almost the same length and detail as the original text.
+    3. Dividers:
+        - Insert a horizontal rule (---) between every major section
 
-        Primary Task: Replace unfamiliar, technical, or academic words with simple, familiar words.
+    4. Lists:
+        - Use bullet points (*)
 
-        Sentence Structure: You may slightly rewrite sentences for clarity, but do not summarize heavily.
+    ✏️ Content Rules:
 
-        NO SKIPPING: Every point, example, and list must remain.
-    
-    2 📝 Short Explanations (When Helpful)
+    1. Do NOT skip any point or explanation from the original note.
 
-        Add very short explanations only when a concept may be confusing.
+    2. Shorten the sentence, and change unfamiliar word to more common words, but do not skip any points or explanations.
 
-        Explanations must be 1 short sentence or a short phrase.
+    3. The output language must be the same as the source note (do not translate the whole note).
 
-        Do not repeat information or add new facts.
+    4. For any unfamiliar word, add a Chinese explanation (中文解释) right after it in brackets.
 
-        Purpose is understanding, not expansion.
+    5. Add some emojis to make the note friendly (do not overuse).
 
-    ## 3. 🎨 Formatting and Tone
-    *   Use markdown headings (`#`, `##`) that match the original text's structure. Add a relevant **emoji** to each main heading.
-    *   Use **bold text** to emphasize key simplified concepts.
-    *   Maintain a clear, direct, and helpful academic tone.
+    6. After each section, add a Mnemonic Tip to help students remember.
 
-    ## 4. 🧠 Memory Aid and Accuracy
-    *   Cover all major topics accurately. Do not skip sections or add new information.
-    *   At the end of each major section, create a short, creative **Mnemonic Tip (记忆技巧)** to aid recall.
-    *   Only for **Mnemonic Tip (记忆技巧)**, add a Chinese translation immediately after it
+    🎯 Goal:
 
-    **Please generate the Simplified Note for the following text:**
+    Make the note shorter, clearer, and student-friendly, while keeping 100% of the original information.
+
+    If yes, generate the simplified note for the text below:
 
     {text} 
     """
@@ -121,9 +135,20 @@ def generate_note(text):
         # Ensure bridge thread is running
         browser_bridge.start()
         
-        response_text = browser_bridge.send_prompt(prompt)
+        response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
         print("  ✅ Browser Bridge response received.")
-        clean_text = response_text.replace("code Markdown download", "")
+        clean_text = response_text.strip()
+        
+        # Remove Markdown fences if present
+        if clean_text.startswith("```markdown"):
+            clean_text = clean_text.replace("```markdown", "", 1)
+        elif clean_text.startswith("```"):
+            clean_text = clean_text.replace("```", "", 1)
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+
+        # Fix HTML entities
+        clean_text = re.sub(r'(#include\s*)<([^>]+)>', r'\1&lt;\2&gt;', clean_text)
         
         return markdown.markdown(clean_text, extensions=['tables'])
     except Exception as e:
@@ -554,6 +579,7 @@ def regenerate_note(project_id, source_id):
         if not original_text:
             return jsonify({"error": "Original source text not found or is empty. Please re-upload the document."}), 404
 
+        browser_bridge.reset()
         new_note_html = generate_note(original_text)
         
         source_ref = db.collection(STUDY_PROJECTS_COLLECTION).document(project_id).collection('sources').document(source_id)
