@@ -45,8 +45,25 @@ public:
         const auto& current_step = plan.steps[plan.current_step_idx];
 
         // 5. Match Tool Name
-        if (current_step.tool_name != tool_name) {
-            return {false, "DEVIATION DETECTED: Plan expects '" + current_step.tool_name + 
+        bool name_match = (current_step.tool_name == tool_name);
+        
+        if (!name_match) {
+            // Fuzzy match for common synonyms
+            if (current_step.tool_name.find(tool_name) != std::string::npos || 
+                tool_name.find(current_step.tool_name) != std::string::npos) {
+                name_match = true;
+            }
+            
+            // Allow "apply_edit" if plan says "create_file" or "write_file" (common AI hallucinations)
+            if (tool_name == "apply_edit" && 
+               (current_step.tool_name == "create_file" || current_step.tool_name == "write_file")) {
+                name_match = true;
+            }
+        }
+
+        if (!name_match) {
+            return {false, "DEVIATION DETECTED: Plan step " + current_step.id + 
+                           " expects '" + current_step.tool_name + 
                            "', but Agent tried '" + tool_name + "'."};
         }
 

@@ -49,20 +49,31 @@ public:
         if (!store_ || store_->get_all_nodes().empty()) return result;
 
         // Search for top k most relevant memories
-        auto results = store_->search(query_vec, 5); 
+        auto results = store_->search(query_vec, 10); // Search deeper (10) to find unique ones
         if (results.empty()) return result;
 
+        std::unordered_set<std::string> seen_content; // 🚀 Deduplication Set
+
         for (const auto& res : results) {
-            // L2 Distance threshold: Lower is closer
+            // L2 Distance threshold
             if (res.faiss_score < 1.4) { 
                  double valence = res.node->weights["valence"];
+                 std::string content_hash = res.node->content; // Simple dedupe key
                  
+                 // 🚀 SKIP DUPLICATES
+                 if (seen_content.count(content_hash)) continue;
+                 seen_content.insert(content_hash);
+
+                 // Truncate content for the prompt to save tokens (first 200 chars)
+                 std::string snippet = res.node->content.substr(0, 200); 
+                 if (res.node->content.length() > 200) snippet += "...";
+
                  if (valence > 0.5) {
                      result.positive_hints += "- [SUCCESS PATTERN] " + res.node->docstring + 
-                                              " -> " + res.node->content + "\n";
+                                              " -> Solved via:\n" + snippet + "\n";
                  } else if (valence < -0.5) {
                      result.negative_warnings += "- [AVOID] " + res.node->docstring + 
-                                                 " -> " + res.node->content + " (Previously Failed)\n";
+                                                 " -> " + snippet + " (Previously Failed)\n";
                  }
                  result.has_memories = true;
             }
