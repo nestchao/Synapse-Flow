@@ -44,6 +44,8 @@ class AIStudioBridge:
                         "--js-flags='--max-old-space-size=512'"
                     ]
                 )
+
+                context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://aistudio.google.com")
                 
                 page = context.pages[0]
                 page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -58,7 +60,8 @@ class AIStudioBridge:
                     try:
                         if cmd_type == "prompt":
                             # Normal prompt, allow navigation/reset if needed
-                            response = self._internal_send_prompt(page, data, skip_nav=False)
+                            msg, use_clip = data
+                            response = self._internal_send_prompt(page, msg, use_clipboard=use_clip, skip_nav=False)
                             result_queue.put(response)
                         
                         elif cmd_type == "upload_extract":
@@ -72,8 +75,13 @@ class AIStudioBridge:
                             result_queue.put(True)
 
                         elif cmd_type == "get_state":
+                            if "aistudio.google.com/app" not in page.url:
+                                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle")
+                            
+                            # Get the list and the active one
                             models = self._internal_get_models(page)
                             active = self._internal_get_active_model_name(page)
+                            
                             result_queue.put({"models": models, "active": active})
                             
                         elif cmd_type == "get_models":
@@ -152,118 +160,168 @@ class AIStudioBridge:
             print("   [Thread] File attached. Sending prompt...")
             
             # 5. Send Prompt with SKIP NAV enabled so we don't refresh the page
-            return self._internal_send_prompt(page, prompt, skip_nav=True)
+            return self._internal_send_prompt(page, prompt, use_clipboard=False, skip_nav=True)
 
         except Exception as e:
             page.keyboard.press("Escape")
             return f"Upload/Extract Failed: {str(e)}"
-
-    def _internal_send_prompt(self, page, message, skip_nav=False):
+    
+    def _internal_send_prompt(self, page, message, use_clipboard=False, skip_nav=False):
         """Logic executed strictly inside the worker thread."""
         try:
-            # 1. Navigation
+            # Navigation logic depends on whether we are continuing a flow (file upload) or starting new
             if not skip_nav:
-                try:
-                    if page.is_closed() or "aistudio.google.com" not in page.url:
-                        page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
-                except:
-                    page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+                if "aistudio.google.com" not in page.url:
+                     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
 
-            # 2. Input
-            # Wake up UI
-            try:
-                page.get_by_text("Start typing a prompt").click(timeout=3000)
-            except:
-                page.locator("textarea").last.click()
-            
-            time.sleep(0.5)
+            # Ensure prompt box is ready
+            prompt_box = page.get_by_placeholder("Start typing a prompt")
+            prompt_box.wait_for(state="visible", timeout=30000)
+            time.sleep(1.5)
 
+            # Inject text
             page.evaluate("""
                 (text) => {
-                    const els = document.querySelectorAll('textarea');
-                    const el = els[els.length - 1]; 
+                    const el = document.querySelector('textarea, [placeholder*="Start typing"]');
                     if (el) {
                         el.value = text;
-                        el.innerText = text;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
                     }
                 }
             """, message)
+
+            time.sleep(1.0)
             
-            page.keyboard.press("Space")
-            page.keyboard.press("Backspace")
-            time.sleep(0.5)
+            # Fallback: Click "Run" button if Enter didn't work (sometimes focus issues)
+            # The "Run" button usually has aria-label="Run"
+            run_btn = page.locator('ms-run-button button[aria-label="Run"]')
+            if run_btn.is_visible():
+                 time.sleep(1)
+                 if run_btn.is_visible():
+                     print("   [Thread] Clicking Run button...")
+                     run_btn.click()
 
-            # 3. Send
-            run_btn = page.locator('button[aria-label="Run"], button[aria-label="Send message"], mat-icon:has-text("send")').last
-            if run_btn.is_visible() and not run_btn.is_disabled():
-                 run_btn.click(force=True)
-            else:
-                 page.keyboard.press("Enter")
+            print("   [Thread] Waiting for AI response...", end="", flush=True)
 
-            print("   [Thread] Waiting for response...", end="", flush=True)
+            try:
+                # Wait up to 120 seconds (2 mins) for the text bubble to appear
+                page.locator('ms-text-chunk').last.wait_for(state="visible", timeout=120000)
+            except:
+                return "Error: AI took too long to start generating text."
+            
+            stop_btn = page.locator("ms-run-button button").filter(has_text="Stop")
+            run_btn = page.locator("ms-run-button button").filter(has_text="Run")
 
-            # 4. ROBUST LOOP: Wait for NON-PROMPT response
             start_time = time.time()
-            last_valid_len = 0
-            stability_counter = 0
-            
+            last_len = 0
+            stable_count = 0
+
             while True:
-                if time.time() - start_time > 400: return "Error: Timeout."
+                if time.time() - start_time > 300: # Extended timeout
+                    return "Error: Timeout waiting for response."
 
-                try:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except: pass
-
-                # Get all text chunks
-                # We use a broad selector to catch everything
-                chunks = page.locator('ms-text-chunk, .model-thoughts, .chat-bubble, .message-content').all()
+                # Keep scrolling to trigger lazy load if needed
+                current_chunks = page.locator('ms-text-chunk').all()
+                current_count = len(current_chunks)
                 
-                if not chunks:
-                    time.sleep(1)
-                    continue
+                if current_count > 0:
+                    page.evaluate("""
+                        () => {
+                            const chunks = document.querySelectorAll('ms-text-chunk');
+                            if (chunks.length > 0) {
+                                const lastChunk = chunks[chunks.length - 1];
+                                lastChunk.scrollIntoView({ block: 'end', behavior: 'instant' });
+                            }
+                        }
+                    """)
 
-                # Grab the LAST chunk (most likely the new one)
-                last_chunk_text = chunks[-1].inner_text().strip()
+                current_chunks = page.locator('ms-text-chunk').all()
                 
-                # 🚀 CRITICAL CHECK: Are we looking at the System Prompt?
-                # The user prompt contains "### SYSTEM ROLE" or "You are 'Synapse'"
-                # The AI response SHOULD NOT contain this (unless it's hallucinating badly)
-                is_user_prompt = "### SYSTEM ROLE" in last_chunk_text or "You are 'Synapse'" in last_chunk_text
+                # Check busy state
+                is_stopping = stop_btn.is_visible()
+                is_run_ready = run_btn.is_visible()
                 
-                if is_user_prompt:
-                    # We are seeing our own message. Wait for AI.
-                    print("p", end="", flush=True) # 'p' for prompt
-                    time.sleep(1.0)
-                    continue
+                print(is_stopping, is_run_ready, end=" | ", flush=True)
 
-                # If we are here, 'last_chunk_text' is likely the AI response
-                current_len = len(last_chunk_text)
+                current_text = current_chunks[-1].inner_text().strip() if current_chunks else ""
+                current_len = len(current_text)
 
-                if current_len > 0:
-                    if current_len == last_valid_len:
-                        stability_counter += 1
-                        print(".", end="", flush=True)
+                print(".", end="", flush=True)
+
+                # Heuristic: If Run button is visible AND stop button is NOT visible AND we have text
+                if is_stopping:
+                    stable_count = 0 # Reset counter, we are definitely busy
+                
+                elif is_run_ready:
+                    # Even if buttons say "Ready", we double check text stability 
+                    # just in case of a UI glitch.
+                    if current_len == last_len and current_len > 0:
+                        stable_count += 1
                         
-                        # Stop button check
-                        stop_visible = page.locator('button[aria-label="Stop"]').first.is_visible()
-                        
-                        if stability_counter >= 4 and not stop_visible:
-                            print(" Captured.")
-                            
-                            # 5. Cleanup & Return
-                            clean_answer = last_chunk_text.replace("Expand to view model thoughts", "").replace("Model", "").strip()
-                            return clean_answer
+                        # Wait 4 ticks (4 seconds) of total stability to be safe
+                        if stable_count >= 8:
+                            break
                     else:
-                        stability_counter = 0
-                        print("*", end="", flush=True)
-                    
-                    last_valid_len = current_len
+                        stable_count = 0
                 else:
-                    print("_", end="", flush=True)
-                    stability_counter = 0
+                    stable_count = 0
                 
-                time.sleep(1.0)
+                last_len = current_len
+                time.sleep(1)
+
+            print("\n   [Thread] Captured.")
+
+            if use_clipboard:
+                # Use the new Clipboard logic ONLY if requested
+                clipboard_content = self._internal_get_markdown_via_clipboard(page)
+                if clipboard_content and len(clipboard_content) > 10:
+                    return clipboard_content
+                print("   [Thread] Clipboard failed or empty. Falling back to scraping.")
+
+            final_chunks = page.locator('ms-text-chunk').all()
+            if not final_chunks: return "Error: No response chunks found."
+            
+            raw_answer = final_chunks[-1].inner_text()
+
+            lines = raw_answer.split('\n')
+            clean_lines = []
+            skip_next = False
+
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                
+                # Skip UI button text
+                if stripped.lower() in ['code', 'json', 'download', 'copy code', 'python', 'javascript']:
+                    skip_next = True
+                    continue
+                
+                # Skip empty lines after UI elements
+                if skip_next and not stripped:
+                    skip_next = False
+                    continue
+                
+                skip_next = False
+                clean_lines.append(line)
+            
+            raw_answer = '\n'.join(clean_lines)
+
+            # Cleanup
+            clean_answer = raw_answer
+            if "Expand to view model thoughts" in clean_answer:
+                clean_answer = clean_answer.split("Expand to view model thoughts")[-1]
+
+            # 🚀 ROBUST CLEANUP: Use Regex Word Boundaries
+            ui_keywords = [
+                "expand_more", "expand_less", "content_copy", "share", 
+                "edit", "thumb_up", "thumb_down"
+            ]
+            
+            for junk in ui_keywords:
+                # Use regex to remove ONLY standalone occurrences
+                clean_answer = re.sub(rf'\b{junk}\b', '', clean_answer, flags=re.IGNORECASE)
+
+            return clean_answer.strip()
 
         except Exception as e:
             return f"Browser Error: {str(e)}"
@@ -271,29 +329,30 @@ class AIStudioBridge:
     def _internal_get_models(self, page):
         """Scrapes available Gemini models from the UI."""
         print("   [Thread] Fetching models...")
-        if "aistudio.google.com" not in page.url:
+        # Ensure we are on the app page
+        if "aistudio.google.com/app" not in page.url:
              page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
 
         try:
-            page.locator("ms-model-selector button").wait_for(state="visible", timeout=30000)
+            # Wait for the model selector to be present
+            page.locator("ms-model-selector button").wait_for(state="visible", timeout=20000)
+            
+            # Open the menu to populate the list
             model_btn = page.locator("ms-model-selector button")
-            if not model_btn.is_visible():
-                page.get_by_label("Run settings").click()
-                time.sleep(0.5)
             model_btn.click()
-            time.sleep(1.0)
-            try:
-                gemini_filter = page.locator("button.ms-button-filter-chip").filter(has_text="Gemini").first
-                if gemini_filter.is_visible(): gemini_filter.click()
-                time.sleep(0.5)
-            except: pass 
-
-            page.locator(".model-title-text").first.wait_for(timeout=3000)
+            time.sleep(1.0) # Wait for animation
+            
+            # Target the model title text in the dropdown
+            page.locator(".model-title-text").first.wait_for(timeout=5000)
             elements = page.locator(".model-title-text").all()
+            
             models = list(dict.fromkeys([t.inner_text().strip() for t in elements if t.inner_text().strip()]))
+            
+            # Close menu
             page.keyboard.press("Escape")
             return models
         except Exception as e:
+            print(f"   [Thread] Error fetching model list: {e}")
             page.keyboard.press("Escape")
             return []
 
@@ -325,10 +384,10 @@ class AIStudioBridge:
             page.keyboard.press("Escape")
             return f"Error: {e}"
 
-    def send_prompt(self, message):
+    def send_prompt(self, message, use_clipboard=False):
         self.start()
         result_queue = queue.Queue()
-        self.cmd_queue.put(("prompt", message, result_queue))
+        self.cmd_queue.put(("prompt", (message, use_clipboard), result_queue))
         try:
             return result_queue.get(timeout=250)
         except queue.Empty:
@@ -347,17 +406,69 @@ class AIStudioBridge:
             return "Error: Browser bridge timed out during extraction."
     
     def _internal_get_active_model_name(self, page):
-        """Scrapes the name of the model currently selected in the dropdown."""
+        """
+        Scrapes the clean Display Name of the active model using the 
+        specific span.title inside the model selector button.
+        """
         try:
-            # Look for the model selector button text
-            selector = page.locator("ms-model-selector button .mat-mdc-button-touch-target").first
-            # If that fails, look for the title text in the settings side panel
-            model_text_el = page.locator("ms-model-selector .mdc-button__label").first
+            selector = "ms-model-selector button span.title"
+            model_el = page.locator(selector).first
+            model_el.wait_for(state="visible", timeout=5000)
+            text = model_el.inner_text().strip()
+            clean_text = " ".join(text.split())
             
-            if model_text_el.is_visible():
-                return model_text_el.inner_text().strip()
-            return None
-        except:
+            print(f"   [Thread] Scraped Active Model: {clean_text}")
+            return clean_text
+            
+        except Exception as e:
+            print(f"   [Thread] Warning: Could not scrape active model name: {e}")
+            try:
+                full_path_selector = "body > app-root > ms-app > div > div > div.layout-wrapper > div > span > ms-prompt-renderer > ms-chunk-editor > ms-right-side-panel > div > ms-run-settings > div.settings-items-wrapper > div > ms-prompt-run-settings-switcher > ms-prompt-run-settings > div.settings-item.settings-model-selector > div > ms-model-selector > button > span.title"
+                text = page.locator(full_path_selector).first.inner_text().strip()
+                return " ".join(text.split())
+            except:
+                return None
+    
+    def _internal_get_markdown_via_clipboard(self, page):
+        """Hovers over the last message and clicks 'Copy text' or 'Copy' (RAW)."""
+        print("   [Thread] Attempting 'Copy text' via Clipboard...")
+        try:
+            latest_turn = page.locator("ms-chat-turn").last
+            latest_turn.scroll_into_view_if_needed()
+            latest_turn.hover()
+            time.sleep(0.5) 
+
+            options_btn = latest_turn.locator("button[aria-label='Open options']")
+            options_btn.wait_for(state="visible", timeout=3000)
+            options_btn.click()
+            
+            # 🚀 CHANGE: Look for "Copy text" instead of "Copy as markdown"
+            # Some versions use "Copy text", others just "Copy". We check both.
+            
+            # 1. Try specific "Copy text"
+            copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy text")
+            
+            # 2. Fallback to just "Copy" (exact match preferred to avoid clicking 'Copy as markdown')
+            if not copy_btn.is_visible():
+                copy_btn = page.locator("button[role='menuitem']").filter(has_text=re.compile(r"^Copy$"))
+
+            if not copy_btn.is_visible():
+                # Last resort fallback if regex fails
+                copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy").first
+
+            copy_btn.wait_for(state="visible", timeout=2000)
+            copy_btn.click()
+            
+            time.sleep(0.5) 
+            clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            page.keyboard.press("Escape")
+            
+            print(f"   [Thread] Clipboard Copy Successful ({len(clipboard_text)} chars).")
+            return clipboard_text
+
+        except Exception as e:
+            print(f"   [Thread] ⚠️ Copy text failed: {e}")
+            page.keyboard.press("Escape")
             return None
 
     def get_available_models(self):
@@ -388,7 +499,7 @@ class AIStudioBridge:
             return result_queue.get(timeout=60)
         except queue.Empty:
             return {"models": [], "active": None}
-
+    
     def reset(self):
         self.start()
         result_queue = queue.Queue()

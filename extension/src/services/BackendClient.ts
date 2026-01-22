@@ -79,11 +79,12 @@ export class BackendClient {
     async getCodeSuggestion(
         projectId: string, 
         prompt: string, 
-        sessionId: string, // New: Required for Graph Continuity
+        sessionId: string, 
         activeContext?: any
     ): Promise<string> {
         try {
-            // 60s Timeout to allow C++ "Thinking" time
+            // ✅ FIX: Increase timeout to 300,000ms (5 minutes)
+            // This accommodates the slower Python Browser Bridge
             const response = await cppClient.post('/generate-code-suggestion', {
                 project_id: projectId,
                 prompt: prompt,
@@ -91,13 +92,13 @@ export class BackendClient {
                 active_file_path: activeContext?.filePath || "",
                 active_file_content: activeContext?.content || "",
                 active_selection: activeContext?.selection || ""
-            }, { timeout: 60000 }); // Increase timeout for complex reasoning
+            }, { timeout: 300000 }); 
 
             return response.data.suggestion;
         } catch (error: any) {
             console.error("Agent Error:", error);
             if (error.code === 'ECONNABORTED') {
-                return "⚠️ The Agent timed out while thinking. It might be a complex task.";
+                return "⚠️ The Agent timed out (Browser Bridge took too long).";
             }
             if (error.response?.status === 500) {
                 return "❌ Internal Engine Error. Check the C++ terminal.";

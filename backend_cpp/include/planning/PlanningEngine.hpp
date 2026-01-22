@@ -101,7 +101,7 @@ public:
 
     void approve_plan() {
         std::lock_guard<std::mutex> lock(plan_mutex_);
-        if (current_plan_.status == PlanStatus::REVIEW_REQUIRED) {
+        if (current_plan_.status == PlanStatus::REVIEW_REQUIRED || current_plan_.status == PlanStatus::DRAFT) {
             current_plan_.status = PlanStatus::APPROVED;
             for(auto& step : current_plan_.steps) step.status = StepStatus::APPROVED;
             spdlog::info("✅ PlanningEngine: Plan APPROVED by User.");

@@ -43,10 +43,11 @@ public:
                 return "ERROR: Permission Denied. You cannot write to folders in the ignored list.";
             }
 
-            // ... (Atomic Surgery Logic) ...
             if (!target.parent_path().empty() && !std::filesystem::exists(target.parent_path())) {
                 std::filesystem::create_directories(target.parent_path());
             }
+
+            spdlog::info("💾 Attempting to write to: {}", target.string());
 
             bool success = AtomicJournal::apply_surgery_safe(target.string(), new_content);
 
