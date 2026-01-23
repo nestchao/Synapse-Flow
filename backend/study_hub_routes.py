@@ -825,7 +825,7 @@ def bridge_generate():
         # We don't force reset here anymore to keep it fast, 
         # the browser_bridge internal logic handles navigation if needed.
         
-        response_text = browser_bridge.send_prompt(prompt)
+        response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
         
         # 🚀 FIX: Detect Browser Errors
         if not response_text or response_text.startswith("Browser Error") or response_text.startswith("Error:"):
