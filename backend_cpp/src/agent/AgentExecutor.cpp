@@ -743,6 +743,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "3. **Docstrings use single quotes**: 'This is a docstring' ✅\n"
             "4. **Multi-line code: Use \\n**: \"def foo():\\n    return 1\" ✅\n"
             "5. **NEVER use triple quotes**: \"\"\"docstring\"\"\" ❌\n\n"
+            "6. **PUT the json code within CODE format**: avoid __main__ become \"main\""
             
             "CORRECT EXAMPLE:\n"
             "{\n"
@@ -933,9 +934,9 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                 // 🚀 CRITICAL FIX: Update Planning Engine state
                 if (planning_engine_->is_plan_approved()) {
                     auto plan = planning_engine_->get_snapshot();
-                    // Double check if the executed tool matches the current step to be safe
+                    
+                    // Only mark success if we are tracking steps
                     if (plan.current_step_idx < plan.steps.size()) {
-                         // We assume the Guard already validated it matches, so we mark it success
                          planning_engine_->mark_step_status(plan.current_step_idx, StepStatus::SUCCESS, observation);
                          spdlog::info("✅ Plan Step {} Completed. Advancing...", plan.current_step_idx + 1);
                     }

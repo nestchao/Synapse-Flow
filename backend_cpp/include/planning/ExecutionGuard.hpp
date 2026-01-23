@@ -20,12 +20,23 @@ public:
         // 1. Allow "Safe" Read-Only tools anytime
         if (tool_name == "read_file" || tool_name == "list_dir" || 
             tool_name == "web_search" || tool_name == "pattern_search" || 
-            tool_name == "propose_plan") {
+            tool_name == "propose_plan" || 
+            tool_name == "FINAL_ANSWER") {
             return {true, "Safe tool allowed."};
         }
 
         // 2. Get Plan State
         auto plan = planner->get_snapshot();
+
+        if (plan.status == PlanStatus::FAILED || plan.status == PlanStatus::COMPLETED) {
+             if (tool_name == "FINAL_ANSWER") return {true, "Plan finished/failed, allowing explanation."};
+             return {false, "BLOCKED: Plan is finished/failed. Use FINAL_ANSWER to close."};
+        }
+
+        if ((plan.status == PlanStatus::APPROVED || plan.status == PlanStatus::IN_PROGRESS) && 
+            tool_name == "FINAL_ANSWER") {
+            return {true, "Authorized: Agent declared mission complete."};
+        }
 
         // 3. Check if Plan exists and is Approved
         if (!plan.id.empty() && plan.status != PlanStatus::APPROVED && plan.status != PlanStatus::IN_PROGRESS) {

@@ -318,15 +318,26 @@ class AIStudioBridge:
 
             if use_clipboard:
                 # Use the new Clipboard logic ONLY if requested
-                clipboard_content = self._internal_get_markdown_via_clipboard(page)
-                if clipboard_content and len(clipboard_content) > 10:
-                    return clipboard_content
-                print("   [Thread] Clipboard failed or empty. Falling back to scraping.")
+                final_chunks = page.locator('ms-text-chunk').all()
+                
+                # TRY TO GET HTML AND PARSE PRE TAGS?
+                # Or just use text_content() which *should* preserve whitespace if it's in a pre/code block?
+                # Actually, Google AI Studio renders code blocks in Monaco or CodeMirror sometimes?
+                
+                # Let's try to grab the code block specifically if it exists.
+                code_blocks = page.locator('code').all()
+                if code_blocks:
+                    # Logic to stitch text? Complex.
+                    pass
+                
+                # SIMPLEST FIX:
+                # text_content usually preserves whitespace better than inner_text for code.
+                raw_answer = final_chunks[-1].text_content()
 
             final_chunks = page.locator('ms-text-chunk').all()
             if not final_chunks: return "Error: No response chunks found."
             
-            raw_answer = final_chunks[-1].inner_text()
+            raw_answer = final_chunks[-1].text_content()
 
             lines = raw_answer.split('\n')
             clean_lines = []
@@ -490,21 +501,38 @@ class AIStudioBridge:
         """Hovers over the last message and clicks 'Copy as markdown'."""
         print("   [Thread] Attempting 'Copy as Markdown' via Clipboard...")
         try:
+            # 1. Target the last message bubble
             latest_turn = page.locator("ms-chat-turn").last
             latest_turn.scroll_into_view_if_needed()
             latest_turn.hover()
             time.sleep(0.5) 
 
+            # 2. Click the 'Three Dots' options button
             options_btn = latest_turn.locator("button[aria-label='Open options']")
             options_btn.wait_for(state="visible", timeout=3000)
             options_btn.click()
             
+            # 3. Find and Click 'Copy as markdown'
+            # We look for the menu item containing the specific text
             copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as markdown")
+            
+            if not copy_btn.is_visible():
+                # Fallback: Try generic class selector if role attribute is missing
+                copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as markdown")
+
+            if not copy_btn.is_visible():
+                print("   [Thread] 'Copy as markdown' option not found in menu.")
+                page.keyboard.press("Escape")
+                return None
+
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
+            # 4. Read Clipboard
             time.sleep(0.5) 
             clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            
+            # Close menu just in case
             page.keyboard.press("Escape")
             
             print(f"   [Thread] Clipboard Copy Successful ({len(clipboard_text)} chars).")
@@ -512,7 +540,9 @@ class AIStudioBridge:
 
         except Exception as e:
             print(f"   [Thread] ⚠️ Copy as Markdown failed: {e}")
-            page.keyboard.press("Escape")
+            try:
+                page.keyboard.press("Escape")
+            except: pass
             return None
 
     def get_available_models(self):

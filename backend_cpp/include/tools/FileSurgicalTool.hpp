@@ -56,7 +56,7 @@ public:
                 return "SUCCESS: File updated safely.";
             } else {
                 spdlog::error("💥 Surgery Failed: {}", target.string());
-                return "ERROR: Edit rejected by Safety Engine.";
+                return "ERROR: Edit rejected by Safety Engine. CODE SYNTAX INVALID. Please check indentation and syntax.";
             }
 
         } catch (const std::exception& e) {
