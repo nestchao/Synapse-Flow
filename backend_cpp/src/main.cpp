@@ -49,6 +49,12 @@ public:
         tool_registry_->register_tool(std::make_unique<code_assistance::PatternSearchTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::CodeExecutionTool>());
         tool_registry_->register_tool(std::make_unique<code_assistance::ShellExecutionTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "FINAL_ANSWER",
+            "Mission Completion Signal",
+            "{}",
+            [](const std::string&) { return "Mission Completed. Terminating loop."; }
+        ));
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
             nullptr, ai_service_, sub_agent_, tool_registry_, memory_vault // 🚀 Pass Vault
