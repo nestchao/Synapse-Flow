@@ -92,6 +92,12 @@ int main() {
     tools->register_tool(std::make_unique<code_assistance::ReadFileTool>());
     tools->register_tool(std::make_unique<code_assistance::ListDirTool>());
     tools->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
+    tools->register_tool(std::make_unique<code_assistance::GenericTool>(
+        "FINAL_ANSWER",
+        "Mission Completion Signal",
+        "{}",
+        [](const std::string&) { return "Mission Completed. Terminating loop."; }
+    ));
     
     // Wire Web Search (Lambda to inject key)
     // tools->register_tool(std::make_unique<code_assistance::GenericTool>(
