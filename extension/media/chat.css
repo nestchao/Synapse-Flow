@@ -1,17 +1,20 @@
-/* Touhou Project Inspired Chat UI */
+/* extension/media/chat.css */
+
+/* --- TOUHOU THEME VARIABLES --- */
 :root {
     --bubble-padding: 14px;
-    --touhou-primary: #ff69b4;
-    --touhou-secondary: #9370db;
-    --touhou-accent: #ffd700;
-    --touhou-danger: #dc143c;
+    --touhou-primary: #ff69b4;   /* Reimu Pink */
+    --touhou-secondary: #9370db; /* Yukari Purple */
+    --touhou-accent: #ffd700;    /* Marisa Gold */
+    --touhou-danger: #dc143c;    /* Remilia Red */
     --spell-card-bg: linear-gradient(135deg, #1a0033 0%, #2d1b4e 50%, #1a0033 100%);
     --danmaku-glow: 0 0 10px rgba(255, 105, 180, 0.6);
 }
 
+/* --- ANIMATIONS --- */
 @keyframes float {
     0%, 100% { transform: translateY(0px); }
-    50% { transform: translateY(-8px); }
+    50% { transform: translateY(-6px); }
 }
 
 @keyframes pulse-glow {
@@ -20,34 +23,30 @@
 }
 
 @keyframes spell-card-appear {
-    0% { 
-        opacity: 0; 
-        transform: scale(0.8) rotate(-5deg);
-    }
-    100% { 
-        opacity: 1; 
-        transform: scale(1) rotate(0deg);
-    }
+    0% { opacity: 0; transform: scale(0.9) translateY(10px); }
+    100% { opacity: 1; transform: scale(1) translateY(0); }
 }
 
-@keyframes danmaku-particle {
-    0% { 
-        transform: translate(0, 0) scale(0);
-        opacity: 0;
-    }
-    50% {
-        opacity: 1;
-    }
-    100% { 
-        transform: translate(var(--x), var(--y)) scale(1);
-        opacity: 0;
-    }
+@keyframes stars-drift {
+    0% { background-position: 0% 0%; }
+    100% { background-position: 100% 100%; }
 }
 
+@keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+
+@keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+}
+
+/* --- BASE STYLES --- */
 body {
     background: linear-gradient(135deg, #0a0015 0%, #1a0033 25%, #2d1b4e 50%, #1a0033 75%, #0a0015 100%);
     background-size: 400% 400%;
-    animation: gradient-shift 15s ease infinite;
+    animation: gradient-shift 20s ease infinite;
     color: #e8d5ff;
     font-family: 'Segoe UI', 'Yu Gothic', 'Meiryo', sans-serif;
     margin: 0;
@@ -59,35 +58,22 @@ body {
     overflow: hidden;
 }
 
-@keyframes gradient-shift {
-    0%, 100% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-}
-
-/* Magical particle background */
+/* Magical particle background overlay */
 body::before {
     content: '';
     position: absolute;
-    width: 100%;
-    height: 100%;
+    width: 200%;
+    height: 200%;
     background-image: 
         radial-gradient(2px 2px at 20% 30%, white, transparent),
         radial-gradient(2px 2px at 60% 70%, var(--touhou-primary), transparent),
         radial-gradient(1px 1px at 50% 50%, var(--touhou-accent), transparent),
-        radial-gradient(1px 1px at 80% 10%, var(--touhou-secondary), transparent),
-        radial-gradient(2px 2px at 90% 60%, white, transparent),
-        radial-gradient(1px 1px at 33% 80%, var(--touhou-primary), transparent);
+        radial-gradient(1px 1px at 80% 10%, var(--touhou-secondary), transparent);
     background-size: 200% 200%;
-    background-position: 0% 0%;
-    animation: stars-drift 20s linear infinite;
-    opacity: 0.4;
+    animation: stars-drift 60s linear infinite;
+    opacity: 0.3;
     pointer-events: none;
     z-index: 0;
-}
-
-@keyframes stars-drift {
-    0% { background-position: 0% 0%; }
-    100% { background-position: 100% 100%; }
 }
 
 #chat-container {
@@ -99,29 +85,19 @@ body::before {
     gap: 16px;
     position: relative;
     z-index: 1;
+    scroll-behavior: smooth;
 }
 
 /* Custom Scrollbar - Spell Card Style */
-#chat-container::-webkit-scrollbar {
-    width: 12px;
-}
-
-#chat-container::-webkit-scrollbar-track {
-    background: rgba(26, 0, 51, 0.5);
-    border-left: 1px solid rgba(255, 105, 180, 0.3);
-}
-
+#chat-container::-webkit-scrollbar { width: 10px; }
+#chat-container::-webkit-scrollbar-track { background: rgba(26, 0, 51, 0.5); }
 #chat-container::-webkit-scrollbar-thumb {
     background: linear-gradient(180deg, var(--touhou-primary), var(--touhou-secondary));
-    border-radius: 6px;
+    border-radius: 5px;
     border: 2px solid rgba(26, 0, 51, 0.5);
 }
 
-#chat-container::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(180deg, var(--touhou-accent), var(--touhou-primary));
-}
-
-/* Chat Bubbles - Spell Card Style */
+/* --- MESSAGES --- */
 .message {
     max-width: 85%;
     padding: var(--bubble-padding);
@@ -131,255 +107,186 @@ body::before {
     position: relative;
     animation: spell-card-appear 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
     border: 2px solid;
+    font-size: 13px;
 }
 
-/* User Message - Player Character Style */
+/* User Message */
 .user {
     align-self: flex-end;
-    background: linear-gradient(135deg, rgba(255, 105, 180, 0.2) 0%, rgba(147, 112, 219, 0.25) 100%);
+    background: linear-gradient(135deg, rgba(255, 105, 180, 0.15) 0%, rgba(147, 112, 219, 0.2) 100%);
     border-color: var(--touhou-primary);
     color: #ffffff;
-    box-shadow: 
-        0 4px 15px rgba(255, 105, 180, 0.4),
-        inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    box-shadow: 0 4px 15px rgba(255, 105, 180, 0.2);
+    border-bottom-right-radius: 2px;
 }
 
 .user::before {
     content: '◆';
     position: absolute;
-    right: -20px;
+    right: -18px;
     top: 50%;
     transform: translateY(-50%);
     color: var(--touhou-primary);
-    font-size: 12px;
+    font-size: 10px;
     animation: pulse-glow 2s infinite;
 }
 
-/* Bot Message - Boss/Spell Card Style */
+/* Bot Message */
 .bot {
     align-self: flex-start;
     background: var(--spell-card-bg);
     border-color: var(--touhou-secondary);
     color: #e8d5ff;
-    box-shadow: 
-        0 4px 20px rgba(147, 112, 219, 0.5),
-        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    box-shadow: 0 4px 20px rgba(147, 112, 219, 0.3);
+    border-bottom-left-radius: 2px;
 }
 
 .bot::before {
     content: '✦';
     position: absolute;
-    left: -20px;
+    left: -18px;
     top: 50%;
     transform: translateY(-50%);
     color: var(--touhou-secondary);
-    font-size: 14px;
+    font-size: 12px;
     animation: float 3s ease-in-out infinite;
 }
 
-/* Code Block - Spell Card Declaration */
+/* Thinking State */
+.bot.thinking {
+    font-style: italic;
+    opacity: 0.8;
+    border-color: var(--touhou-accent);
+}
+.bot.thinking::after {
+    content: ' ...';
+    animation: pulse-glow 1s infinite;
+}
+
+/* --- CODE BLOCKS (SPELL CARDS) --- */
 .code-block-container {
     position: relative;
     z-index: 1;
-    background: linear-gradient(135deg, rgba(10, 0, 21, 0.9) 0%, rgba(45, 27, 78, 0.9) 100%);
-    margin: 16px 0;
-    border: 3px solid;
-    border-image: linear-gradient(45deg, var(--touhou-primary), var(--touhou-accent), var(--touhou-secondary)) 1;
-    border-radius: 8px;
+    background: linear-gradient(135deg, rgba(10, 0, 21, 0.95) 0%, rgba(45, 27, 78, 0.95) 100%);
+    margin: 12px 0;
+    border: 2px solid;
+    border-image: linear-gradient(45deg, var(--touhou-primary), var(--touhou-accent)) 1;
+    border-radius: 4px; /* Image borders ignore radius, but keeps layout clean */
     overflow: hidden;
-    pointer-events: auto !important;
-    animation: spell-card-appear 0.5s ease-out;
-    box-shadow: 
-        0 0 20px rgba(255, 105, 180, 0.3),
-        0 8px 32px rgba(0, 0, 0, 0.6);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
 }
 
 .code-block-container::before {
     content: '';
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: linear-gradient(90deg, 
-        transparent, 
-        var(--touhou-primary), 
-        var(--touhou-accent),
-        var(--touhou-secondary), 
-        transparent);
-    animation: shimmer 3s linear infinite;
-}
-
-@keyframes shimmer {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(100%); }
+    top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--touhou-primary), var(--touhou-accent), transparent);
+    animation: shimmer 2s linear infinite;
+    z-index: 3;
 }
 
 .code-header {
     z-index: 2;
     position: relative;
-    background: linear-gradient(90deg, rgba(255, 105, 180, 0.2), rgba(147, 112, 219, 0.2));
-    border-bottom: 2px solid var(--touhou-primary);
-    padding: 12px 16px;
+    background: rgba(45, 27, 78, 0.8);
+    border-bottom: 1px solid var(--touhou-primary);
+    padding: 8px 12px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-weight: 600;
-    letter-spacing: 1px;
-    text-transform: uppercase;
     font-size: 11px;
+    font-family: 'Segoe UI', sans-serif;
+    font-weight: 700;
 }
 
 .code-header span {
     color: var(--touhou-accent);
-    text-shadow: 0 0 10px rgba(255, 215, 0, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 1px;
 }
+.code-header span::before { content: '【 '; color: var(--touhou-primary); }
+.code-header span::after { content: ' 】'; color: var(--touhou-primary); }
 
-.code-header span::before {
-    content: '【 ';
-    color: var(--touhou-primary);
-}
-
-.code-header span::after {
-    content: ' 】';
-    color: var(--touhou-primary);
-}
-
-.code-actions {
-    display: flex;
-    gap: 8px;
-}
+.code-actions { display: flex; gap: 8px; }
 
 .action-btn {
     pointer-events: auto !important;
     cursor: pointer !important;
-    user-select: none;
-    z-index: 10;
-    padding: 6px 14px;
-    border: 2px solid;
-    border-radius: 6px;
-    font-size: 11px;
+    padding: 4px 10px;
+    border: 1px solid;
+    border-radius: 4px;
+    font-size: 10px;
     font-weight: bold;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    transition: all 0.3s ease;
-    position: relative;
-    overflow: hidden;
-}
-
-.action-btn::before {
-    content: '';
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    width: 0;
-    height: 0;
-    border-radius: 50%;
-    background: rgba(255, 255, 255, 0.3);
-    transform: translate(-50%, -50%);
-    transition: width 0.6s, height 0.6s;
-}
-
-.action-btn:hover::before {
-    width: 300px;
-    height: 300px;
+    transition: all 0.2s ease;
+    background: rgba(0,0,0,0.5);
 }
 
 .accept-btn {
-    background: linear-gradient(135deg, #28a745, #20c997);
-    color: white;
     border-color: #20c997;
-    box-shadow: 0 0 10px rgba(32, 201, 151, 0.5);
+    color: #20c997;
 }
-
 .accept-btn:hover {
-    background: linear-gradient(135deg, #20c997, #28a745);
-    box-shadow: 0 0 20px rgba(32, 201, 151, 0.8);
-    transform: translateY(-2px);
+    background: #20c997;
+    color: #000;
+    box-shadow: 0 0 10px #20c997;
 }
 
 .reject-btn {
-    background: linear-gradient(135deg, #6c757d, #495057);
-    color: white;
     border-color: #adb5bd;
-    box-shadow: 0 0 10px rgba(173, 181, 189, 0.3);
+    color: #adb5bd;
 }
-
 .reject-btn:hover {
-    background: linear-gradient(135deg, #495057, #343a40);
-    box-shadow: 0 0 20px rgba(173, 181, 189, 0.6);
-    transform: translateY(-2px);
+    background: #adb5bd;
+    color: #000;
 }
 
 pre {
-    padding: 16px;
+    padding: 12px;
     margin: 0;
     overflow-x: auto;
-    background: rgba(0, 0, 0, 0.3);
-    border-left: 3px solid var(--touhou-secondary);
+    background: transparent;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
 }
+code { color: #e8d5ff; text-shadow: 0 0 2px rgba(232, 213, 255, 0.1); }
 
-pre::-webkit-scrollbar {
-    height: 8px;
-}
-
-pre::-webkit-scrollbar-track {
-    background: rgba(26, 0, 51, 0.5);
-}
-
-pre::-webkit-scrollbar-thumb {
-    background: var(--touhou-primary);
-    border-radius: 4px;
-}
-
-code {
-    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-    font-size: 13px;
-    color: #e8d5ff;
-    text-shadow: 0 0 5px rgba(232, 213, 255, 0.3);
-}
-
-/* Input Area - Grimoire Style */
+/* --- INPUT AREA (GRIMOIRE) --- */
 .input-wrapper {
     padding: 16px;
-    background: linear-gradient(180deg, rgba(10, 0, 21, 0.95) 0%, rgba(26, 0, 51, 0.95) 100%);
-    border-top: 3px solid;
-    border-image: linear-gradient(90deg, var(--touhou-primary), var(--touhou-accent), var(--touhou-secondary)) 1;
+    background: linear-gradient(180deg, rgba(10, 0, 21, 0.95) 0%, rgba(26, 0, 51, 0.98) 100%);
+    border-top: 1px solid var(--touhou-secondary);
     position: relative;
     z-index: 2;
-    box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.6);
 }
 
 .input-wrapper::before {
-    content: '☆ ─── ✦ ─── ☆';
+    content: '☆ ── ✦ ── ☆';
     position: absolute;
-    top: -12px;
-    left: 50%;
+    top: -10px; left: 50%;
     transform: translateX(-50%);
     color: var(--touhou-accent);
-    font-size: 10px;
-    letter-spacing: 4px;
-    text-shadow: 0 0 10px rgba(255, 215, 0, 0.8);
+    font-size: 8px;
+    background: #0a0015;
+    padding: 0 10px;
+    border-radius: 10px;
+    border: 1px solid var(--touhou-secondary);
 }
 
 .input-container {
     display: flex;
-    align-items: center;
-    background: rgba(45, 27, 78, 0.4);
-    border: 2px solid var(--touhou-secondary);
+    align-items: flex-end; /* Align to bottom for multiline */
+    background: rgba(45, 27, 78, 0.5);
+    border: 1px solid var(--touhou-secondary);
     border-radius: 8px;
-    padding: 6px 12px;
-    box-shadow: 
-        inset 0 2px 10px rgba(0, 0, 0, 0.3),
-        0 0 15px rgba(147, 112, 219, 0.3);
+    padding: 4px;
     transition: all 0.3s ease;
 }
 
 .input-container:focus-within {
     border-color: var(--touhou-primary);
-    box-shadow: 
-        inset 0 2px 10px rgba(0, 0, 0, 0.3),
-        0 0 25px rgba(255, 105, 180, 0.6);
+    box-shadow: 0 0 15px rgba(255, 105, 180, 0.3);
 }
 
 #prompt {
@@ -390,57 +297,28 @@ code {
     outline: none;
     padding: 10px;
     resize: none;
-    font-size: 14px;
-    line-height: 1.5;
-}
-
-#prompt::placeholder {
-    color: rgba(232, 213, 255, 0.5);
-    font-style: italic;
+    font-size: 13px;
+    line-height: 1.4;
+    max-height: 120px;
+    min-height: 24px;
+    font-family: inherit;
 }
 
 #send-btn {
     background: linear-gradient(135deg, var(--touhou-primary), var(--touhou-secondary));
     color: white;
-    border: 2px solid var(--touhou-accent);
-    border-radius: 8px;
-    width: 40px;
-    height: 40px;
+    border: 1px solid var(--touhou-accent);
+    border-radius: 6px;
+    width: 36px; height: 36px;
+    margin-left: 8px;
     cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.3s ease;
-    position: relative;
-    overflow: hidden;
-}
-
-#send-btn::before {
-    content: '発射'; /* "Fire" in Japanese */
-    position: absolute;
-    font-size: 8px;
-    font-weight: bold;
-    color: rgba(255, 255, 255, 0.7);
-    letter-spacing: 1px;
-}
-
-#send-btn svg {
-    width: 20px;
-    height: 20px;
-    fill: white;
-    filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.8));
-    position: relative;
-    z-index: 1;
+    display: flex; align-items: center; justify-content: center;
+    transition: transform 0.2s;
 }
 
 #send-btn:hover {
-    background: linear-gradient(135deg, var(--touhou-accent), var(--touhou-primary));
-    box-shadow: 
-        0 0 20px var(--touhou-primary),
-        0 0 40px var(--touhou-accent);
-    transform: scale(1.1) rotate(5deg);
+    transform: scale(1.05) rotate(5deg);
+    box-shadow: 0 0 10px var(--touhou-primary);
 }
 
-#send-btn:active {
-    transform: scale(0.95) rotate(-5deg);
-}
+#send-btn svg { width: 18px; height: 18px; fill: white; filter: drop-shadow(0 0 2px white); }

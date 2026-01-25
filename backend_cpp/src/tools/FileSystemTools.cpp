@@ -295,14 +295,18 @@ std::string ReadFileTool::execute(const std::string& args_json) {
     try {
         auto j = nlohmann::json::parse(args_json);
         std::string pid = j.value("project_id", "");
-        std::string path = j.value("path", "."); // Default to "."
+        std::string path = j.value("path", "");
         
-        // Normalize root request
-        if (path == "/" || path == "\\" || path.empty()) path = ".";
+        if (path.empty()) return "ERROR: 'path' parameter is required for read_file.";
         
-        auto filter = FileSystemTools::load_config(pid);
-        return FileSystemTools::list_dir_deep(pid, path, filter, j.value("depth", 2));
-    } catch (...) { return "ERROR: Invalid JSON."; }
+        // ✅ CORRECT: Call the read function
+        return FileSystemTools::read_file_safe(pid, path);
+
+    } catch (const std::exception& e) { 
+        return "ERROR: JSON Parse Error: " + std::string(e.what());
+    } catch (...) { 
+        return "ERROR: Unknown Error in ReadFileTool"; 
+    }
 }
 
 std::string ListDirTool::execute(const std::string& args_json) {

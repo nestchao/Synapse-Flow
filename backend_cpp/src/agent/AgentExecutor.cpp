@@ -740,9 +740,9 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "When generating Python code inside JSON parameters:\n"
             "1. **ALWAYS use SINGLE QUOTES for Python strings**: print('hello') ✅  print(\"hello\") ❌\n"
             "2. **F-strings must use single quotes**: f'Result: {x}' ✅  f\"Result: {x}\" ❌\n"
-            "3. **Docstrings use single quotes**: 'This is a docstring' ✅\n"
+            "3. **Comments**: Use hash (#) for multi-line comments. Do NOT use multi-line strings/docstrings inside the code.\n"
             "4. **Multi-line code: Use \\n**: \"def foo():\\n    return 1\" ✅\n"
-            "5. **NEVER use triple quotes**: \"\"\"docstring\"\"\" ❌\n\n"
+            "5. **Docstrings**: Use triple double-quotes (\"\"\") for multi-line docstrings. Escape them as \\\"\\\"\\\" inside JSON.\n"
             "6. **PUT the json code within CODE format**: avoid __main__ become \"main\""
             
             "CORRECT EXAMPLE:\n"
