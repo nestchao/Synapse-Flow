@@ -3,25 +3,31 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- 🚀 SECURITY: Strict Content Security Policy -->
+    <!-- 🚀 CSP: Strict security settings -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https:; script-src ${webview.cspSource} 'unsafe-inline' https://cdn.jsdelivr.net; style-src ${webview.cspSource} 'unsafe-inline';">
     <link href="{{styleUri}}" rel="stylesheet">
 </head>
 <body>
-    <div id="chat-container"></div>
+    <div id="chat-container">
+        <!-- Messages will be injected here -->
+        <div class="message bot" style="opacity: 0.8;">
+            Greetings. I am Synapse-Flow. The repository logic has been indexed. 
+            <br><i>Waiting for input...</i>
+        </div>
+    </div>
     
     <div class="input-wrapper">
         <div class="input-container">
-            <textarea id="prompt" rows="1" placeholder="Ask anything..."></textarea>
-            <button id="send-btn">
+            <textarea id="prompt" rows="1" placeholder="Cast your spell (Command)..."></textarea>
+            <button id="send-btn" title="Send Command">
                 <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
             </button>
         </div>
     </div>
 
-    <!-- External Libs -->
+    <!-- Markdown Parser -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <!-- 🚀 Modular JS -->
+    <!-- Logic -->
     <script src="{{scriptUri}}"></script>
 </body>
 </html>
