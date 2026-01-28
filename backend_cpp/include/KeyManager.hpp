@@ -21,6 +21,7 @@ private:
     std::vector<std::string> model_pool;
     mutable std::shared_mutex pool_mutex;
     
+    // Atomic index acts as the "Pointer" to the last usable key
     std::atomic<size_t> current_key_index{0};
     std::atomic<size_t> current_model_index{0};
     
@@ -34,6 +35,7 @@ public:
     void refresh_key_pool() {
         std::unique_lock lock(pool_mutex);
 
+        // Try to load keys.json
         std::vector<std::string> search_paths = {
             "keys.json", "../keys.json", "build/keys.json", "Release/keys.json", "../../keys.json"
         };
@@ -63,7 +65,8 @@ public:
                     model_pool.push_back(m.get<std::string>());
                 }
             } else {
-                model_pool = { "gemini-2.0-flash", "gemini-1.5-flash" };
+                // 🚀 FIX 404: Use currently valid model names
+                model_pool = { "gemini-3-flash-preview", "gemini-2.5-flash" };
             }
             
             serper_key = j.value("serper", "");
@@ -80,97 +83,37 @@ public:
     struct KeyModelPair {
         std::string key;
         std::string model;
-        size_t key_index;
-        size_t model_index;
     };
 
     KeyModelPair get_current_pair() const {
-        std::shared_lock lock(pool_mutex); // Reader lock
-        if (key_pool.empty() || model_pool.empty()) return {"", "", 0, 0};
-        
-        size_t start_idx = current_key_index.load();
-        size_t pool_size = key_pool.size();
-        
-        // 🚀 SMART SEARCH: Iterate to find the first ACTIVE key
-        // This prevents us from using a key we already know is 429'd
-        for (size_t i = 0; i < pool_size; ++i) {
-            size_t idx = (start_idx + i) % pool_size;
-            if (key_pool[idx].is_active) {
-                // Found a live one!
-                size_t m_idx = current_model_index.load() % model_pool.size();
-                return { key_pool[idx].key, model_pool[m_idx], idx, m_idx };
-            }
-        }
-        
-        // ⚠️ ALL KEYS DEAD?
-        // Fallback: Return the current one anyway. The request will fail,
-        // triggering report_rate_limit(), which will trigger the Phoenix Protocol.
-        size_t k_idx = start_idx % pool_size;
+        std::shared_lock lock(pool_mutex);
+        if (key_pool.empty()) return {"", ""};
+        if (model_pool.empty()) return {"", "gemini-3-flash-preview"};
+
+        // Simple atomic read - gets the key currently pointed to
+        size_t k_idx = current_key_index.load() % key_pool.size();
         size_t m_idx = current_model_index.load() % model_pool.size();
-        return { key_pool[k_idx].key, model_pool[m_idx], k_idx, m_idx };
+        
+        return { key_pool[k_idx].key, model_pool[m_idx] };
     }
 
     std::string get_current_key() const { return get_current_pair().key; }
     std::string get_current_model() const { return get_current_pair().model; }
+    std::string get_serper_key() const { std::shared_lock lock(pool_mutex); return serper_key; }
 
-    std::string get_serper_key() const { 
-        std::shared_lock lock(pool_mutex);
-        return serper_key; 
-    }
-
+    // 🚀 NEW: Explicit rotation for Retries
     void rotate_key() {
         size_t prev = current_key_index.fetch_add(1);
-        spdlog::info("🔄 Manual Key Rotation: {} -> {}", prev % key_pool.size(), (prev + 1) % key_pool.size());
+        spdlog::info("🔄 Rotating Key Pointer: {} -> {}", prev, prev + 1);
     }
 
     void rotate_model() {
         current_model_index++;
-        // NOTE: We do NOT reset current_key_index here anymore.
-        // We want to keep using the current active key logic even on a new model.
     }
 
-    // 🚀 INTELLIGENT DECOMMISSIONING
+    // Logic to mark a key as "dead" if it fails too often (Optional, handled by retry loop now)
     void report_rate_limit() {
-        std::unique_lock lock(pool_mutex); // Writer lock
-        if (key_pool.empty()) return;
-        
-        size_t idx = current_key_index.load() % key_pool.size();
-        
-        if (key_pool[idx].is_active) {
-            key_pool[idx].fail_count++;
-            spdlog::warn("⚠️ Key #{} Rate Limited (Fail Count: {})", idx, key_pool[idx].fail_count);
-            
-            if (key_pool[idx].fail_count > 2) {
-                key_pool[idx].is_active = false;
-                spdlog::error("💀 Key #{} Decommissioned due to excessive failures.", idx);
-            }
-        }
-        
-        // Force move to next key
-        current_key_index++;
-        size_t next = current_key_index.load() % key_pool.size();
-        spdlog::info("🔄 Auto-Rotating to Key #{}", next);
-
-        // 🚀 PHOENIX PROTOCOL: Revive if all are dead
-        bool any_active = false;
-        for(const auto& k : key_pool) {
-            if(k.is_active) { any_active = true; break; }
-        }
-        
-        if (!any_active) {
-            spdlog::error("🔥 PHOENIX PROTOCOL: All keys exhausted. Reviving Vault.");
-            for(auto& k : key_pool) { 
-                k.is_active = true; 
-                k.fail_count = 0; 
-            }
-        }
-    }
-
-    size_t get_active_key_count() const {
-        std::shared_lock lock(pool_mutex);
-        size_t count = 0;
-        for (const auto& k : key_pool) if (k.is_active) count++;
-        return count;
+        rotate_key(); // Just rotate for now
     }
 
     size_t get_total_keys() const {
