@@ -9,6 +9,11 @@
 
 namespace code_assistance {
 
+enum class RoutingStrategy {
+    QUALITY_FIRST, // Try Scraper -> Fallback to API (For Coding/Planning)
+    SPEED_FIRST    // Try API -> Fallback to Scraper (For Reading/Listing)
+};
+
 struct VisionResult {
     std::string analysis;
     int fuel_consumed;
@@ -39,15 +44,16 @@ public:
         const std::string& project_context,
         const std::string& current_file_path 
     );
-    GenerationResult generate_text_elite(const std::string& prompt); 
+    GenerationResult generate_text_elite(const std::string& prompt, RoutingStrategy strategy = RoutingStrategy::QUALITY_FIRST); 
     VisionResult analyze_vision(const std::string& prompt, const std::string& base64_image);
 
 private:
     std::shared_ptr<KeyManager> key_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
-    const std::string base_url_ = "https://generativelanguage.googleapis.com/v1beta/models/";
+    const std::string base_url_ = "https://generativelanguage.googleapis.com/v1beta/";
     const std::string python_bridge_url_ = "http://127.0.0.1:5000/bridge/generate";
     GenerationResult call_python_bridge(const std::string& prompt);
+    GenerationResult call_gemini_api(const std::string& prompt);
 
     std::string get_endpoint_url(const std::string& action);
 };

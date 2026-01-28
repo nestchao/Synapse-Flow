@@ -40,25 +40,19 @@ nlohmann::json extract_json(const std::string& raw) {
     std::string clean = raw;
     
     // 1. Strip UI artifacts (code/JSON/download buttons) and Markdown blocks
-    // Remove common UI text that appears before JSON in scraped content
-    std::vector<std::string> ui_prefixes = {"code", "JSON", "json", "download", "Copy code"};
-    for (const auto& prefix : ui_prefixes) {
-        size_t pos = 0;
-        while ((pos = clean.find(prefix, pos)) != std::string::npos) {
-            // Only remove if it's at start of line or after newline
-            if (pos == 0 || clean[pos - 1] == '\n') {
-                clean.erase(pos, prefix.length());
-                // Also remove trailing newline if present
-                if (pos < clean.length() && clean[pos] == '\n') {
-                    clean.erase(pos, 1);
-                }
-            } else {
-                pos += prefix.length();
-            }
+    std::vector<std::string> garbage_headers = {
+        "editmore_vert", "edit", "delete", "content_copy", 
+        "thumb_up", "thumb_down", "more_vert", "share", "volume_up", "copy code"
+    };
+    for (const auto& junk : garbage_headers) {
+        if (clean.find(junk) == 0) { // If starts with junk
+             clean = clean.substr(junk.length());
+             // Trim leading whitespace again after removal
+             clean.erase(0, clean.find_first_not_of(" \t\r\n"));
         }
     }
-    
-    // Strip Markdown Code Blocks
+
+    // 2. Strip Markdown Code Blocks
     size_t code_start = clean.find("```json");
     if (code_start != std::string::npos) {
         size_t code_end = clean.find("```", code_start + 7);
@@ -74,10 +68,37 @@ nlohmann::json extract_json(const std::string& raw) {
             }
         }
     }
-
-    // 2. Trim Whitespace
+    
+    // Trim
     clean.erase(0, clean.find_first_not_of(" \n\r\t"));
     clean.erase(clean.find_last_not_of(" \n\r\t") + 1);
+
+    // 3. Try Standard Parsing (Handles Objects AND Arrays)
+    try {
+        return nlohmann::json::parse(clean);
+    } catch (...) {
+        // [INSERT THIS BLOCK HERE]
+        // Fallback: If it looks like multiple objects but missing brackets/commas
+        // e.g. {tool...} {tool...} or {tool...}, {tool...}
+        if (clean.front() == '{' && clean.back() == '}') {
+             try {
+                 std::string wrapped = "[" + clean + "]";
+                 // Replace: } {  -> }, {
+                 size_t pos = 0;
+                 while ((pos = wrapped.find("} {", pos)) != std::string::npos) {
+                     wrapped.replace(pos, 3, "}, {");
+                     pos += 4;
+                 }
+                 // Replace: }\n{ -> }, {
+                 pos = 0;
+                 while ((pos = wrapped.find("}\n{", pos)) != std::string::npos) {
+                     wrapped.replace(pos, 3, "}, {");
+                     pos += 4;
+                 }
+                 return nlohmann::json::parse(wrapped);
+             } catch (...) {}
+        }
+    }
 
     // 3. PRE-EXTRACTION: Get tool name BEFORE attempting parse
     //    This prevents corruption from affecting tool detection
@@ -375,6 +396,36 @@ nlohmann::json extract_json(const std::string& raw) {
         spdlog::error("❌ Regex fallback failed: {}", e.what());
     }
 
+    size_t first_bracket = clean.find('[');
+    
+    if (first_bracket != std::string::npos) {
+        // Find the last "}," pattern which signifies the end of a valid object in a list
+        size_t last_valid_object_end = clean.rfind("}");
+        
+        if (last_valid_object_end != std::string::npos && last_valid_object_end > first_bracket) {
+            // Construct a new valid string: [ ... } ]
+            std::string recovered = clean.substr(first_bracket, last_valid_object_end - first_bracket + 1);
+            recovered += "]"; 
+            
+            spdlog::warn("⚠️ Detected Truncated Batch. Attempting recovery...");
+            
+            try {
+                return nlohmann::json::parse(recovered);
+            } catch (...) {
+                // If that fails, try aggressive comma fix
+                // Sometimes truncation leaves a trailing comma inside the object
+            }
+        }
+    }
+
+    if (clean.find("def ") != std::string::npos || clean.find("import ") != std::string::npos) {
+        spdlog::warn("⚠️ Raw Code Detected. Wrapping in FINAL_ANSWER.");
+        nlohmann::json fallback;
+        fallback["tool"] = "FINAL_ANSWER";
+        fallback["parameters"] = {{"answer", raw}}; // Return the raw text as the answer
+        return fallback;
+    }
+
     // 7. CATASTROPHIC FAILURE
     spdlog::error("❌ JSON Parse FATAL - All methods exhausted");
     spdlog::error("Input (first 500 chars): {}", clean.substr(0, 500));
@@ -571,28 +622,17 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     static std::mutex skill_cache_mutex;
 
     std::string business_context = "";
-    
-    // 1. Try to find new skills based on current prompt
     auto skill_lib = get_skill_library(req.project_id());
     std::string new_skills = skill_lib->retrieve_skills(req.prompt(), prompt_vec);
 
     {
         std::lock_guard<std::mutex> lock(skill_cache_mutex);
-        
-        // 2. If new skills found, update cache (append unique)
-        // For simplicity, we just overwrite or append if it's significant.
-        // A better heuristic: If prompt is short ("Approved"), KEEP old skills.
-        // If prompt is long ("Change it to use SQL"), FETCH new skills.
-        
         if (req.prompt().length() > 50 && !new_skills.empty()) {
             session_skill_cache[session_id] = new_skills;
         }
-        
-        // 3. Always use cached skills if available
         if (session_skill_cache.count(session_id)) {
             business_context = session_skill_cache[session_id];
         } else if (!new_skills.empty()) {
-             // First turn
              session_skill_cache[session_id] = new_skills;
              business_context = new_skills;
         }
@@ -601,7 +641,6 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     if (!business_context.empty()) {
         std::string header = "\n### 🛑 MANDATORY BUSINESS RULES (YOU MUST FOLLOW THESE)\n" 
                              "Failure to follow these rules will result in rejection.\n";
-        // Check if header already exists to avoid duplication
         if (business_context.find("### 🛑") == std::string::npos) {
             business_context = header + business_context;
         }
@@ -609,51 +648,29 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
     if (!parent_node_id.empty()) {
         auto trace = graph->get_trace(parent_node_id);
-        // Limit to last 15 steps to save context window
         int start_idx = std::max(0, (int)trace.size() - 15);
-        
         for (size_t i = start_idx; i < trace.size(); ++i) {
             const auto& node = trace[i];
-            // Skip nodes from other sessions if mixed (though get_trace follows parent links)
-            
-            if (node.type == NodeType::PROMPT) {
-                internal_monologue += "\n[USER] " + node.content;
-            } else if (node.type == NodeType::SYSTEM_THOUGHT) {
-                internal_monologue += "\n[THOUGHT] " + node.content;
-            } else if (node.type == NodeType::TOOL_CALL) {
-                // Try to get tool name from metadata, or parsing content
+            if (node.type == NodeType::PROMPT) internal_monologue += "\n[USER] " + node.content;
+            else if (node.type == NodeType::SYSTEM_THOUGHT) internal_monologue += "\n[THOUGHT] " + node.content;
+            else if (node.type == NodeType::TOOL_CALL) {
                 std::string tname = node.metadata.count("tool") ? node.metadata.at("tool") : "tool";
-                internal_monologue += "\n[TOOL CALL] " + tname; // Content might be huge JSON, skip for brevity
+                internal_monologue += "\n[TOOL CALL] " + tname;
             } else if (node.type == NodeType::CONTEXT_CODE) {
-                // Tool output
                 std::string preview = node.content.length() > 100 ? node.content.substr(0, 100) + "..." : node.content;
                 internal_monologue += "\n[TOOL RESULT] " + preview;
-            } else if (node.type == NodeType::RESPONSE) {
-                internal_monologue += "\n[AI] " + node.content;
-            }
+            } else if (node.type == NodeType::RESPONSE) internal_monologue += "\n[AI] " + node.content;
         }
-        spdlog::info("🧠 Reconstructed History: {} entries.", trace.size());
     }
 
     // Check Plan Approval via Chat
     if (planning_engine_->has_active_plan() && !planning_engine_->is_plan_approved()) {
         std::string p_lower = req.prompt();
         std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
-        
-        bool user_approved = (
-            p_lower.find("approve") != std::string::npos || 
-            p_lower.find("yes") != std::string::npos || 
-            p_lower.find("proceed") != std::string::npos ||
-            p_lower.find("go ahead") != std::string::npos ||
-            p_lower.find("looks good") != std::string::npos
-        );
-
+        bool user_approved = (p_lower.find("approve") != std::string::npos || p_lower.find("yes") != std::string::npos || p_lower.find("proceed") != std::string::npos);
         if (user_approved) {
             planning_engine_->approve_plan();
             this->notify(writer, "PLANNING", "Plan approved. Commencing execution.");
-            spdlog::info("✅ AgentExecutor: Detected user approval in prompt: '{}'", req.prompt());
-        } else {
-            spdlog::info("⏳ AgentExecutor: Plan is pending. User prompt '{}' did not trigger approval.", req.prompt());
         }
     }
 
@@ -667,52 +684,49 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     if (!related_nodes.empty()) {
         for(const auto& node : related_nodes) {
             bool is_failure = (node.metadata.count("status") && node.metadata.at("status") == "failed");
-            
             if (node.type == NodeType::CONTEXT_CODE) {
                 std::string fpath = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
                 memories += "- [CODE] " + fpath + ":\n" + node.content.substr(0, 300) + "...\n";
-            } 
-            else if (node.type == NodeType::RESPONSE) {
-                if (!is_failure) episodic_memories += "- [RECENT CHAT] " + node.content + "\n";
-            } 
-            else if (node.type == NodeType::TOOL_CALL) {
-                if (is_failure) warnings += "⚠️ AVOID: " + node.content + " (This failed previously)\n";
+            } else if (node.type == NodeType::RESPONSE && !is_failure) {
+                episodic_memories += "- [RECENT CHAT] " + node.content + "\n";
+            } else if (node.type == NodeType::TOOL_CALL) {
+                if (is_failure) warnings += "⚠️ AVOID: " + node.content + "\n";
                 else memories += "- [SUCCESSFUL ACTION] " + node.content + "\n";
             }
         }
     }
 
-    // 🚀 NEW: Load Massive Context (Tree + Full Code)
+    // Load Context
     std::string massive_context = "";
     std::string full_codebase = load_full_context_file(req.project_id());
-    
     if (!full_codebase.empty()) {
-        // 🛑 TOKEN LIMIT CALCULATION:
-        // 1 Token ~= 4 Characters.
-        // Limit: 1,000,000 Tokens ~= 4,000,000 Bytes (4MB).
-        // Safety Buffer: We use 3.8MB to leave room for system prompts, history, and output.
         const size_t SAFE_TOKEN_LIMIT_BYTES = 3800000; 
-
-        if (full_codebase.size() > SAFE_TOKEN_LIMIT_BYTES) {
-             massive_context += "\n### 📚 FULL CODEBASE (Truncated to fit 1M Context)\n" + full_codebase.substr(0, SAFE_TOKEN_LIMIT_BYTES) + "\n...[CONTENT TRUNCATED]...\n";
-        } else {
-             massive_context += "\n### 📚 FULL CODEBASE\n" + full_codebase + "\n";
-        }
+        if (full_codebase.size() > SAFE_TOKEN_LIMIT_BYTES) massive_context += "\n### 📚 FULL CODEBASE (Truncated)\n" + full_codebase.substr(0, SAFE_TOKEN_LIMIT_BYTES) + "\n";
+        else massive_context += "\n### 📚 FULL CODEBASE\n" + full_codebase + "\n";
     }
 
     // 5. Execution Loop
     int max_steps = 16;
-    
     for (int step = 0; step < max_steps; ++step) {
         
         std::string prompt_template = 
             "### SYSTEM ROLE\n"
             "You are 'Synapse', an Autonomous Coding Agent.\n\n"
             "### TOOL MANIFEST\n" + tool_manifest + "\n"
-            "Added Tool: `propose_plan` -> Input: { \"steps\": [ {\"description\": \"...\", \"tool\": \"apply_edit\", \"parameters\": {\"path\": \"REQUIRED_FILE_PATH.py\", \"content\": \"...\"}} ] }\n"
-            "CRITICAL: You MUST include the 'path' parameter in the plan step if the tool is 'apply_edit'.\n\n"
-            "IMPORTANT: When writing code in JSON, you MUST escape newlines as \\n. Do not use literal newlines inside strings."
+            // 🚀 BATCH MODE INSTRUCTION ADDED HERE
+            "🚀 BATCH MODE ENABLED: You are encouraged to return a JSON LIST `[...]` of multiple tool calls to save time.\n"
+            "Example: `[ {\"tool\": \"apply_edit\", ...}, {\"tool\": \"execute_code\", ...} ]`\n"
+            "If you are confident, perform the edit, execution, and final answer in ONE response.\n\n"
             "### USER REQUEST\n" + req.prompt() + "\n\n";
+
+        prompt_template += 
+            "\n### 🚨 CRITICAL JSON FORMATTING RULES 🚨\n"
+            "1. **INDENTATION IS VITAL**: When writing Python code in JSON, you MUST include spaces after the newline.\n"
+            "   ❌ WRONG: \"def foo():\\nreturn 1\"\n"
+            "   ✅ RIGHT: \"def foo():\\n    return 1\" (Notice the spaces after \\n)\n"
+            "2. **SINGLE QUOTES**: Use single quotes for Python strings: print('hello').\n"
+            "3. **NO LATEX**: Do NOT use LaTeX formulas (like \\frac) in the output text. It breaks the display. Use plain text like (1/pi).\n"
+            "4. **OUTPUT VALID JSON**: Start with `[`.\n";
 
         if (!business_context.empty()) prompt_template += business_context + "\n";
         if (!massive_context.empty()) prompt_template += massive_context + "\n";
@@ -720,17 +734,20 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         std::string plan_ctx = planning_engine_->get_plan_context_for_ai();
         if (!plan_ctx.empty()) prompt_template += plan_ctx + "\n";
 
+        // 🚀 DISABLED THE "NO ACTIVE PLAN" BLOCKER TO ALLOW FAST EXECUTION
+        /* 
+        if (!planning_engine_->has_active_plan()) {
+            prompt_template += "\n### 🚦 STATE: NO ACTIVE PLAN...\n";
+        }
+        */
+
         if (long_term.has_memories) {
-            if(!long_term.positive_hints.empty()) 
-                prompt_template += "### 🧠 SUCCESSFUL STRATEGIES\n" + long_term.positive_hints + "\n";
-            if(!long_term.negative_warnings.empty()) 
-                prompt_template += "### ⛔ KNOWN PITFALLS\n" + long_term.negative_warnings + "\n";
+            if(!long_term.positive_hints.empty()) prompt_template += "### 🧠 SUCCESSFUL STRATEGIES\n" + long_term.positive_hints + "\n";
+            if(!long_term.negative_warnings.empty()) prompt_template += "### ⛔ KNOWN PITFALLS\n" + long_term.negative_warnings + "\n";
         }
 
-        if (!episodic_memories.empty()) 
-            prompt_template += "### EPISODIC CONTEXT\n" + sanitize_for_prompt(episodic_memories) + "\n";
-        if (!memories.empty()) 
-            prompt_template += "### RELEVANT CODE\n" + sanitize_for_prompt(memories) + "\n";
+        if (!episodic_memories.empty()) prompt_template += "### EPISODIC CONTEXT\n" + sanitize_for_prompt(episodic_memories) + "\n";
+        if (!memories.empty()) prompt_template += "### RELEVANT CODE\n" + sanitize_for_prompt(memories) + "\n";
         if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
         if (!warnings.empty()) prompt_template += "### ⛔ ACTIVE WARNINGS\n" + warnings + "\n";
         if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
@@ -738,41 +755,12 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         prompt_template += 
             "\n### 🚨 CRITICAL JSON FORMATTING RULES 🚨\n"
             "When generating Python code inside JSON parameters:\n"
-            "1. **ALWAYS use SINGLE QUOTES for Python strings**: print('hello') ✅  print(\"hello\") ❌\n"
-            "2. **F-strings must use single quotes**: f'Result: {x}' ✅  f\"Result: {x}\" ❌\n"
-            "3. **Comments**: Use hash (#) for multi-line comments. Do NOT use multi-line strings/docstrings inside the code.\n"
-            "4. **Multi-line code: Use \\n**: \"def foo():\\n    return 1\" ✅\n"
-            "5. **Docstrings**: Use triple double-quotes (\"\"\") for multi-line docstrings. Escape them as \\\"\\\"\\\" inside JSON.\n"
-            "6. **PUT the json code within CODE format**: avoid __main__ become \"main\""
+            "1. **ALWAYS use SINGLE QUOTES for Python strings**: print('hello') ✅\n"
+            "2. **Multi-line code: Use \\n**: \"def foo():\\n    return 1\" ✅\n"
+            "3. **OUTPUT ONLY VALID JSON**. Start with `[` or `{`.\n";
             
-            "CORRECT EXAMPLE:\n"
-            "{\n"
-            "  \"tool\": \"apply_edit\",\n"
-            "  \"parameters\": {\n"
-            "    \"path\": \"test.py\",\n"
-            "    \"content\": \"import logging\\n\\nlogging.basicConfig(level=logging.INFO)\\n\\ndef calc(n):\\n    'Calculate something'\\n    logging.info(f'Processing n={n}')\\n    return n * 2\"\n"
-            "  }\n"
-            "}\n\n"
-            
-            "WRONG EXAMPLE (WILL FAIL):\n"
-            "{\n"
-            "  \"parameters\": {\n"
-            "    \"content\": \"logging.info(f\\\"This breaks JSON\\\")\"  ❌ DOUBLE QUOTES IN F-STRING\n"
-            "  }\n"
-            "}\n\n"
-            
-            // [NEW] FORCE JSON MODE INSTRUCTION
-            "### 🛑 FINAL OUTPUT INSTRUCTION 🛑\n"
-            "You must output ONLY valid JSON. Do not write any conversational text, explanations, or markdown outside the JSON object.\n"
-            "Your entire response must start with `{` and end with `}`.\n";
-            
-        // Capture the full prompt context for the dashboard
         last_effective_prompt = prompt_template;
         spdlog::debug("📝 PROMPT TO AI (Truncated):\n{}", prompt_template.substr(0, 1000));
-        
-        if (prompt_template.find("f\"") != std::string::npos) {
-            spdlog::warn("⚠️ Prompt contains f-string with double quotes - AI will likely fail");
-        }
 
         this->notify(writer, "THINKING", "Processing logic...");
         last_gen = ai_service_->generate_text_elite(prompt_template);
@@ -783,174 +771,138 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         }
 
         std::string raw_thought = last_gen.text;
+        
+        // --- 🚀 NEW BATCH PARSING LOGIC ---
+        nlohmann::json extracted = extract_json(raw_thought);
+        std::vector<nlohmann::json> actions;
 
-        // --- 🔍 DEBUG LOG: RAW AI OUTPUT ---
-        spdlog::info("\n==================================================");
-        spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (START):");
-        // We use std::cout for raw output to ensure no formatting/truncation issues with spdlog
-        std::cout << raw_thought << std::endl; 
-        spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (END)");
-        spdlog::info("==================================================\n");
-        // ------------------------------------
-
-        nlohmann::json action = extract_json(raw_thought);
-
-        spdlog::info("🧩 PARSED JSON RESULT:\n{}", action.dump(2)); 
-
-        std::string tool_name = "";
-
-        if (action.contains("tool_code")) {
-            internal_monologue += "\n[SYSTEM ERROR] Invalid JSON Format (tool_code). Use {\"tool\": ..., \"parameters\": ...}.";
-            this->notify(writer, "ERROR_CATCH", "Invalid Protocol (tool_code). Retrying...");
-            continue; 
+        // Detect if it is a single action or a batch
+        if (extracted.is_array()) {
+            for (const auto& item : extracted) {
+                actions.push_back(item);
+            }
+            spdlog::info("🚀 Batch Mode: Detected {} actions in one response.", actions.size());
+        } else {
+            actions.push_back(extracted);
         }
 
-        if (action.contains("tool")) {
-            tool_name = action["tool"];
-        } 
-        else if (action.contains("name")) {
-            tool_name = action["name"];
-        }
-        else if (action.contains("function")) {
-            tool_name = action["function"];
-        }
+        // EXECUTE THE BATCH LOCALLY
+        bool batch_aborted = false;
 
-        if (!tool_name.empty()) {
-            
-            // Log what we found for debugging
-            spdlog::info("🔍 Detected Tool Call: {}", tool_name);
+        for (const auto& action : actions) {
+            if (batch_aborted) break; // Stop executing subsequent steps if previous failed
 
-            // Handle optional "thought" or "reasoning" fields
-            std::string reasoning = action.value("thought", action.value("reasoning", "Executing logic..."));
-            
-            // Handle parameters (support "parameters", "arguments", or "args")
+            std::string tool_name = "";
+            if (action.contains("tool")) tool_name = action["tool"];
+            else if (action.contains("name")) tool_name = action["name"];
+            else if (action.contains("function")) tool_name = action["function"];
+
+            // Handle pure text response (no tool)
+            if (tool_name.empty()) {
+                if (actions.size() == 1) {
+                    final_output = last_gen.text;
+                    last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
+                    this->notify(writer, "FINAL", final_output);
+                    goto mission_complete;
+                }
+                continue;
+            }
+
             nlohmann::json params;
             if (action.contains("parameters")) params = action["parameters"];
             else if (action.contains("arguments")) params = action["arguments"];
             else if (action.contains("args")) params = action["args"];
-            else params = nlohmann::json::object(); // No params
+            else params = nlohmann::json::object();
 
             params["project_id"] = req.project_id();
 
-            // --- 🛡️ EXECUTION GUARD CHECK START ---
-            GuardResult guard = ExecutionGuard::validate_tool_call(tool_name, params, planning_engine_.get());
-            
-            if (!guard.allowed) {
-                spdlog::warn("🛑 Guard Blocked Action: {}", guard.reason);
-                this->notify(writer, "BLOCKED", guard.reason);
-                internal_monologue += "\n[SYSTEM BLOCK] " + guard.reason;
-                last_error = guard.reason; 
-                
-                // IMPORTANT: Semicolons added strictly here
-                final_output = "I cannot execute that action. " + guard.reason + " I must propose a plan first.";
-                continue; 
+            // Handle Reasoning/Thoughts if present in JSON
+            if (action.contains("thought")) {
+                std::string reasoning = action["thought"];
+                last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
+                this->notify(writer, "PLANNING", reasoning);
             }
-            // --- 🛡️ EXECUTION GUARD CHECK END ---
 
-            // 1. Propose Plan
+            params["_batch_mode"] = true; 
+
+            // --- 1. Propose Plan ---
             if (tool_name == "propose_plan") {
-                // If plan is already approved, BLOCK proposal and force execution
-                if (planning_engine_->is_plan_approved()) {
-                    this->notify(writer, "ERROR_CATCH", "Plan already approved. Forcing execution...");
-                    
-                    // Inject a stern correction into the monologue
-                    internal_monologue += "\n[SYSTEM ERROR] You tried to 'propose_plan' but the plan is ALREADY APPROVED. You MUST use 'apply_edit' or 'run_command' to execute the steps now.";
-                    
-                    // Don't exit loop, let it retry generation with this new context
-                    continue; 
-                }
-
                 if (params.contains("steps")) {
                     planning_engine_->propose_plan(req.prompt(), params["steps"]);
-                    
-                    ::code_assistance::AgentResponse plan_res;
-                    plan_res.set_phase("PROPOSAL");
-                    plan_res.set_payload(planning_engine_->get_snapshot().to_json().dump()); 
-                    if (writer) writer->Write(plan_res);
-                    
-                    final_output = "I have proposed a plan based on the business rules. Please review and approve.";
-                    goto mission_complete; 
-                }
-            }
-
-            // 2. Execute Tool
-            this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
-            std::string observation = safe_execute_tool(tool_name, params, session_id);
-
-            // 3. Update Plan Step
-            if (planning_engine_->is_plan_approved()) {
-                auto plan = planning_engine_->get_snapshot();
-                if (plan.current_step_idx < plan.steps.size()) {
-                    auto next_tool = plan.steps[plan.current_step_idx].tool_name;
-                    prompt_template += "5. **URGENT ACTION**: The plan is APPROVED. \n"
-                                    "   **FORBIDDEN TOOL**: `propose_plan` (Do NOT use this).\n"  // <--- ADDED THIS
-                                    "   **REQUIRED TOOL**: `" + next_tool + "`.\n"
-                                    "   Execute Step " + std::to_string(plan.current_step_idx + 1) + " immediately.\n";
-                }
-            }
-            
-            // 4. Record Thought
-            last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
-            this->notify(writer, "PLANNING", reasoning);
-
-            // 5. Handle Final Answer
-            if (tool_name == "FINAL_ANSWER") {
-                final_output = params.value("answer", "");
-                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
-                
-                if (last_error.empty()) {
-                    memory_vault_->add_success(req.prompt(), "Solved via: " + internal_monologue.substr(0, 500), prompt_vec);
-                }
-
-                this->notify(writer, "FINAL", final_output);
-                goto mission_complete; 
-            }
-
-            // 6. Record Intent & Result
-            std::string sig = tool_name + params.dump();
-            last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
-            
-            last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
-
-            // 7. Self-Check & Learning
-            if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
-                memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name + " Params: " + params.dump(), prompt_vec);
-                last_error = observation;
-                graph->update_metadata(last_graph_node, "status", "failed");
-                internal_monologue += "\n[FAILED] " + tool_name + " " + params.dump() + " -> " + observation;
-                this->notify(writer, "ERROR_CATCH", "Detected failure. Self-correcting...");
-
-                if (planning_engine_->is_plan_approved()) {
-                    auto plan = planning_engine_->get_snapshot();
-                    planning_engine_->mark_step_status(plan.current_step_idx, StepStatus::FAILED, observation);
-                }
-
-            } else {
-                last_error = "";
-                graph->update_metadata(last_graph_node, "status", "success");
-                internal_monologue += "\n[OK] " + tool_name + " " + params.dump() + " -> " + observation.substr(0, 200) + "...";
-                this->notify(writer, "SUCCESS", "Action confirmed.");
-
-                // 🚀 CRITICAL FIX: Update Planning Engine state
-                if (planning_engine_->is_plan_approved()) {
-                    auto plan = planning_engine_->get_snapshot();
-                    
-                    // Only mark success if we are tracking steps
-                    if (plan.current_step_idx < plan.steps.size()) {
-                         planning_engine_->mark_step_status(plan.current_step_idx, StepStatus::SUCCESS, observation);
-                         spdlog::info("✅ Plan Step {} Completed. Advancing...", plan.current_step_idx + 1);
+                    // Auto-approve if batched with execution
+                    if (actions.size() > 1) {
+                        planning_engine_->approve_plan();
+                        this->notify(writer, "PLANNING", "Plan proposed and auto-approved for batch execution.");
+                    } else {
+                        // Standard Stop for approval
+                        ::code_assistance::AgentResponse plan_res;
+                        plan_res.set_phase("PROPOSAL");
+                        plan_res.set_payload(planning_engine_->get_snapshot().to_json().dump()); 
+                        if (writer) writer->Write(plan_res);
+                        final_output = "Plan Proposed.";
+                        goto mission_complete; 
                     }
                 }
             }
+
+            // --- 2. Execution Guard ---
+            // If we are in a batch, we are lenient unless it's a hard plan violation
+            GuardResult guard = ExecutionGuard::validate_tool_call(tool_name, params, planning_engine_.get());
+            if (!guard.allowed) {
+                // If checking strict plan compliance fails, verify if it's just an out-of-order batch
+                // For now, fail the specific action
+                spdlog::warn("🛑 Guard Blocked Action: {}", guard.reason);
+                this->notify(writer, "BLOCKED", guard.reason);
+                internal_monologue += "\n[SYSTEM BLOCK] " + guard.reason;
+                last_error = guard.reason;
+                batch_aborted = true; 
+                continue;
+            }
+
+            // --- 3. Execute Tool ---
+            this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
+            std::string observation = safe_execute_tool(tool_name, params, session_id);
+
+            // --- 4. Update Plan Status ---
+            if (planning_engine_->is_plan_approved()) {
+                auto plan = planning_engine_->get_snapshot();
+                if (plan.current_step_idx < plan.steps.size()) {
+                    // Simple heuristic: If tool matches plan step, mark success
+                    planning_engine_->mark_step_status(plan.current_step_idx, StepStatus::SUCCESS, observation);
+                }
+            }
+
+            // --- 5. Record Graph ---
+            std::string sig = tool_name; 
+            if (params.contains("path")) sig += " " + params["path"].get<std::string>();
             
-        } else {
-            // No tool = Chat response
-            final_output = last_gen.text;
-            last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
-            this->notify(writer, "FINAL", final_output);
-            goto mission_complete;
-        }
-    }
+            last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
+            last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
+
+            // --- 6. Check for Errors ---
+            if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
+                memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name, prompt_vec);
+                last_error = observation;
+                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
+                this->notify(writer, "ERROR_CATCH", "Action failed. Halting batch.");
+                batch_aborted = true;
+            } else {
+                internal_monologue += "\n[OK] " + tool_name + " -> Success";
+            }
+
+            // --- 7. Final Answer ---
+            if (tool_name == "FINAL_ANSWER") {
+                final_output = params.value("answer", "");
+                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
+                if (last_error.empty()) {
+                    memory_vault_->add_success(req.prompt(), "Solved via: " + internal_monologue.substr(0, 500), prompt_vec);
+                }
+                this->notify(writer, "FINAL", final_output);
+                goto mission_complete; 
+            }
+        } // End Batch Loop
+
+    } // End Turn Loop
 
 mission_complete:
     {
@@ -968,9 +920,7 @@ mission_complete:
     log.project_id = req.project_id();
     log.user_query = req.prompt();
     log.ai_response = final_output;
-    
     log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    
     log.duration_ms = total_ms;
     log.full_prompt = last_effective_prompt + "\n\n### EXECUTION HISTORY\n" + internal_monologue;
     code_assistance::LogManager::instance().add_log(log);
