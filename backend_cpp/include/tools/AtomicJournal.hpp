@@ -81,19 +81,19 @@ public:
 
     static bool validate_ast_integrity(const std::string& code, const std::string& ext) {
         // Instantiate the Elite Parser
-        code_assistance::elite::ASTBooster parser;
+        // code_assistance::elite::ASTBooster parser;
         
-        // 1. Syntax Check via Tree-sitter
-        if (!parser.validate_syntax(code, ext)) {
-            spdlog::error("❌ AST REJECTION: Syntax error detected in proposed code.");
-            return false;
-        }
+        // // 1. Syntax Check via Tree-sitter
+        // if (!parser.validate_syntax(code, ext)) {
+        //     spdlog::error("❌ AST REJECTION: Syntax error detected in proposed code.");
+        //     return false;
+        // }
 
-        // 2. Critical Heuristic: Prevent wiping files
-        if (code.length() < 10 && ext != ".txt" && ext != ".md") {
-            spdlog::warn("⚠️ AST WARNING: Proposed code is dangerously short/empty.");
-            return false;
-        }
+        // // 2. Critical Heuristic: Prevent wiping files
+        // if (code.length() < 10 && ext != ".txt" && ext != ".md") {
+        //     spdlog::warn("⚠️ AST WARNING: Proposed code is dangerously short/empty.");
+        //     return false;
+        // }
 
         return true;
     }

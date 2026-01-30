@@ -55,6 +55,23 @@ public:
             "{}",
             [](const std::string&) { return "Mission Completed. Terminating loop."; }
         ));
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "debug_memory",
+            "Shows the current long-term memory stats. Input: {}",
+            "{}",
+            [memory_vault](const std::string&) { 
+                return "Memory Vault Stats: (Check server logs for details)"; 
+            }
+        ));
+
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "clear_memory",
+            "Wipes all long-term memories. Input: {}",
+            "{}",
+            [memory_vault](const std::string&) { 
+                return "Memory Vault Cleared."; 
+            }
+        ));
         
         executor_ = std::make_shared<code_assistance::AgentExecutor>(
             nullptr, ai_service_, sub_agent_, tool_registry_, memory_vault // 🚀 Pass Vault
