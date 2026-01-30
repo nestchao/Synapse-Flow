@@ -109,8 +109,6 @@ cpr::Response perform_request_with_retry(Func request_factory, std::shared_ptr<K
 GenerationResult EmbeddingService::call_gemini_api(const std::string& prompt) {
     GenerationResult final_result;
     std::string url = get_endpoint_url("generateContent");
-    
-    spdlog::info("🚀 API REQUEST | URL: {}", url); 
 
     auto r = perform_request_with_retry([&]() {
         return cpr::Post(cpr::Url{get_endpoint_url("generateContent")},

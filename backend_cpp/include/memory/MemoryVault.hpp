@@ -82,6 +82,20 @@ public:
         return result;
     }
 
+    void clear() {
+        if (fs::exists(path_)) {
+            fs::remove_all(path_);
+            fs::create_directories(path_);
+        }
+        // Re-init store
+        store_ = std::make_shared<FaissVectorStore>(768);
+        spdlog::warn("🧠 Memory Vault WIPED by user command.");
+    }
+
+    std::string get_stats() {
+        return "Total Memories: " + std::to_string(store_->get_all_nodes().size());
+    }
+
 private:
     std::shared_ptr<CodeNode> create_memory_node(const std::string& situation, const std::string& action, 
                                                  const std::vector<float>& vec, double valence) {
