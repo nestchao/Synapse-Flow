@@ -36,6 +36,8 @@ FaissVectorStore::~FaissVectorStore() {
 }
 
 void FaissVectorStore::add_nodes(const std::vector<std::shared_ptr<CodeNode>>& nodes) {
+    std::unique_lock lock(rw_mutex_);
+
     if (nodes.empty()) return;
 
     std::vector<float> vectors_flat;
@@ -70,6 +72,8 @@ void FaissVectorStore::add_nodes(const std::vector<std::shared_ptr<CodeNode>>& n
 }
 
 std::vector<FaissSearchResult> FaissVectorStore::search(const std::vector<float>& query_vector, int k) {
+    std::shared_lock lock(rw_mutex_);
+
     if (index_->ntotal == 0) return {};
 
     std::vector<float> query_copy = query_vector;
@@ -93,6 +97,8 @@ std::vector<FaissSearchResult> FaissVectorStore::search(const std::vector<float>
 }
 
 void FaissVectorStore::save(const std::string& path) const {
+    std::shared_lock lock(rw_mutex_); 
+
     fs::path dir(path);
     fs::create_directories(dir);
 
@@ -109,6 +115,8 @@ void FaissVectorStore::save(const std::string& path) const {
 }
 
 void FaissVectorStore::load(const std::string& path) {
+    std::unique_lock lock(rw_mutex_);
+
     fs::path dir(path);
     
     // reset() deletes the old index and takes ownership of the new one
@@ -138,6 +146,8 @@ const std::vector<std::shared_ptr<CodeNode>>& FaissVectorStore::get_all_nodes() 
 }
 
 std::shared_ptr<CodeNode> FaissVectorStore::get_node_by_name(const std::string& name) const {
+    std::shared_lock lock(rw_mutex_);
+    
     auto it = name_to_id_map_.find(name);
     if (it != name_to_id_map_.end()) {
         auto node_it = id_to_node_map_.find(it->second);

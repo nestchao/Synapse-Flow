@@ -9,6 +9,7 @@
 #include <functional>
 #include <stdexcept>
 #include <type_traits> 
+#include <spdlog/spdlog.h> 
 
 class ThreadPool {
 public:
@@ -20,12 +21,22 @@ public:
                     {
                         std::unique_lock<std::mutex> lock(this->queue_mutex);
                         this->condition.wait(lock, [this]{ return this->stop || !this->tasks.empty(); });
+                        
                         if(this->stop && this->tasks.empty())
                             return;
+                        
                         task = std::move(this->tasks.front());
                         this->tasks.pop();
                     }
-                    task();
+                    
+                    // 🛡️ Exception Boundary: Prevent one task from crashing the whole server
+                    try {
+                        task();
+                    } catch (const std::exception& e) {
+                        spdlog::error("🔥 Uncaught exception in ThreadPool worker: {}", e.what());
+                    } catch (...) {
+                        spdlog::error("🔥 Unknown exception in ThreadPool worker");
+                    }
                 }
             });
     }
@@ -56,10 +67,11 @@ public:
             stop = true;
         }
         condition.notify_all();
-        for(std::thread &worker: workers)
-            worker.join();
+        for(std::thread &worker: workers) {
+            if(worker.joinable()) worker.join(); // 🛡️ Safety check
+        }
     }
-
+    
 private:
     std::vector<std::thread> workers;
     std::queue<std::function<void()>> tasks;
