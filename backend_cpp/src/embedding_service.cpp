@@ -83,9 +83,11 @@ cpr::Response perform_request_with_retry(Func request_factory, std::shared_ptr<K
 
         // 429 Rate Limit -> Rotate Key + Small Sleep
         if (r.status_code == 429) {
-            spdlog::warn("⏳ Rate Limit Hit. Switching Key...");
+            // Calculate delay: 500ms * 2^attempt
+            int delay_ms = 500 * std::pow(2, i);
+            spdlog::warn("⏳ Rate Limit Hit. Backing off for {}ms...", delay_ms);
             km->rotate_key();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500)); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms)); 
             continue;
         }
 

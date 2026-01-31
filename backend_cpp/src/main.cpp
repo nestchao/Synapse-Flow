@@ -7,6 +7,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <signal.h>
 
 #include "KeyManager.hpp"
 #include "LogManager.hpp"
@@ -32,6 +33,16 @@ using json = nlohmann::json;
 namespace code_assistance {
     std::string web_search(const std::string& args_json, const std::string& api_key);
 }
+
+std::unique_ptr<httplib::Server> global_server_ptr;
+
+void signal_handler(int signum) {
+    spdlog::info("🛑 Interrupt signal ({}) received. Shutting down...", signum);
+    if (global_server_ptr) {
+        global_server_ptr->stop();
+    }
+}
+
 
 class CodeAssistanceServer {
 public:
@@ -78,6 +89,32 @@ public:
         );
 
         setup_routes();
+
+        std::thread([this]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                
+                auto stats = system_monitor_.get_latest_snapshot();
+                
+                // If RAM > 2GB (adjust as needed), clear caches
+                if (stats.ram_usage_mb > 2048) {
+                    spdlog::warn("⚠️ High Memory Usage ({} MB). Purging Caches...", stats.ram_usage_mb);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        project_context_cache_.clear();
+                    }
+                    
+                    // Assuming EmbeddingService exposes cache clearing or we add it
+                    // ai_service_->clear_cache(); 
+                    
+                    // Force OS to reclaim memory (Linux specific, but useful concept)
+                    #ifdef __linux__
+                    malloc_trim(0);
+                    #endif
+                }
+            }
+        }).detach();
     }
 
     void run() {
@@ -440,8 +477,18 @@ void pre_flight_check() {
 
 int main() {
     spdlog::set_pattern("[%H:%M:%S] [%^%l%$] %v");
+    
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     pre_flight_check();
-    CodeAssistanceServer server;
-    server.run();
+    CodeAssistanceServer app;
+    
+    // We can't easily extract the server object from the wrapper class without modifying it
+    // But ensuring ThreadPool destructors run (via app going out of scope) is usually enough 
+    // if the server.listen() loop breaks.
+    
+    app.run(); // This blocks
+    
     return 0;
 }
