@@ -322,3 +322,125 @@ code { color: #e8d5ff; text-shadow: 0 0 2px rgba(232, 213, 255, 0.1); }
 }
 
 #send-btn svg { width: 18px; height: 18px; fill: white; filter: drop-shadow(0 0 2px white); }
+
+/* --- PLAN CARD (New) --- */
+.plan-card {
+    background: rgba(13, 17, 23, 0.95);
+    border: 1px solid var(--touhou-primary);
+    border-radius: 8px;
+    margin: 10px 0;
+    overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    animation: spell-card-appear 0.3s ease-out;
+}
+
+.plan-header {
+    background: linear-gradient(90deg, rgba(45, 27, 78, 0.8), rgba(26, 0, 51, 0.8));
+    padding: 10px 15px;
+    font-weight: bold;
+    color: var(--touhou-accent);
+    border-bottom: 1px solid var(--touhou-primary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.plan-steps {
+    padding: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.step-item {
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    align-items: center;
+    color: #e8d5ff;
+}
+
+.step-icon {
+    width: 20px;
+    text-align: center;
+    font-weight: bold;
+}
+
+.step-pending .step-icon { color: var(--touhou-secondary); }
+.step-success .step-icon { color: #20c997; }
+.step-running .step-icon { animation: spin 1s infinite linear; }
+
+.plan-actions {
+    padding: 10px 15px;
+    background: rgba(0,0,0,0.2);
+    display: flex;
+    gap: 10px;
+    border-top: 1px solid rgba(255, 105, 180, 0.3);
+}
+
+.btn-approve {
+    background: var(--touhou-primary);
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    flex: 1;
+    transition: all 0.2s;
+}
+
+.btn-approve:hover { box-shadow: 0 0 10px var(--touhou-primary); }
+
+.btn-reject {
+    background: transparent;
+    border: 1px solid var(--touhou-danger);
+    color: var(--touhou-danger);
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    flex: 1;
+}
+
+@keyframes spin { 100% { transform: rotate(360deg); } }
+
+.thinking-container {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 5px;
+}
+
+.magic-circle {
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--touhou-primary);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: magic-spin 1s linear infinite;
+    position: relative;
+}
+
+.magic-circle::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px; right: 2px; bottom: 2px;
+    border: 2px solid var(--touhou-secondary);
+    border-bottom-color: transparent;
+    border-radius: 50%;
+    animation: magic-spin 1.5s linear infinite reverse;
+}
+
+@keyframes magic-spin { to { transform: rotate(360deg); } }
+
+.thinking-text {
+    font-style: italic;
+    background: linear-gradient(90deg, #e8d5ff, #ff69b4, #e8d5ff);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    background-size: 200% auto;
+    animation: shine 2s linear infinite;
+}
+
+@keyframes shine { to { background-position: 200% center; } }
