@@ -1,3 +1,4 @@
+// extension/media/chat.js
 (function () {
     const vscode = acquireVsCodeApi();
     const chatContainer = document.getElementById('chat-container');
@@ -11,7 +12,6 @@
         let lang = typeof tokenOrCode === 'object' ? (tokenOrCode.lang || "") : (language || "");
         
         const id = 'code-' + Math.random().toString(36).substr(2, 9);
-        // Clean comments like [TARGET:file.ts]
         const displayCode = codeText.replace(/(?:\/\/|#|--)\s*\[TARGET:.*?\]\s*\n?/, "");
         
         return `
@@ -39,16 +39,31 @@
     const state = vscode.getState() || { messages: [] };
     
     function saveState() {
-        // Limit state to last 50 messages to prevent memory issues
         const messages = Array.from(chatContainer.children).slice(-50).map(child => child.outerHTML);
         vscode.setState({ messages });
     }
 
     if (state.messages && state.messages.length > 0) {
         chatContainer.innerHTML = state.messages.join('');
-        // Re-scroll to bottom
         setTimeout(() => chatContainer.scrollTop = chatContainer.scrollHeight, 100);
     }
+
+    // --- GLOBAL FUNCTIONS (Must be accessible by HTML onclick) ---
+    window.sendApproval = (id, approved) => {
+        const card = document.getElementById(id);
+        if(card) {
+            // Visual feedback
+            const btns = card.querySelector('.plan-actions');
+            if(btns) btns.innerHTML = approved ? 
+                '<span style="color:#20c997; font-weight:bold; width:100%; text-align:center;">MISSION AUTHORIZED</span>' : 
+                '<span style="color:#dc143c; font-weight:bold; width:100%; text-align:center;">MISSION ABORTED</span>';
+        }
+        // Send to extension
+        vscode.postMessage({ 
+            type: 'askCode', 
+            value: approved ? "Plan approved. Proceed with execution." : "Plan rejected. Stop." 
+        });
+    };
 
     // --- EVENT LISTENERS ---
     chatContainer.addEventListener('click', (e) => {
@@ -60,7 +75,6 @@
             
             if (action === 'accept') {
                 const rawCode = container.querySelector('.hidden-raw').innerText;
-                // Visual Feedback
                 target.innerText = "INJECTING...";
                 target.style.background = "#20c997";
                 vscode.postMessage({ type: 'applyCode', value: rawCode, id: blockId });
@@ -83,11 +97,17 @@
         div.innerText = text;
         chatContainer.appendChild(div);
         
-        // 2. Add Thinking Placeholder
+        // 2. Add Thinking Placeholder (UPDATED FOR ANIMATION)
         const thinkingDiv = document.createElement('div');
         thinkingDiv.className = 'message bot thinking';
         thinkingDiv.id = 'temp-thinking';
-        thinkingDiv.innerText = 'Chanting spell...';
+        // 🚀 FIX: Use innerHTML to inject the CSS magic circle structure
+        thinkingDiv.innerHTML = `
+            <div class="thinking-container">
+                <div class="magic-circle"></div>
+                <span class="thinking-text">Weaving Logic...</span>
+            </div>
+        `;
         chatContainer.appendChild(thinkingDiv);
 
         // Send to Extension
@@ -112,7 +132,6 @@
     window.addEventListener('message', event => {
         const message = event.data;
         
-        // Remove temp thinking bubble if it exists
         const tempThinking = document.getElementById('temp-thinking');
         if (tempThinking) tempThinking.remove();
 
@@ -121,30 +140,36 @@
 
         switch (message.type) {
             case 'addResponse':
-                // For "Thinking..." updates from backend
                 const div = document.createElement('div');
-                div.className = message.value.includes('Thinking') ? 'message bot thinking' : 'message bot';
-                div.innerHTML = marked.parse(message.value); 
+                // Check if backend specifically sent "Thinking..." text update
+                if (message.value.includes('Thinking')) {
+                    div.className = 'message bot thinking';
+                    div.innerHTML = `
+                        <div class="thinking-container">
+                            <div class="magic-circle"></div>
+                            <span class="thinking-text">${message.value}</span>
+                        </div>`;
+                } else {
+                    div.className = 'message bot';
+                    div.innerHTML = marked.parse(message.value);
+                }
                 chatContainer.appendChild(div);
                 saveState();
                 break;
                 
             case 'updateLastResponse':
-                // The main AI response replaces the last bubble (usually the thinking one)
                 let content = message.value;
-                // Auto-wrap raw code if it looks like code but isn't marked
                 if ((content.includes("def ") || content.includes("class ") || content.includes("import ")) && !content.includes("```")) {
                     content = "```python\n" + content + "\n```";
                 }
                 
-                // If there was no last bot bubble (rare), create one
                 if (!lastBot) {
                     const newDiv = document.createElement('div');
                     newDiv.className = 'message bot';
                     newDiv.innerHTML = marked.parse(content);
                     chatContainer.appendChild(newDiv);
                 } else {
-                    lastBot.className = 'message bot'; // Remove 'thinking' class
+                    lastBot.className = 'message bot'; // Removes 'thinking' class and animation
                     lastBot.innerHTML = marked.parse(content);
                 }
                 saveState();
@@ -159,6 +184,43 @@
                     actions.innerHTML = '<span style="color:#20c997; font-weight:bold;">★ SPELL CAST (APPLIED)</span>';
                     saveState();
                 }
+                break;
+
+            case 'renderPlan':
+                // 🚀 FIX: Logic correctly placed inside switch
+                const plan = message.value; 
+                const planId = 'plan-' + Math.random().toString(36).substr(2, 9);
+                
+                let stepsHtml = plan.steps.map((step, idx) => `
+                    <div class="step-item step-${step.status.toLowerCase()}">
+                        <div class="step-icon">${step.status === 'SUCCESS' ? '✓' : (idx + 1)}</div>
+                        <div class="step-desc">
+                            <span style="color:#ffd700; font-weight:bold">[${step.tool}]</span> 
+                            ${step.description}
+                        </div>
+                    </div>
+                `).join('');
+
+                const html = `
+                    <div class="plan-card" id="${planId}">
+                        <div class="plan-header">
+                            <span>⚡ EXECUTION PLAN</span>
+                            <span style="font-size:10px; opacity:0.7">${plan.status}</span>
+                        </div>
+                        <div class="plan-steps">${stepsHtml}</div>
+                        ${plan.status === 'REVIEW_REQUIRED' ? `
+                        <div class="plan-actions">
+                            <button class="btn-approve" onclick="sendApproval('${planId}', true)">APPROVE MISSION</button>
+                            <button class="btn-reject" onclick="sendApproval('${planId}', false)">ABORT</button>
+                        </div>` : ''}
+                    </div>
+                `;
+
+                const planDiv = document.createElement('div');
+                planDiv.className = 'message bot';
+                planDiv.innerHTML = html;
+                chatContainer.appendChild(planDiv);
+                saveState();
                 break;
         }
         chatContainer.scrollTop = chatContainer.scrollHeight;
