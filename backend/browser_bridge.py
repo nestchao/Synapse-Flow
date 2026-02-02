@@ -48,7 +48,22 @@ class AIStudioBridge:
                 context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://aistudio.google.com")
                 
                 page = context.pages[0]
-                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                def block_aggressively(route):
+                    if route.request.resource_type in ["image", "font", "media"]:
+                        route.abort()
+                    else:
+                        route.continue_()
+                page.route("**/*", block_aggressively)
+
+                # --- OPTIMIZATION: Network Interception ---
+                def handle_response(response):
+                    if "generateContent" in response.url and response.status == 200:
+                        try:
+                            # We don't parse the whole stream here (it's complex chunks),
+                            # but we use this as a signal that the backend is active.
+                            pass 
+                        except: pass
+                page.on("response", handle_response)
                 
                 print("✅ [Thread] Browser Ready.")
 
@@ -125,7 +140,6 @@ class AIStudioBridge:
             add_btn = page.locator("[data-test-id='add-media-button']")
             add_btn.wait_for(state="visible", timeout=20000)
             add_btn.click()
-            time.sleep(0.5)
             
             # Handle File Chooser
             upload_option = page.locator("button.mat-mdc-menu-item").filter(has_text="Upload a file")
@@ -148,8 +162,6 @@ class AIStudioBridge:
             except:
                 print("   [Thread] Warning: Filename chip not detected within timeout. Proceeding anyway...")
 
-            # 4. Wait for processing bar (Tokenizing)
-            time.sleep(1) 
             try:
                 if page.locator("mat-progress-bar").is_visible():
                     print("   [Thread] Processing bar detected. Waiting...")
@@ -179,7 +191,6 @@ class AIStudioBridge:
             last_option_btn = options_buttons[-1]
             last_option_btn.scroll_into_view_if_needed()
             last_option_btn.click()
-            time.sleep(0.5) 
             
             # 2. Wait for the menu item 'Copy as markdown'
             # Using text filter is safer than nth-child index which can change
@@ -219,141 +230,41 @@ class AIStudioBridge:
                      page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
 
             # Ensure prompt box is ready
-            prompt_box = page.get_by_placeholder("Start typing a prompt")
-            prompt_box.wait_for(state="visible", timeout=30000)
-            time.sleep(1.5)
+            prompt_box = page.locator('textarea, [placeholder*="Start typing"]')
+            prompt_box.wait_for(state="visible", timeout=15000)
 
-            # Inject text
-            page.evaluate("""
-                (text) => {
-                    const el = document.querySelector('textarea, [placeholder*="Start typing"]');
-                    if (el) {
-                        el.value = text;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }
-            """, message)
+            # Using fill() is faster than type() and bypasses most event delays
+            prompt_box.fill(message)
 
-            time.sleep(1.0)
-            
-            # Press Enter to send
-            # page.keyboard.press("Enter")
-            
-            # Fallback: Click "Run" button if Enter didn't work (sometimes focus issues)
-            # The "Run" button usually has aria-label="Run"
+            # 2. Trigger Run
             run_btn = page.locator('ms-run-button button[aria-label="Run"]')
-            if run_btn.is_visible():
-                 # If run button is still visible 1s after pressing enter, click it
-                 time.sleep(1)
-                 if run_btn.is_visible():
-                     print("   [Thread] 'Enter' didn't trigger run. Clicking Run button...")
-                     run_btn.click()
+            run_btn.click()
 
-            print("   [Thread] Waiting for AI response...", end="", flush=True)
-
+            print("   [Thread] AI Processing...", end="", flush=True)
+            
             try:
-                # Wait up to 120 seconds (2 mins) for the text bubble to appear
-                page.locator('ms-text-chunk').last.wait_for(state="visible", timeout=120000)
+                # First, wait for the stop button to appear (generation started)
+                stop_btn = page.locator('ms-run-button button:has-text("Stop")')
+                stop_btn.wait_for(state="visible", timeout=5000)
+                
+                # Now, wait for the stop button to DISAPPEAR (generation finished)
+                stop_btn.wait_for(state="hidden", timeout=300000)
             except:
-                return "Error: AI took too long to start generating text."
-            
-            stop_btn = page.locator("ms-run-button button").filter(has_text="Stop")
-            run_btn = page.locator("ms-run-button button").filter(has_text="Run")
+                # Fallback if the response was so fast the Stop button never registered
+                pass
 
-            start_time = time.time()
-            last_len = 0
-            stable_count = 0
-
-            while True:
-                if time.time() - start_time > 300: # Extended timeout
-                    return "Error: Timeout waiting for response."
-
-                # Keep scrolling to trigger lazy load if needed
-                current_chunks = page.locator('ms-text-chunk').all()
-                current_count = len(current_chunks)
-                
-                if current_count > 0:
-                    page.evaluate("""
-                        () => {
-                            const chunks = document.querySelectorAll('ms-text-chunk');
-                            if (chunks.length > 0) {
-                                const lastChunk = chunks[chunks.length - 1];
-                                lastChunk.scrollIntoView({ block: 'end', behavior: 'instant' });
-                                let parent = lastChunk.parentElement;
-                                while (parent) {
-                                    if (parent.scrollHeight > parent.clientHeight) {
-                                        parent.scrollTop = parent.scrollHeight;
-                                    }
-                                    parent = parent.parentElement;
-                                }
-                                const editor = document.querySelector('ms-prompt-editor');
-                                if (editor) editor.scrollTop = editor.scrollHeight;
-                            }
-                        }
-                    """)
-
-                current_chunks = page.locator('ms-text-chunk').all()
-                
-                # Check busy state
-                is_stopping = stop_btn.is_visible()
-                is_run_ready = run_btn.is_visible()
-                
-                print(is_stopping, is_run_ready, end=" | ", flush=True)
-
-                current_text = current_chunks[-1].inner_text().strip() if current_chunks else ""
-                current_len = len(current_text)
-
-                print(".", end="", flush=True)
-
-                # Heuristic: If Run button is visible AND stop button is NOT visible AND we have text
-                if is_stopping:
-                    stable_count = 0 # Reset counter, we are definitely busy
-                
-                elif is_run_ready:
-                    # Even if buttons say "Ready", we double check text stability 
-                    # just in case of a UI glitch.
-                    if current_len == last_len and current_len > 0:
-                        stable_count += 1
-                        
-                        # Wait 4 ticks (4 seconds) of total stability to be safe
-                        if stable_count >= 8:
-                            break
-                    else:
-                        stable_count = 0
-                
-                # CASE C: Ambiguous State (No Run button, No Stop button)
-                # This happens during transitions. Assume busy.
-                else:
-                    stable_count = 0
-                
-                last_len = current_len
-                time.sleep(1)
-
-            print("\n   [Thread] Captured.")
-
+            # 4. Final Data Retrieval
             if use_clipboard:
-                # Use the new Clipboard logic ONLY if requested
-                clipboard_content = self._internal_get_markdown_via_clipboard(page)
-                if clipboard_content and len(clipboard_content) > 10:
-                    return clipboard_content
-                print("   [Thread] Clipboard failed or empty. Falling back to scraping.")
+                markdown = self._internal_get_markdown_via_clipboard(page)
+                if markdown: return markdown
 
+            # Final Fallback to DOM Scrape
             final_chunks = page.locator('ms-text-chunk').all()
-            if not final_chunks: return "Error: No response chunks found."
+            if not final_chunks: return "Error: No response found."
             
-            raw_answer = final_chunks[-1].inner_text()
-
-            # Cleanup
-            clean_answer = raw_answer
-            if "Expand to view model thoughts" in clean_answer:
-                clean_answer = clean_answer.split("Expand to view model thoughts")[-1]
-
-            ui_keywords = ["expand_more", "expand_less", "content_copy", "share", "edit", "thumb_up", "thumb_down"]
-            for junk in ui_keywords:
-                clean_answer = clean_answer.replace(junk, "")
-
-            return clean_answer.strip()
+            # Use the last chunk and clean it
+            raw_text = final_chunks[-1].inner_text().strip()
+            return self._clean_ui_junk(raw_text)
 
         except Exception as e:
             return f"Browser Error: {str(e)}"
@@ -475,32 +386,22 @@ class AIStudioBridge:
                 return None
     
     def _internal_get_markdown_via_clipboard(self, page):
-        """Hovers over the last message and clicks 'Copy as markdown'."""
-        print("   [Thread] Attempting 'Copy as Markdown' via Clipboard...")
+        """Extracts the cleanest version of the response using AI Studio's own copy tool."""
         try:
             latest_turn = page.locator("ms-chat-turn").last
-            latest_turn.scroll_into_view_if_needed()
             latest_turn.hover()
-            time.sleep(0.5) 
-
+            
             options_btn = latest_turn.locator("button[aria-label='Open options']")
-            options_btn.wait_for(state="visible", timeout=3000)
             options_btn.click()
             
+            # Wait for the specific menu item
             copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as markdown")
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
-            time.sleep(0.5) 
-            clipboard_text = page.evaluate("navigator.clipboard.readText()")
-            page.keyboard.press("Escape")
-            
-            print(f"   [Thread] Clipboard Copy Successful ({len(clipboard_text)} chars).")
-            return clipboard_text
-
-        except Exception as e:
-            print(f"   [Thread] ⚠️ Copy as Markdown failed: {e}")
-            page.keyboard.press("Escape")
+            # Instant read from the browser's shared clipboard
+            return page.evaluate("navigator.clipboard.readText()")
+        except:
             return None
 
     def get_available_models(self):
