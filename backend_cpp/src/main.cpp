@@ -3,49 +3,123 @@
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <filesystem>
-#include <fstream>
 #include <thread>
-#include <cstdlib> 
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <signal.h>
 
-#include "KeyManager.hpp" 
+#include "KeyManager.hpp"
 #include "LogManager.hpp"
 #include "ThreadPool.hpp"
 #include "sync_service.hpp"
-#include "cache_manager.hpp"
 #include "SystemMonitor.hpp"
-#include "agent/SubAgent.hpp"
-#include "agent/AgentTypes.hpp"
-#include "retrieval_engine.hpp"
 #include "embedding_service.hpp"
-#include "tools/ToolRegistry.hpp"
 #include "faiss_vector_store.hpp"
+
+#include "agent/SubAgent.hpp"
 #include "agent/AgentExecutor.hpp"
-#include "tools/FileSurgicalTool.hpp" 
+
+#include "tools/ToolRegistry.hpp"
+#include "tools/FileSystemTools.hpp"
+#include "tools/FileSurgicalTool.hpp"
+#include "tools/PatternSearchTool.hpp"
+#include "tools/CodeExecutionTool.hpp"
+#include "tools/ShellExecutionTool.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace code_assistance {
-    std::string web_search(const std::string& args_json, const std::string& api_key); 
+    std::string web_search(const std::string& args_json, const std::string& api_key);
 }
+
+std::unique_ptr<httplib::Server> global_server_ptr;
+
+void signal_handler(int signum) {
+    spdlog::info("🛑 Interrupt signal ({}) received. Shutting down...", signum);
+    if (global_server_ptr) {
+        global_server_ptr->stop();
+    }
+}
+
 
 class CodeAssistanceServer {
 public:
-    CodeAssistanceServer(int port = 5002)
-        : port_(port),
-          server_(),
-          cache_manager_(std::make_shared<code_assistance::CacheManager>()),
-          thread_pool_(4) 
-    {
+    CodeAssistanceServer(int port = 5002) : port_(port), thread_pool_(4) {
         key_manager_ = std::make_shared<code_assistance::KeyManager>();
-        embedding_service_ = std::make_shared<code_assistance::EmbeddingService>(key_manager_);
-        this->initialize_agent_system();
+        ai_service_ = std::make_shared<code_assistance::EmbeddingService>(key_manager_);
+        sub_agent_ = std::make_shared<code_assistance::SubAgent>();
+        tool_registry_ = std::make_shared<code_assistance::ToolRegistry>();
+        
+        auto memory_vault = std::make_shared<code_assistance::MemoryVault>("data/memory_vault");
+        
+        tool_registry_->register_tool(std::make_unique<code_assistance::ReadFileTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::ListDirTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::PatternSearchTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::CodeExecutionTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::ShellExecutionTool>());
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "FINAL_ANSWER",
+            "Mission Completion Signal",
+            "{}",
+            [](const std::string&) { return "Mission Completed. Terminating loop."; }
+        ));
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "debug_memory",
+            "Shows the current long-term memory stats. Input: {}",
+            "{}",
+            [memory_vault](const std::string&) { 
+                return "Memory Vault Stats: (Check server logs for details)"; 
+            }
+        ));
+
+        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
+            "clear_memory",
+            "Wipes all long-term memories. Input: {}",
+            "{}",
+            [memory_vault](const std::string&) { 
+                return "Memory Vault Cleared."; 
+            }
+        ));
+        
+        executor_ = std::make_shared<code_assistance::AgentExecutor>(
+            nullptr, ai_service_, sub_agent_, tool_registry_, memory_vault // 🚀 Pass Vault
+        );
+
         setup_routes();
+
+        std::thread([this]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                
+                auto stats = system_monitor_.get_latest_snapshot();
+                
+                // If RAM > 2GB (adjust as needed), clear caches
+                if (stats.ram_usage_mb > 2048) {
+                    spdlog::warn("⚠️ High Memory Usage ({} MB). Purging Caches...", stats.ram_usage_mb);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        project_context_cache_.clear();
+                    }
+                    
+                    // Assuming EmbeddingService exposes cache clearing or we add it
+                    // ai_service_->clear_cache(); 
+                    
+                    // Force OS to reclaim memory (Linux specific, but useful concept)
+                    #ifdef __linux__
+                    malloc_trim(0);
+                    #endif
+                }
+            }
+        }).detach();
     }
 
     void run() {
-        spdlog::info("🚀 Starting C++ Code Assistance Backend on port {}", port_);
-        server_.listen("127.0.0.1", port_);
+        spdlog::info("🚀 REST Server (Ghost Text & Sync) listening on port {}", port_);
+        server_.listen("0.0.0.0", port_);
     }
 
 private:
@@ -53,539 +127,136 @@ private:
     httplib::Server server_;
     ThreadPool thread_pool_;
     std::mutex store_mutex;
-
-    std::shared_ptr<code_assistance::SubAgent> sub_agent_;
-    std::shared_ptr<code_assistance::AgentExecutor> executor_;
+    
     std::shared_ptr<code_assistance::KeyManager> key_manager_;
-
-    std::shared_ptr<code_assistance::CacheManager> cache_manager_;
+    std::shared_ptr<code_assistance::EmbeddingService> ai_service_;
+    std::shared_ptr<code_assistance::SubAgent> sub_agent_;
     std::shared_ptr<code_assistance::ToolRegistry> tool_registry_;
-    std::shared_ptr<code_assistance::EmbeddingService> embedding_service_;
+    std::shared_ptr<code_assistance::AgentExecutor> executor_;
     std::unordered_map<std::string, std::shared_ptr<code_assistance::FaissVectorStore>> project_stores_;
-    
     code_assistance::SystemMonitor system_monitor_;
+    std::unordered_map<std::string, std::string> project_context_cache_;
+    std::mutex cache_mutex_;
 
-    void initialize_agent_system() {
-        tool_registry_ = std::make_shared<code_assistance::ToolRegistry>();
-        sub_agent_ = std::make_shared<code_assistance::SubAgent>();
+    // --- HELPER METHODS (Must be inside class) ---
 
-        tool_registry_->register_tool(std::make_unique<code_assistance::FileSurgicalTool>());
+    std::shared_ptr<code_assistance::FaissVectorStore> load_vector_store(const std::string& project_id) {
+        std::lock_guard<std::mutex> lock(store_mutex);
+        if (project_stores_.count(project_id)) return project_stores_[project_id];
 
-        // Web searching tool
-        // tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
-        //     "web_search",
-        //     "Search the internet for documentation",
-        //     "{\"query\": \"string\"}",
-        //     [this](const std::string& args) { 
-        //         // 🚀 THE FIX: Use key_manager_ (the class member name)
-        //         return code_assistance::web_search(args, this->key_manager_->get_serper_key()); 
-        //     }
-        // ));
+        fs::path vector_path = fs::path("data") / project_id / "vector_store";
+        if (!fs::exists(vector_path)) return nullptr;
 
-        // Register Read File
-       tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
-            "read_file",
-            "Read code from a file.",
-            "{\"path\": \"string\"}",
-            [this](const std::string& args_json) -> std::string {
-                try {
-                    auto j = nlohmann::json::parse(args_json);
-                    std::string pid = j.value("project_id", "");
-                    nlohmann::json config = this->load_project_config(pid);
-                    
-                    std::filesystem::path root(config.value("local_path", ""));
-                    std::filesystem::path target = (root / j.value("path", "")).lexically_normal();
-
-                    // Re-use security check from above...
-                    
-                    std::ifstream f(target);
-                    if (!f.is_open()) return "ERROR: File not accessible.";
-                    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                } catch(...) { return "ERROR: Operation failed."; }
-            }
-        ));
-
-        tool_registry_->register_tool(std::make_unique<code_assistance::GenericTool>(
-            "list_dir",
-            "List files in the project workspace.",
-            "{\"path\": \"string\"}", // AI no longer needs to know about project_id
-            [this](const std::string& args_json) -> std::string {
-                try {
-                    auto j = nlohmann::json::parse(args_json);
-                    std::string pid = j.value("project_id", ""); // Injected by AgentExecutor
-                    std::string sub_path = j.value("path", ".");
-
-                    nlohmann::json config = this->load_project_config(pid);
-                    std::string root_str = config.value("local_path", "");
-                    
-                    if (root_str.empty()) return "ERROR: Workspace root not resolved for ID: " + pid;
-
-                    // 🚀 SECURITY: Prevent Directory Traversal
-                    std::filesystem::path root_path(root_str);
-                    std::filesystem::path target_path = (root_path / sub_path).lexically_normal();
-
-                    // Ensure target is still inside root
-                    auto rel = std::filesystem::relative(target_path, root_path);
-                    if (rel.empty() || rel.string().find("..") != std::string::npos) {
-                        return "ERROR: Security Violation. Path is outside workspace.";
-                    }
-
-                    std::string res = "Directory contents of " + sub_path + ":\n";
-                    for (auto& entry : std::filesystem::directory_iterator(target_path)) {
-                        auto status = entry.status();
-                        std::string type = entry.is_directory() ? "[DIR]" : "[FILE]";
-                        uintmax_t size = entry.is_regular_file() ? entry.file_size() : 0;
-                        
-                        // Output: [FILE] test01.py (0 bytes) | [FILE] test04.json (801 bytes)
-                        res += type + " " + entry.path().filename().string() + " (" + std::to_string(size) + " bytes)\n";
-                    }
-                    return res;
-                } catch (const std::exception& e) { return std::string("ERROR: ") + e.what(); }
-            }
-        ));
-
-        // Initialize the Pilot
-        executor_ = std::make_shared<code_assistance::AgentExecutor>(
-            nullptr, // Engine loaded per-request
-            embedding_service_,
-            sub_agent_,
-            tool_registry_
-        );
+        try {
+            auto store = std::make_shared<code_assistance::FaissVectorStore>(768);
+            store->load(vector_path.string());
+            project_stores_[project_id] = store;
+            return store;
+        } catch (...) { return nullptr; }
     }
-    
-    void setup_routes() {
-        server_.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-            res.set_header("Access-Control-Allow-Headers", "Content-Type, X-User-ID");
-            res.status = 204;
-        });
 
-        server_.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Access-Control-Allow-Origin", "*");
-            return httplib::Server::HandlerResponse::Unhandled;
-        });
+    json load_project_config(const std::string& project_id) {
+        fs::path default_path = fs::path("data") / project_id / "config.json";
+        if(!fs::exists(default_path)) return json({});
+        try { std::ifstream f(default_path); json c; f >> c; return c; } catch (...) { return json({}); }
+    }
 
-        server_.Get("/api/admin/telemetry", [this](const httplib::Request&, httplib::Response& res) {
-            auto metrics = system_monitor_.get_latest_snapshot();
-            auto logs = code_assistance::LogManager::instance().get_logs_json();
-            
-            json response = {
-                {"metrics", {
-                    {"cpu", metrics.cpu_usage},
-                    {"ram_mb", metrics.ram_usage_mb},
-                    {"ram_total", metrics.ram_total_mb},
-                    {"vector_latency", metrics.vector_latency_ms},
-                    {"embedding_latency", metrics.embedding_latency_ms},
-                    {"llm_latency", metrics.llm_generation_ms},
-                    {"tps", metrics.tokens_per_second},
-                    {"graph_scanned", metrics.graph_nodes_scanned}
-                }},
-                {"status", {
-                    {"brain_keys", key_manager_->get_active_key_count()},
-                    {"oculus_ready", !key_manager_->get_serper_key().empty()}
-                }},
-                {"logs", logs}
-            };
-            res.set_content(response.dump(), "application/json");
-        });
-
-        // This allows localhost:5002/index.html to work
-        server_.set_base_dir("./www"); 
-
-        // Handle the /admin shortcut
-        server_.Get("/admin", [](const httplib::Request&, httplib::Response& res) {
-            res.set_redirect("/index.html");
-        });
-
-        server_.Get("/api/admin/agent_trace", [this](const httplib::Request&, httplib::Response& res) {
-            auto traces = code_assistance::LogManager::instance().get_traces_json();
-            res.set_content(traces.dump(), "application/json");
-        });
-
-        server_.Get("/api/hello", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(R"({"message": "Hello from C++ Backend!"})", "application/json");
-        });
-
-        server_.Post("/sync/register/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
-            this->handle_register_project(req, res);
-        });
-
-        server_.Post("/sync/run/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
-            this->handle_sync_project(req, res);
-        });
-
-        server_.Post("/generate-code-suggestion", [this](const httplib::Request& req, httplib::Response& res) {
-            this->handle_generate_suggestion(req, res);
-        });
-
-        server_.Post("/retrieve-context-candidates", [this](const httplib::Request& req, httplib::Response& res) {
-            this->handle_retrieve_candidates(req, res);
-        });
+    void refresh_context_cache(const std::string& project_id, const fs::path& storage_path) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        std::stringstream ss;
         
-        server_.Post("/sync/reindex/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
-            this->handle_sync_project(req, res); 
-        });
+        // 1. Inject Topology (Tree)
+        fs::path tree_path = storage_path / "tree.txt";
+        if (fs::exists(tree_path)) { 
+            ss << "### PROJECT TOPOLOGY\n";
+            std::ifstream f(tree_path); 
+            ss << f.rdbuf() << "\n\n"; 
+        }
 
-        // GRAPH TOPOLOGY API
-        server_.Post("/get-dependency-subgraph", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                auto body = json::parse(req.body);
-                std::string project_id = body["project_id"];
-                std::string target_node_id = body["node_id"];
-
-                auto store = load_vector_store(project_id);
-                if (!store) throw std::runtime_error("Project not found");
-
-                auto root_node = store->get_node_by_name(target_node_id);
+        // 2. Inject Aggregated Source Code
+        fs::path full_path = storage_path / "_full_context.txt";
+        if (fs::exists(full_path)) {
+            std::ifstream f(full_path);
+            if (f.is_open()) {
+                ss << "### FULL PROJECT CONTEXT\n";
                 
-                json nodes = json::array();
-                json edges = json::array();
-                json raw_deps = json::array(); 
+                // 🚀 UNLIMITED READ: Reads the entire file buffer directly into the stream
+                // This will consume as much RAM as the file size requires.
+                ss << f.rdbuf(); 
                 
-                if (root_node) {
-                    nodes.push_back({{"id", root_node->id}, {"label", root_node->name}, {"type", "root"}});
-                    
-                    auto all_nodes = store->get_all_nodes();
-                    std::unordered_set<std::string> added_ids;
-                    added_ids.insert(root_node->id);
-
-                    for (const auto& dep_raw : root_node->dependencies) {
-                        raw_deps.push_back(dep_raw);
-                        
-                        // Fuzzy Resolve
-                        std::string resolved_id = "";
-                        std::string clean_dep = dep_raw;
-                        
-                        size_t last_slash = clean_dep.find_last_of('/');
-                        if (last_slash != std::string::npos) clean_dep = clean_dep.substr(last_slash + 1);
-                        
-                        // size_t last_dot = clean_dep.find_last_of('.');
-                        // if (last_dot != std::string::npos && last_dot > 0) clean_dep = clean_dep.substr(0, last_dot);
-
-                        // O(N) scan - fine for graph view (N is small)
-                        for (const auto& candidate : all_nodes) {
-                            fs::path cand_p(candidate->file_path);
-                            std::string cand_stem = cand_p.stem().string(); 
-                            if (cand_stem == clean_dep) {
-                                resolved_id = candidate->id;
-                                break;
-                            }
-                        }
-
-                        if (!resolved_id.empty() && !added_ids.count(resolved_id)) {
-                            nodes.push_back({{"id", resolved_id}, {"label", clean_dep}, {"type", "dependency"}});
-                            edges.push_back({{"source", root_node->id}, {"target", resolved_id}});
-                            added_ids.insert(resolved_id);
-                        }
-                    }
-                }
-
-                res.set_content(json{
-                    {"nodes", nodes}, 
-                    {"edges", edges},
-                    {"raw_dependencies", raw_deps} 
-                }.dump(), "application/json");
-
-            } catch (const std::exception& e) {
-                res.status = 500; 
-                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+                ss << "\n";
             }
-        });
+        }
+        
+        project_context_cache_[project_id] = ss.str();
+        spdlog::info("🧠 RAM Cache Hot-Loaded for '{}'. Size: {:.2f} MB", 
+                     project_id, project_context_cache_[project_id].size() / 1024.0 / 1024.0);
 
-        server_.Post("/sync/file/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                auto project_id = req.path_params.at("project_id");
-                auto body = json::parse(req.body);
-                std::string relative_path = body.value("file_path", "");
-
-                if (relative_path.empty()) throw std::runtime_error("Missing file_path");
-
-                spdlog::info("🎯 Real-time Sync Triggered: {}/{}", project_id, relative_path);
-
-                // Capture 'this' and variables needed for the background task
-                thread_pool_.enqueue([this, project_id, relative_path]() {
-                    try {
-                        code_assistance::SyncService sync_service(embedding_service_);
-                        json config = load_project_config(project_id);
-                        
-                        // 🚀 THE FIX: Convert paths to strings for the SyncService API
-                        std::string storage_path = config.value("storage_path", "");
-                        if (storage_path.empty()) {
-                            storage_path = (fs::path("data") / project_id).string();
-                        }
-                        
-                        std::string local_root = config.value("local_path", "");
-
-                        // Perform Incremental Sync
-                        auto nodes = sync_service.sync_single_file(project_id, local_root, storage_path, relative_path);
-                        
-                        // Update the Vector Store in memory
-                        if (project_stores_.count(project_id)) {
-                            project_stores_[project_id]->add_nodes(nodes);
-                            
-                            // 🚀 THE FIX: Argument 1 conversion from path to string
-                            fs::path store_dir = fs::path(storage_path) / "vector_store";
-                            project_stores_[project_id]->save(store_dir.string()); 
-                        }
-                        
-                        spdlog::info("✅ File Sync Complete: {}", relative_path);
-                    } catch (const std::exception& e) {
-                        spdlog::error("❌ File Sync Failed for {}: {}", relative_path, e.what());
-                    }
-                });
-
-                res.set_content(json{{"success", true}}.dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 500;
-                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
-            }
-        });
-
-        server_.Post("/complete", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                auto body = json::parse(req.body);
-                std::string prefix = body["prefix"];
-                
-                // 🚀 PROMPT ENGINEERING: Demand only the continuation
-                std::string prompt = 
-                    "CONTEXT: " + prefix + "\n"
-                    "TASK: Complete the code from the cursor position.\n"
-                    "RULES:\n"
-                    "1. Return ONLY the code needed to finish the block.\n"
-                    "2. DO NOT repeat the prefix.\n"
-                    "3. NO MARKDOWN (no ```).\n"
-                    "4. NO EXPLANATIONS.";
-
-                std::string completion = embedding_service_->generate_text(prompt);
-
-                // 🚀 SURGICAL SCRUB: Force-remove backticks if Gemini ignores instructions
-                size_t first = completion.find_first_not_of(" \n\r\t`");
-                size_t last = completion.find_last_not_of(" \n\r\t` \n");
-                if (first != std::string::npos && last != std::string::npos) {
-                    completion = completion.substr(first, (last - first + 1));
-                }
-
-                spdlog::info("✅ Ghost Payload Ready: {}", completion);
-                res.set_content(json{{"completion", completion}}.dump(), "application/json");
-            } catch (...) { res.status = 500; }
-        });
-
-        server_.Post("/admin/refresh-keys", [this](const httplib::Request&, httplib::Response& res) {
-            spdlog::info("🔄 Manual Key Pool Refresh Initiated...");
-            key_manager_->refresh_key_pool();
-            res.set_content(R"({"status": "synchronized"})", "application/json");
-        });
-
-        server_.Post("/api/admin/publish_trace", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                code_assistance::AgentTrace trace;
-                trace.session_id = j.value("session_id", "AGENT");
-                trace.state = j.value("state", "LOG");
-                trace.detail = j.value("detail", "");
-                trace.duration_ms = j.value("duration", 0.0);
-                
-                code_assistance::LogManager::instance().add_trace(trace);
-                res.set_content(R"({"status":"ok"})", "application/json");
-            } catch (...) { res.status = 400; }
-        });
-
-        server_.Post("/api/admin/stress_test", [this](const httplib::Request&, httplib::Response& res) {
-            spdlog::warn("🚨 STRESS TEST INITIATED - Saturation of ThreadPool...");
-            
-            int successful_spawns = 0;
-            for(int i=0; i<10; ++i) {
-                thread_pool_.enqueue([this, i]() {
-                    // Simulate a heavy retrieval + AI thought process
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500 + (i * 100)));
-                    spdlog::info("Stress Worker #{} check-in.", i);
-                });
-                successful_spawns++;
-            }
-
-            res.set_content(nlohmann::json({
-                {"passed", successful_spawns},
-                {"jitter_ms", 12.4},
-                {"status", "NOMINAL"}
-            }).dump(), "application/json");
-        });
-
-        server_.Post("/api/admin/publish_log", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                auto j = nlohmann::json::parse(req.body);
-                code_assistance::InteractionLog log;
-                log.timestamp = j.value("timestamp", 0LL);
-                log.project_id = j.value("project_id", "unknown");
-                log.user_query = j.value("user_query", "");
-                log.ai_response = j.value("ai_response", "");
-                log.duration_ms = j.value("duration_ms", 0.0);
-                log.prompt_tokens = j.value("prompt_tokens", 0);
-                log.completion_tokens = j.value("completion_tokens", 0);
-                log.total_tokens = j.value("total_tokens", 0);
-
-                // 🚀 THE FIX: Add to the Dashboard's singleton memory
-                code_assistance::LogManager::instance().add_log(log);
-                
-                res.set_content(R"({"status":"log_synchronized"})", "application/json");
-            } catch (...) { res.status = 400; }
-        });
+        double size_mb = project_context_cache_[project_id].size() / (1024.0 * 1024.0);
+        code_assistance::SystemMonitor::global_cache_size_mb.store(size_mb);
     }
 
-    std::vector<std::string> get_json_list(const json& body, const std::string& key1, const std::string& key2) {
-        if (body.contains(key1) && !body[key1].is_null()) return body[key1].get<std::vector<std::string>>();
-        if (body.contains(key2) && !body[key2].is_null()) return body[key2].get<std::vector<std::string>>();
-        return {};
-    }
+    // --- ROUTE HANDLERS (Moved INSIDE class) ---
 
     void handle_register_project(const httplib::Request& req, httplib::Response& res) {
         try {
             auto project_id = req.path_params.at("project_id");
             auto body = json::parse(req.body);
-            std::string local_path = body.value("local_path", "");
-            if (local_path.empty()) local_path = body.value("localPath", "");
-            auto extensions = get_json_list(body, "allowed_extensions", "allowedExtensions");
-            auto ignored = get_json_list(body, "ignored_paths", "ignoredPaths");
-            auto included = get_json_list(body, "included_paths", "includedPaths");
-            
-            // Handle Custom Storage Path
-            std::string storage_path = body.value("storage_path", "");
-            
-            spdlog::info("📝 Registering project: {} (Storage: {})", project_id, storage_path.empty() ? "Default" : storage_path);
-
-            json config = {
-                {"local_path", local_path},
-                {"storage_path", storage_path}, // SAVE THIS
-                {"allowed_extensions", extensions},
-                {"ignored_paths", ignored},
-                {"included_paths", included},
-                {"is_active", true},
-                {"status", "idle"}
-            };
-            
-            // Always save to default location as the "Master Record"
-            fs::path default_config_path = fs::path("data") / project_id / "config.json";
-            fs::create_directories(default_config_path.parent_path());
-            std::ofstream file(default_config_path);
-            file << config.dump(2);
-            
-            // Also save to custom location if requested (for SyncService to find)
-            if (!storage_path.empty()) {
-                fs::path custom_config_path = fs::path(storage_path) / "config.json";
-                fs::create_directories(custom_config_path.parent_path());
-                std::ofstream custom_file(custom_config_path);
-                custom_file << config.dump(2);
-            }
-
-            res.set_content(json{{"success", true}, {"project_id", project_id}}.dump(), "application/json");
-        } catch (const std::exception& e) {
-            spdlog::error("❌ Registration error: {}", e.what());
-            res.status = 500;
-            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
-        }
+            fs::path path = fs::path("data") / project_id / "config.json";
+            fs::create_directories(path.parent_path());
+            std::ofstream f(path); f << body.dump(2);
+            res.set_content(json{{"success", true}}.dump(), "application/json");
+        } catch(...) { res.status = 500; }
     }
 
     void handle_sync_project(const httplib::Request& req, httplib::Response& res) {
         try {
             auto project_id = req.path_params.at("project_id");
-            spdlog::info("🔄 Starting sync for project: {}", project_id);
-
-            // Load Config (Smart Load)
             json config = load_project_config(project_id);
+            std::string store_path = config.value("storage_path", "");
+            if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
             
-            // Determine Storage Path
-            std::string storage_path;
-            // 1. Try payload override
-            auto body = json::parse(req.body); 
-            storage_path = body.value("storage_path", "");
-            
-            // 2. Try config saved value
-            if (storage_path.empty()) storage_path = config.value("storage_path", "");
-            
-            // 3. Default
-            if (storage_path.empty()) storage_path = (fs::path("data") / project_id).string();
+            thread_pool_.enqueue([this, project_id, store_path]() {
+                auto t_start = std::chrono::high_resolution_clock::now();
 
-            thread_pool_.enqueue([this, project_id, config, storage_path]() { 
-                try {
-                    code_assistance::SyncService sync_service(embedding_service_);
-
-                    auto result = sync_service.perform_sync(
-                        project_id,
-                        config.value("local_path", ""),
-                        storage_path,  
-                        config.value("allowed_extensions", std::vector<std::string>{}),
-                        config.value("ignored_paths", std::vector<std::string>{}),
-                        config.value("included_paths", std::vector<std::string>{})
-                    );
-                    
-                    if (!result.nodes.empty()) {
-                        auto vector_store = std::make_shared<code_assistance::FaissVectorStore>(768);
-                        vector_store->add_nodes(result.nodes);
-                        
-                        fs::path store_path = fs::path(storage_path) / "vector_store"; 
-                        fs::create_directories(store_path);
-                        vector_store->save(store_path.string());
-                        
-                        // Update In-Memory Map
-                        // Note: In production, use a mutex here
-                        project_stores_[project_id] = vector_store;
-                    }
-                    
-                    spdlog::info("✅ Sync complete: {} files updated, {} nodes indexed", 
-                                    result.updated_count, result.nodes.size());
-                } catch (const std::exception& e) {
-                    spdlog::error("❌ Background Sync Failed for {}: {}", project_id, e.what());
+                // A. Run Sync
+                json config = load_project_config(project_id);
+                code_assistance::SyncService sync(ai_service_);
+                
+                // Perform Sync
+                auto sync_res = sync.perform_sync(project_id, config.value("local_path",""), store_path, {}, {}, {});
+                
+                // B. 🚀 UNIFIED INGESTION: Feed results to AgentExecutor's Graph
+                if (!sync_res.nodes.empty()) {
+                    executor_->ingest_sync_results(project_id, sync_res.nodes);
                 }
+
+                // C. Hot-Load RAM Context (Optional now, as Graph handles retrieval)
+                this->refresh_context_cache(project_id, store_path);
+
+                auto t_end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                code_assistance::SystemMonitor::global_sync_latency_ms.store(ms);
+                spdlog::info("⏱️ Sync Complete in {:.2f} ms", ms);
             });
 
             res.set_content(json{{"success", true}}.dump(), "application/json");
-            
-        } catch (const std::exception& e) {
-            spdlog::error("❌ Sync request error: {}", e.what());
-            res.status = 500;
-            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
-        }
-    }
-
-    std::string clean_internal_path(std::string path) {
-        // 1. Convert backslashes to forward slashes for consistency
-        std::replace(path.begin(), path.end(), '\\', '/');
-
-        // 2. Locate the "converted_files/" marker
-        std::string marker = "converted_files/";
-        size_t pos = path.find(marker);
-        
-        if (pos != std::string::npos) {
-            // Strip everything up to and including "converted_files/"
-            std::string cleaned = path.substr(pos + marker.length());
-            
-            // 3. Remove the trailing ".txt" added by the converter
-            if (cleaned.length() > 4 && cleaned.substr(cleaned.length() - 4) == ".txt") {
-                cleaned = cleaned.substr(0, cleaned.length() - 4);
-            }
-            return cleaned;
-        }
-        
-        // 4. Fallback: If it's just in the hidden folder but not converted_files
-        if (path.find(".study_assistant/") != std::string::npos) {
-            size_t last_slash = path.find_last_of('/');
-            return path.substr(last_slash + 1);
-        }
-
-        return path;
+        } catch(...) { res.status = 500; }
     }
 
     void handle_generate_suggestion(const httplib::Request& req, httplib::Response& res) {
         try {
-            auto body = nlohmann::json::parse(req.body);
-            
-            // 🚀 This call now matches the header we just fixed
-            std::string result = executor_->run_autonomous_loop_internal(body); 
-
-            res.set_content(nlohmann::json{{"suggestion", result}}.dump(), "application/json");
-        } catch (const std::exception& e) {
+            auto body = json::parse(req.body);
+            std::string result = executor_->run_autonomous_loop_internal(body);
+            res.set_content(json{{"suggestion", result}}.dump(), "application/json");
+        } catch(const std::exception& e) { 
+            spdlog::error("🔥 REST HANDLER ERROR: {}", e.what()); // 🚀 Log the error
+            res.status = 500; 
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json"); // Return JSON error
+        } catch(...) {
+            spdlog::error("🔥 REST HANDLER CRASH: Unknown Exception"); 
             res.status = 500;
-            res.set_content(nlohmann::json{{"error", e.what()}}.dump(), "application/json");
+            res.set_content(json{{"error", "Unknown server exception"}}.dump(), "application/json");
         }
     }
 
@@ -595,121 +266,229 @@ private:
             std::string project_id = body["project_id"];
             std::string prompt = body["prompt"];
             auto store = load_vector_store(project_id);
-             if (!store) throw std::runtime_error("Project not indexed. Please sync first.");
-            auto query_emb = embedding_service_->generate_embedding(prompt);
+            if (!store) { res.status = 404; return; }
+            
+            auto query_emb = ai_service_->generate_embedding(prompt);
             code_assistance::RetrievalEngine engine(store);
-            auto results = engine.retrieve(prompt, query_emb, 80, true);
+            auto results = engine.retrieve(prompt, query_emb, 10, true);
+            
             json candidates = json::array();
             for (const auto& r : results) {
-                candidates.push_back({
-                    {"id", r.node->id},
-                    {"name", r.node->name},
-                    {"file_path", r.node->file_path},
-                    {"type", r.node->type},
-                    {"score", r.final_score},
-                    {"ai_summary", r.node->ai_summary}
-                });
+                candidates.push_back({{"file_path", r.node->file_path}, {"content", r.node->content}});
             }
             res.set_content(json{{"candidates", candidates}}.dump(), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 500;
-            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
-        }
+        } catch(...) { res.status = 500; }
     }
 
-    // --- SMART CONFIG LOADING ---
-    json load_project_config(const std::string& project_id) {
-        fs::path default_path = fs::path("data") / project_id / "config.json";
-        if(!fs::exists(default_path)) return json({});
+    void setup_routes() {
+        // --- CORS HEADERS ---
+        server_.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+        server_.Options("/(.*)", [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
+
+        // 1. GHOST TEXT (Inline Logic)
+        server_.Post("/complete", [this](const httplib::Request& req, httplib::Response& res) {
+            auto start = std::chrono::high_resolution_clock::now();
+            try {
+                auto body = json::parse(req.body);
+                std::string prefix = body.value("prefix", "");
+                std::string suffix = body.value("suffix", "");
+                std::string project_id = body.value("project_id", "");
+                std::string current_file = body.value("file_path", "");
+
+                if (prefix.empty()) { res.status = 400; return; }
+
+                // 1. Fetch from RAM (No Disk I/O)
+                std::string long_context = "";
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    if (project_context_cache_.count(project_id)) {
+                        long_context = project_context_cache_[project_id];
+                    }
+                }
+
+                // 2. Generate
+                std::string completion = this->ai_service_->generate_autocomplete(prefix, suffix, long_context, current_file);
+
+                auto end = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                code_assistance::SystemMonitor::global_llm_generation_ms.store(ms);
+                
+                // 3. LOGGING (Crucial for Dashboard)
+                if (!completion.empty()) {
+                    code_assistance::InteractionLog log;
+                    log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                    log.project_id = project_id;
+                    log.request_type = "GHOST";
+                    
+                    // User Query Preview
+                    std::string pre_short = prefix.length() > 50 ? prefix.substr(prefix.length() - 50) : prefix;
+                    std::string suf_short = suffix.length() > 50 ? suffix.substr(0, 50) : suffix;
+                    log.user_query = pre_short + " [CURSOR] " + suf_short;
+                    
+                    // Full Context for Inspector
+                    log.full_prompt = "### SYSTEM CONTEXT SIZE: " + std::to_string(long_context.size()) + " chars\n" +
+                                      "### ACTIVE FILE: " + current_file + "\n\n" + 
+                                      prefix + "[CURSOR]" + suffix; 
+                    
+                    log.ai_response = completion;
+                    log.duration_ms = ms;
+                    
+                    // Save to Singleton
+                    code_assistance::LogManager::instance().add_log(log);
+                }
+
+                res.set_content(json{{"completion", completion}}.dump(), "application/json");
+            } catch (...) { res.status = 500; }
+        });
+
+        // 2. Standard Handlers
+        server_.Post("/sync/register/:project_id", [this](const httplib::Request& req, httplib::Response& res) { this->handle_register_project(req, res); });
+        server_.Post("/generate-code-suggestion", [this](const httplib::Request& req, httplib::Response& res) { this->handle_generate_suggestion(req, res); });
+        server_.Post("/retrieve-context-candidates", [this](const httplib::Request& req, httplib::Response& res) { this->handle_retrieve_candidates(req, res); });
+
+        // 3. SYNC RUN (Fixed Logic)
+        server_.Post("/sync/run/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
+            try {
+                auto project_id = req.path_params.at("project_id");
+                json body = json::parse(req.body);
+                std::string store_path = body.value("storage_path", "");
+                if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
+                
+                thread_pool_.enqueue([this, project_id, store_path]() {
+                    auto t_start = std::chrono::high_resolution_clock::now();
+
+                    // A. Load Config
+                    json config = load_project_config(project_id);
+                    
+                    // 🚀 EXTRACT LISTS (FIXED PART)
+                    std::vector<std::string> ext = config.value("allowed_extensions", std::vector<std::string>{});
+                    std::vector<std::string> ign = config.value("ignored_paths", std::vector<std::string>{});
+                    std::vector<std::string> inc = config.value("included_paths", std::vector<std::string>{});
+
+                    // Ensure defaults if empty (Backend Safety)
+                    if (ext.empty()) ext = {"java", "json", "py", "cpp", "h", "ts", "js", "txt", "md"};
+                    
+                    code_assistance::SyncService sync(ai_service_);
+                    
+                    // Pass the extracted lists to the sync engine
+                    auto sync_res = sync.perform_sync(
+                        project_id, 
+                        config.value("local_path", ""), 
+                        store_path, 
+                        ext, 
+                        ign, 
+                        inc
+                    );
+                    
+                    // B. Unified Ingestion
+                    if (!sync_res.nodes.empty()) {
+                        executor_->ingest_sync_results(project_id, sync_res.nodes);
+                    }
+
+                    // C. Hot-Load RAM Context
+                    this->refresh_context_cache(project_id, store_path);
+
+                    auto t_end = std::chrono::high_resolution_clock::now();
+                    double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+                    code_assistance::SystemMonitor::global_sync_latency_ms.store(ms);
+                    spdlog::info("⏱️ Sync Complete in {:.2f} ms", ms);
+                });
+
+                res.set_content(json{{"success", true}}.dump(), "application/json");
+            } catch(...) { res.status = 500; }
+        });
         
-        try {
-            std::ifstream file(default_path);
-            json config; file >> config;
-            return config;
-        } catch (...) { return json({}); }
-    }
+        // 4. File Specific Sync
+        server_.Post("/sync/file/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
+            try {
+                std::string project_id = req.path_params.at("project_id");
+                auto body = json::parse(req.body);
+                std::string rel_path = body.value("file_path", "");
+                
+                if (rel_path.find(".study_assistant") == std::string::npos) {
+                    fs::path default_store = fs::path("data") / project_id;
+                    thread_pool_.enqueue([this, project_id, default_store]() {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Debounce
+                        this->refresh_context_cache(project_id, default_store);
+                    });
+                }
+                res.set_content(json{{"status", "queued"}}.dump(), "application/json");
+            } catch (...) { res.status = 400; }
+        });
 
-    // --- SMART INDEX LOADING ---
-    std::shared_ptr<code_assistance::FaissVectorStore> load_vector_store(const std::string& project_id) {
-        // 🚀 STEP 1: Lock immediately to prevent race conditions on the map
-        std::lock_guard<std::mutex> lock(store_mutex);
-
-        // 🚀 STEP 2: Check Memory Cache (Atomic lookup)
-        if (project_stores_.count(project_id)) {
-            return project_stores_[project_id];
-        }
-
-        // 🚀 STEP 3: Determine Path logic
-        json config = load_project_config(project_id);
-        std::string storage_path = config.value("storage_path", "");
-        
-        fs::path store_root;
-        if (!storage_path.empty()) {
-            store_root = fs::path(storage_path);
-        } else {
-            store_root = fs::path("data") / project_id;
-        }
-        
-        fs::path vector_path = store_root / "vector_store";
-
-        if (!fs::exists(vector_path)) {
-            spdlog::warn("⚠️ Index not found at {}", vector_path.string());
-            return nullptr;
-        }
-
-        // 🚀 STEP 4: Physical Disk Load
-        try {
-            spdlog::info("📂 Loading FAISS index into memory for project: {}", project_id);
-            auto store = std::make_shared<code_assistance::FaissVectorStore>(768);
-            store->load(vector_path.string());
+        // 5. TELEMETRY (FIXED: Send ALL data needed by JS)
+        server_.Get("/api/admin/telemetry", [this](const httplib::Request&, httplib::Response& res) {
+            auto m = system_monitor_.get_latest_snapshot();
+            auto logs = code_assistance::LogManager::instance().get_logs_json();
+            auto traces = code_assistance::LogManager::instance().get_traces_json(); 
             
-            // Cache it for the next request
-            project_stores_[project_id] = store;
-            return store;
-        } catch (const std::exception& e) {
-            spdlog::error("❌ Failed to load vector store: {}", e.what());
-            return nullptr;
-        }
+            json payload;
+            payload["metrics"] = {
+                {"cpu", m.cpu_usage},
+                {"ram_mb", m.ram_usage_mb},
+                {"last_sync_duration_ms", m.last_sync_duration_ms}, 
+                {"cache_size_mb", m.cache_size_mb},
+                {"llm_latency", m.llm_generation_ms},
+                {"tps", m.tokens_per_second},
+                {"vector_latency", m.vector_latency_ms}
+            };
+            payload["logs"] = logs;
+            payload["agent_traces"] = traces;
+
+            res.set_content(payload.dump(), "application/json");
+        });
+
+        // 6. 🚀 GRAPH DATA ENDPOINT
+        server_.Get("/api/admin/graph/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
+            std::string project_id = req.path_params.at("project_id");
+            
+            // Sanitize ID (same logic as AgentExecutor)
+            std::string safe_id = project_id;
+            std::replace(safe_id.begin(), safe_id.end(), ':', '_');
+            std::replace(safe_id.begin(), safe_id.end(), '/', '_');
+            std::replace(safe_id.begin(), safe_id.end(), '\\', '_');
+            
+            fs::path graph_path = fs::path("data/graphs") / safe_id / "graph.json";
+            
+            if (fs::exists(graph_path)) {
+                std::ifstream f(graph_path);
+                std::stringstream buffer;
+                buffer << f.rdbuf();
+                res.set_content(buffer.str(), "application/json");
+            } else {
+                res.set_content("[]", "application/json"); // Return empty graph if new
+            }
+        });
+        
+        server_.Get("/api/hello", [](const httplib::Request&, httplib::Response& res) { res.set_content(R"({"status": "nominal"})", "application/json"); });
+        server_.set_mount_point("/", "./www");
+        server_.Get("/admin", [](const httplib::Request&, httplib::Response& res) { res.set_redirect("/index.html"); });
     }
 };
 
 void pre_flight_check() {
-    namespace fs = std::filesystem;
-    
-    // 🚀 THE FIX: Check for the new folder structure
-    // We check for 'www/index.html' instead of 'dashboard.html'
-    std::vector<std::string> required_assets = {
-        "www/index.html", 
-        "www/style.css", 
-        "www/main.js", 
-        "keys.json"
-    };
-    
-    bool integrity_pass = true;
-    for (const auto& asset : required_assets) {
-        if (!fs::exists(asset)) {
-            spdlog::critical("🚨 PRE-FLIGHT FAILURE: Missing asset: {}", asset);
-            integrity_pass = false;
-        }
-    }
-    
-    if (!integrity_pass) {
-        spdlog::info("💡 Technical Note: Assets must be in: {}", fs::current_path().string());
-        spdlog::info("💡 Ensure 'www' folder and 'keys.json' are next to the .exe");
-        std::exit(EXIT_FAILURE); 
-    }
-    
-    spdlog::info("🚀 All systems nominal. UI Assets verified.");
+    if (!fs::exists("keys.json")) spdlog::warn("⚠️ keys.json not found!");
 }
 
-int main(int argc, char* argv[]) {
-    
-    pre_flight_check();
-
+int main() {
     spdlog::set_pattern("[%H:%M:%S] [%^%l%$] %v");
-    spdlog::set_level(spdlog::level::info);
     
-    CodeAssistanceServer server(5002);
-    server.run();
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    pre_flight_check();
+    CodeAssistanceServer app;
+    
+    // We can't easily extract the server object from the wrapper class without modifying it
+    // But ensuring ThreadPool destructors run (via app going out of scope) is usually enough 
+    // if the server.listen() loop breaks.
+    
+    app.run(); // This blocks
+    
     return 0;
 }

@@ -1,4 +1,5 @@
 # backend/browser_bridge.py
+
 import os
 import time
 import threading
@@ -33,37 +34,52 @@ class AIStudioBridge:
                     headless=False,
                     
                     # --- RAM & CPU OPTIMIZATIONS ---
-                    viewport={'width': 1100, 'height': 800},
+                    viewport={'width': 1100, 'height': 500},
                     ignore_default_args=["--enable-automation"],
                     args=[
-                        "--start-maximized", 
                         "--disable-blink-features=AutomationControlled",
                         "--disable-gpu",
+                        "--disable-software-rasterizer",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--disable-sync",
+                        "--disable-default-apps",
+                        "--disable-translate",
+                        "--disable-notifications",
                         "--disable-dev-shm-usage",
                         "--no-sandbox",
-                        "--js-flags='--max-old-space-size=512'"
+                        "--mute-audio",
+                        "--js-flags='--max-old-space-size=256'",  # Reduced memory
+                        "--disable-features=IsolateOrigins,site-per-process"  # Reduces memory
                     ]
                 )
 
                 context.grant_permissions(["clipboard-read", "clipboard-write"], origin="https://aistudio.google.com")
                 
                 page = context.pages[0]
-                def block_aggressively(route):
+
+                # --- OPTIMIZATION: Block heavy assets ---
+                def block_heavy_resources(route):
                     if route.request.resource_type in ["image", "font", "media"]:
                         route.abort()
                     else:
                         route.continue_()
-                page.route("**/*", block_aggressively)
+                
+                page.route("**/*", block_heavy_resources)
 
-                # --- OPTIMIZATION: Network Interception ---
-                def handle_response(response):
-                    if "generateContent" in response.url and response.status == 200:
-                        try:
-                            # We don't parse the whole stream here (it's complex chunks),
-                            # but we use this as a signal that the backend is active.
-                            pass 
-                        except: pass
-                page.on("response", handle_response)
+                # Disable all CSS animations and transitions for speed
+                page.add_init_script("""
+                    const style = document.createElement('style');
+                    style.innerHTML = `
+                        *, *::before, *::after {
+                            transition: none !important;
+                            animation: none !important;
+                        }
+                    `;
+                    document.head.appendChild(style);
+                """)
+                
+                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
                 
                 print("✅ [Thread] Browser Ready.")
 
@@ -75,8 +91,10 @@ class AIStudioBridge:
                     try:
                         if cmd_type == "prompt":
                             # Normal prompt, allow navigation/reset if needed
-                            msg, use_clip = data
-                            response = self._internal_send_prompt(page, msg, use_clipboard=use_clip, skip_nav=False)
+                            # CHANGED: use_clip -> return_markdown
+                            msg, return_markdown = data 
+                            # CHANGED: use_clipboard -> return_markdown
+                            response = self._internal_send_prompt(page, msg, return_markdown=return_markdown, skip_nav=False) 
                             result_queue.put(response)
                         
                         elif cmd_type == "upload_extract":
@@ -86,12 +104,12 @@ class AIStudioBridge:
                             result_queue.put(response)
 
                         elif cmd_type == "reset":
-                            page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle")
+                            page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded")
                             result_queue.put(True)
 
                         elif cmd_type == "get_state":
                             if "aistudio.google.com/app" not in page.url:
-                                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle")
+                                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded")
                             
                             # Get the list and the active one
                             models = self._internal_get_models(page)
@@ -121,11 +139,11 @@ class AIStudioBridge:
         try:
             # We want to start fresh so we don't attach to an old conversation
             if "aistudio.google.com" not in page.url:
-                 page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+                 page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
             else:
                  # Check if the "New chat" button is visible and click it, otherwise reload
                  # This is safer than just reloading if the URL is generic
-                 page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle")
+                 page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded")
         except:
             pass
 
@@ -140,6 +158,7 @@ class AIStudioBridge:
             add_btn = page.locator("[data-test-id='add-media-button']")
             add_btn.wait_for(state="visible", timeout=20000)
             add_btn.click()
+            # REPLACED: time.sleep(0.5) with implicit wait via expect_file_chooser
             
             # Handle File Chooser
             upload_option = page.locator("button.mat-mdc-menu-item").filter(has_text="Upload a file")
@@ -162,109 +181,122 @@ class AIStudioBridge:
             except:
                 print("   [Thread] Warning: Filename chip not detected within timeout. Proceeding anyway...")
 
+            # 4. Wait for processing bar (Tokenizing)
+            # REPLACED: time.sleep(1) with immediate check/wait
             try:
-                if page.locator("mat-progress-bar").is_visible():
+                progress_bar = page.locator("mat-progress-bar")
+                if progress_bar.is_visible():
                     print("   [Thread] Processing bar detected. Waiting...")
-                    page.locator("mat-progress-bar").wait_for(state="hidden", timeout=120000)
+                    progress_bar.wait_for(state="hidden", timeout=120000)
             except:
                 pass
 
             print("   [Thread] File attached. Sending prompt...")
             
             # 5. Send Prompt with SKIP NAV enabled so we don't refresh the page
-            return self._internal_send_prompt(page, prompt, use_clipboard=False, skip_nav=True)
+            # Set return_markdown=False as extraction usually requires raw text
+            return self._internal_send_prompt(page, prompt, return_markdown=False, skip_nav=True)
 
         except Exception as e:
             page.keyboard.press("Escape")
             return f"Upload/Extract Failed: {str(e)}"
     
-    def _internal_get_markdown(self, page):
-        """Clicks 'Copy as Markdown' on the last response and returns clipboard content."""
-        print("   [Thread] Copying answer as Markdown...")
+    # REMOVED: _internal_get_markdown (was duplicate/old)
+
+    def _internal_send_prompt(self, page, message, return_markdown=False, skip_nav=False):
+        """Optimized prompt sending with faster detection."""
         try:
-            # 1. Find the options button for the LAST turn
-            # Targeting ms-chat-turn-options
-            options_buttons = page.locator("ms-chat-turn-options button[aria-label='Open options']").all()
-            if not options_buttons:
-                return "Error: No chat options button found. Ensure chat has started."
-            
-            last_option_btn = options_buttons[-1]
-            last_option_btn.scroll_into_view_if_needed()
-            last_option_btn.click()
-            
-            # 2. Wait for the menu item 'Copy as markdown'
-            # Using text filter is safer than nth-child index which can change
-            copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as markdown")
-            
-            if not copy_btn.is_visible():
-                # Fallback: sometimes it's just 'Copy'
-                print("   [Thread] 'Copy as markdown' not found, checking raw Copy...")
-                copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy").first
-            
-            if not copy_btn.is_visible():
-                page.keyboard.press("Escape")
-                return "Error: Copy option not found in menu."
+            # Only navigate if absolutely necessary
+            # if not skip_nav:
+            #     print("   [Thread] 🔄 Forcing New Chat for fresh context...", flush=True)
+            #     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
-            # 3. Click Copy
-            copy_btn.click()
-            time.sleep(0.5) # Wait for clipboard write
-            
-            # 4. Read from clipboard
-            # This requires 'clipboard-read' permission set in launch_persistent_context
-            markdown_content = page.evaluate("navigator.clipboard.readText()")
-            
-            print(f"   [Thread] Markdown copied ({len(markdown_content)} chars).")
-            return markdown_content
-
-        except Exception as e:
-            # Attempt to close menu if open
-            page.keyboard.press("Escape")
-            return f"Error getting markdown: {str(e)}"
-
-    def _internal_send_prompt(self, page, message, use_clipboard=False, skip_nav=False):
-        """Logic executed strictly inside the worker thread."""
-        try:
-            # Navigation logic depends on whether we are continuing a flow (file upload) or starting new
-            if not skip_nav:
-                if "aistudio.google.com" not in page.url:
-                     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
-
-            # Ensure prompt box is ready
-            prompt_box = page.locator('textarea, [placeholder*="Start typing"]')
+            # Wait for prompt box with shorter timeout
+            prompt_box = page.get_by_placeholder("Start typing a prompt")
             prompt_box.wait_for(state="visible", timeout=15000)
 
-            # Using fill() is faster than type() and bypasses most event delays
-            prompt_box.fill(message)
+            # Inject text directly (no sleep needed)
+            page.evaluate("""
+                (text) => {
+                    const el = document.querySelector('textarea, [placeholder*="Start typing"]');
+                    if (el) {
+                        el.value = text;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }
+            """, message)
 
-            # 2. Trigger Run
-            run_btn = page.locator('ms-run-button button[aria-label="Run"]')
+            # Click Run button immediately (remove the 1s sleep)
+            run_btn = page.locator('ms-run-button button').filter(has_text="Run")
+            run_btn.wait_for(state="visible", timeout=5000)
             run_btn.click()
 
-            print("   [Thread] AI Processing...", end="", flush=True)
+            print("   [Thread] Waiting for AI response...", flush=True)
+
+            # Wait for first response chunk
+            page.locator('ms-text-chunk').first.wait_for(state="visible", timeout=120000)
             
-            try:
-                # First, wait for the stop button to appear (generation started)
-                stop_btn = page.locator('ms-run-button button:has-text("Stop")')
-                stop_btn.wait_for(state="visible", timeout=5000)
+            run_btn_ready = page.locator("ms-run-button button").filter(has_text="Run")
+            last_text_len = -1
+            stability_counter = 0
+            max_stability_checks = 60 # Check for 30 seconds max (0.5s * 60)
+            
+            for i in range(max_stability_checks):
+                # 1. Force scroll down to trigger lazy loading of bottom text
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 
-                # Now, wait for the stop button to DISAPPEAR (generation finished)
-                stop_btn.wait_for(state="hidden", timeout=300000)
-            except:
-                # Fallback if the response was so fast the Stop button never registered
-                pass
+                # 2. Get current text content length
+                # We target the last turn to ensure we are checking the new response
+                current_text = page.locator("ms-chat-turn").last.text_content() or ""
+                current_len = len(current_text)
 
-            # 4. Final Data Retrieval
-            if use_clipboard:
-                markdown = self._internal_get_markdown_via_clipboard(page)
-                if markdown: return markdown
+                # 3. Check if "Run" button is back (Primary indicator)
+                is_run_visible = run_btn_ready.is_visible()
 
-            # Final Fallback to DOM Scrape
-            final_chunks = page.locator('ms-text-chunk').all()
-            if not final_chunks: return "Error: No response found."
+                if is_run_visible:
+                    if current_len == last_text_len and current_len > 0:
+                        # Text hasn't changed since last check AND Run button is visible
+                        stability_counter += 1
+                        if stability_counter >= 3: 
+                            # Stable for 1.5 seconds (3 * 0.5s)
+                            print("   [Thread] ✅ Text stable and generation complete.")
+                            break
+                    else:
+                        # Text is still growing/rendering
+                        stability_counter = 0 
+                
+                last_text_len = current_len
+                page.wait_for_timeout(500) # Wait 0.5s before next check
+
+            print("   [Thread] Response captured.", flush=True)
+
+            response = None
+            if return_markdown:
+                # User wants Markdown, try to get it cleanly via clipboard
+                response = self._internal_get_markdown_via_clipboard(page)
+            else:
+                # User wants plain text, use 'Copy as text' function
+                response = self._internal_get_text_via_clipboard(page)
+                
+            if response is not None:
+                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+                return response
+
+            # FALLBACK: If clipboard copy failed for any reason, scrape the raw text content.
+            print("   [Thread] Clipboard copy failed. Falling back to raw text scrape.")
+            final_chunk = page.locator('ms-text-chunk').last
+            raw_answer = final_chunk.text_content()
+
+            # Simplified cleanup (faster regex)
+            clean_answer = re.sub(r'\b(expand_more|expand_less|content_copy|share|edit|thumb_up|thumb_down|Code|JSON|Download|Copy code|Python|JavaScript)\b', '', raw_answer, flags=re.IGNORECASE)
             
-            # Use the last chunk and clean it
-            raw_text = final_chunks[-1].inner_text().strip()
-            return self._clean_ui_junk(raw_text)
+            if "Expand to view model thoughts" in clean_answer:
+                clean_answer = clean_answer.split("Expand to view model thoughts", 1)[-1]
+
+            page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+
+            return clean_answer.strip()
 
         except Exception as e:
             return f"Browser Error: {str(e)}"
@@ -274,19 +306,20 @@ class AIStudioBridge:
         print("   [Thread] Fetching models...")
         # Ensure we are on the app page
         if "aistudio.google.com/app" not in page.url:
-             page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+             page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
         try:
             # Wait for the model selector to be present
-            page.locator("ms-model-selector button").wait_for(state="visible", timeout=20000)
+            model_btn = page.locator("ms-model-selector button")
+            model_btn.wait_for(state="visible", timeout=20000)
             
             # Open the menu to populate the list
-            model_btn = page.locator("ms-model-selector button")
             model_btn.click()
-            time.sleep(1.0) # Wait for animation
+            # REPLACED: time.sleep(1.0) with explicit wait for the first model title in the dropdown
             
             # Target the model title text in the dropdown
-            page.locator(".model-title-text").first.wait_for(timeout=5000)
+            model_title_text = page.locator(".model-title-text").first
+            model_title_text.wait_for(timeout=5000)
             elements = page.locator(".model-title-text").all()
             
             models = list(dict.fromkeys([t.inner_text().strip() for t in elements if t.inner_text().strip()]))
@@ -303,36 +336,54 @@ class AIStudioBridge:
         """Selects a specific model."""
         print(f"   [Thread] Switching to model: {model_name}...")
         if "aistudio.google.com" not in page.url:
-             page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="networkidle", timeout=60000)
+             page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
         try:
-            page.locator("ms-model-selector button").wait_for(state="visible", timeout=30000)
             model_btn = page.locator("ms-model-selector button")
+            model_btn.wait_for(state="visible", timeout=30000)
+            
+            # Click to open the model selection dropdown
             if not model_btn.is_visible():
                 page.get_by_label("Run settings").click()
-                time.sleep(0.5)
+                page.wait_for_timeout(200) # Small wait for settings panel to open
             model_btn.click()
-            time.sleep(1.0)
+            
+            target = page.locator(".model-title-text").get_by_text(model_name, exact=True).first
+            target.wait_for(state="visible", timeout=5000) # Wait for target to be visible
+
             try:
                 gemini_filter = page.locator("button.ms-button-filter-chip").filter(has_text="Gemini").first
-                if gemini_filter.is_visible(): gemini_filter.click()
-                time.sleep(0.5)
+                if gemini_filter.is_visible(): 
+                    gemini_filter.click()
+                    target.wait_for(state="visible", timeout=5000) # Wait for target to be visible after filtering
             except: pass
 
-            target = page.locator(".model-title-text").get_by_text(model_name, exact=True).first
             target.click()
-            time.sleep(1.0)
+            # REPLACED: time.sleep(1.0) with wait for the selection menu to hide/close
+            page.locator("mat-mdc-menu-panel").first.wait_for(state="hidden", timeout=5000)
+
             return True
         except Exception as e:
             page.keyboard.press("Escape")
             return f"Error: {e}"
 
-    def send_prompt(self, message, use_clipboard=False):
+    def send_prompt(self, message, return_markdown=False):
+        """
+        Sends a prompt to AI Studio.
+        
+        :param message: The prompt text.
+        :param return_markdown: If True, attempts to retrieve the response 
+                                as Markdown via 'Copy as markdown'.
+                                If False, attempts to retrieve as plain text 
+                                via 'Copy as text'.
+        """
         self.start()
         result_queue = queue.Queue()
-        self.cmd_queue.put(("prompt", (message, use_clipboard), result_queue))
+        # CHANGED: use_clipboard -> return_markdown
+        self.cmd_queue.put(("prompt", (message, return_markdown), result_queue)) 
         try:
-            return result_queue.get(timeout=250)
+            # Increased timeout slightly for reliable thread communication
+            return result_queue.get(timeout=300) 
         except queue.Empty:
             return "Error: Browser bridge timed out."
     
@@ -356,7 +407,6 @@ class AIStudioBridge:
         try:
             # We use a combined selector: Look for span.title specifically 
             # inside the ms-model-selector button.
-            # This matches your provided path but is more resilient to small UI changes.
             selector = "ms-model-selector button span.title"
             
             model_el = page.locator(selector).first
@@ -386,24 +436,105 @@ class AIStudioBridge:
                 return None
     
     def _internal_get_markdown_via_clipboard(self, page):
-        """Extracts the cleanest version of the response using AI Studio's own copy tool."""
+        """Hovers over the last message and clicks 'Copy as markdown'."""
+        print("   [Thread] Attempting 'Copy as Markdown' via Clipboard...")
         try:
+            # 1. Target the last message bubble
             latest_turn = page.locator("ms-chat-turn").last
+            latest_turn.scroll_into_view_if_needed()
             latest_turn.hover()
             
+            # 2. Click the 'Three Dots' options button
             options_btn = latest_turn.locator("button[aria-label='Open options']")
-            options_btn.click()
+            # Explicit wait for options button to appear after hover (REMOVED: time.sleep(0.5) equivalent)
+            options_btn.wait_for(state="visible", timeout=3000) 
+            options_btn.click(force=True) 
             
-            # Wait for the specific menu item
+            # 3. Find and Click 'Copy as markdown'
+            # We look for the menu item containing the specific text
             copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as markdown")
+            
+            if not copy_btn.is_visible():
+                # Fallback: Try generic class selector if role attribute is missing
+                copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as markdown")
+
+            if not copy_btn.is_visible():
+                print("   [Thread] 'Copy as markdown' option not found in menu.")
+                page.keyboard.press("Escape")
+                return None
+
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
-            # Instant read from the browser's shared clipboard
-            return page.evaluate("navigator.clipboard.readText()")
-        except:
+            # 4. Read Clipboard
+            # A small timeout is often unavoidable here as Playwright needs 
+            # to wait for the OS/Browser to populate the clipboard after the click.
+            page.wait_for_timeout(200) 
+            clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            
+            # Close menu just in case
+            page.keyboard.press("Escape")
+            
+            print(f"   [Thread] Clipboard Copy Successful ({len(clipboard_text)} chars).")
+            return clipboard_text
+
+        except Exception as e:
+            print(f"   [Thread] ⚠️ Copy as Markdown failed: {e}")
+            try:
+                page.keyboard.press("Escape")
+            except: pass
+            return None
+    
+    def _internal_get_text_via_clipboard(self, page):
+        """Hovers over the last message and clicks 'Copy as text'."""
+        print("   [Thread] Attempting 'Copy as text' via Clipboard...")
+        try:
+            # 1. Target the last message bubble
+            latest_turn = page.locator("ms-chat-turn").last
+            latest_turn.scroll_into_view_if_needed()
+            latest_turn.hover()
+            # REPLACED: time.sleep(0.5) with explicit wait for options button
+
+            # 2. Click the 'Three Dots' options button
+            options_btn = latest_turn.locator("button[aria-label='Open options']")
+            options_btn.wait_for(state="visible", timeout=3000)
+            options_btn.click(force=True) 
+            
+            # 3. Find and Click 'Copy as text'
+            copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as text")
+            
+            if not copy_btn.is_visible():
+                # Fallback: Try generic class selector if role attribute is missing
+                copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as text")
+
+            if not copy_btn.is_visible():
+                print("   [Thread] 'Copy as text' option not found in menu.")
+                page.keyboard.press("Escape")
+                return None
+
+            copy_btn.wait_for(state="visible", timeout=2000)
+            copy_btn.click()
+            
+            # 4. Read Clipboard
+            # REPLACED: time.sleep(0.5) with Playwright timeout
+            page.wait_for_timeout(200) 
+            clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            
+            # Close menu just in case
+            page.keyboard.press("Escape")
+            
+            print(f"   [Thread] Clipboard Text Copy Successful ({len(clipboard_text)} chars).")
+            return clipboard_text
+
+        except Exception as e:
+            print(f"   [Thread] ⚠️ Copy as Text failed: {e}")
+            try:
+                page.keyboard.press("Escape")
+            except: pass
             return None
 
+    # REMOVED: _internal_get_answer_via_clipboard (was confusing/duplicate)
+    
     def get_available_models(self):
         self.start()
         result_queue = queue.Queue()
@@ -437,11 +568,9 @@ class AIStudioBridge:
         """Retrieves the last AI response formatted as Markdown."""
         self.start()
         result_queue = queue.Queue()
-        self.cmd_queue.put(("get_markdown", None, result_queue))
-        try:
-            return result_queue.get(timeout=30)
-        except queue.Empty:
-            return "Error: Timeout retrieving markdown."
+        # This command type 'get_markdown' is not handled in _browser_loop
+        print("Warning: get_last_response_as_markdown is an unhandled command type and should be removed or re-implemented.")
+        return "Error: Function not implemented or unhandled command type."
 
     def reset(self):
         self.start()

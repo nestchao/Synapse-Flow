@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory> // Required for std::unique_ptr
 #include <faiss/utils/distances.h>
+#include <shared_mutex> 
 
 // Forward declare FAISS Index
 namespace faiss { struct Index; }
@@ -38,6 +39,8 @@ private:
     std::vector<std::shared_ptr<CodeNode>> nodes_list_;
     std::unordered_map<long, std::shared_ptr<CodeNode>> id_to_node_map_;
     std::unordered_map<std::string, long> name_to_id_map_;
+
+    mutable std::shared_mutex rw_mutex_; 
 };
 
 } // namespace code_assistance

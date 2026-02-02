@@ -2,139 +2,125 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Synapse-Flow | Mission Control</title>
     <link rel="stylesheet" href="style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <!-- 🚀 VIS.JS IMPORT -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        #graph-container { width: 100%; height: 100%; background: #0d1117; }
+    </style>
 </head>
 <body>
-    <nav class="sidebar">
-        <div class="logo">
-            <i class="fas fa-microchip"></i>
-            <span>SYNAPSE</span>
-        </div>
-        <ul class="nav-links">
-            <li class="active" data-page="overview">
-                <i class="fas fa-chart-line"></i> <span>Overview</span>
-            </li>
-            <li data-page="trace">
-                <i class="fas fa-satellite-dish"></i> <span>Flight Trace</span>
-            </li>
-            <li data-page="history">
-                <i class="fas fa-history"></i> <span>Archive</span>
-            </li>
-            <li data-page="control">
-                <i class="fas fa-sliders-h"></i> <span>Control</span>
-            </li>
-        </ul>
-        <div class="system-status">
-            <div class="pulse"></div>
-            <span id="uptime">System Online</span>
-        </div>
-    </nav>
-
-    <main class="content">
-        <!-- PAGE: OVERVIEW -->
-        <section id="overview" class="page active">
-            <header>
-                <h1>System Vitality</h1>
-                <div class="last-updated">Last Sync: <span id="sync-time">--:--:--</span></div>
-            </header>
+    <div class="app-container">
+        
+        <!-- GLOBAL NAVIGATION RAIL -->
+        <aside class="icon-nav">
+            <div class="nav-brand"><i class="fas fa-brain"></i></div>
             
-            <div class="stats-grid">
-                <div class="card gauge-card">
-                    <label>CPU Utilization</label>
-                    <div class="gauge-wrap">
-                        <svg class="gauge-svg" viewBox="0 0 100 100">
-                            <circle class="bg" cx="50" cy="50" r="45"></circle>
-                            <circle id="cpu-gauge" class="meter" cx="50" cy="50" r="45"></circle>
-                        </svg>
-                        <span id="cpu-text">0%</span>
-                    </div>
-                </div>
-                <div class="card gauge-card">
-                    <label>Private Memory</label>
-                    <div class="gauge-wrap">
-                        <svg class="gauge-svg" viewBox="0 0 100 100">
-                            <circle class="bg" cx="50" cy="50" r="45"></circle>
-                            <circle id="ram-gauge" class="meter" cx="50" cy="50" r="45"></circle>
-                        </svg>
-                        <span id="ram-text">0MB</span>
-                    </div>
-                </div>
-                <div class="card stat-card">
-                    <label>Vector Latency</label>
-                    <h2 id="vec-val">0ms</h2>
-                    <div class="trend positive"><i class="fas fa-bolt"></i> Low Latency</div>
-                </div>
-                <div class="card stat-card">
-                    <label>Throughput</label>
-                    <h2 id="tps-val">0 T/s</h2>
-                    <div class="trend"><i class="fas fa-wave-square"></i> Real-time</div>
-                </div>
+            <div class="nav-item active" onclick="switchPage('dashboard')">
+                <i class="fas fa-tachometer-alt"></i>
+                <span class="tooltip">Mission Control</span>
             </div>
-        </section>
+            
+            <div class="nav-item" onclick="switchPage('trace')">
+                <i class="fas fa-network-wired"></i>
+                <span class="tooltip">Live Trace</span>
+            </div>
 
-        <!-- PAGE: FLIGHT TRACE -->
-        <section id="trace" class="page">
-            <header>
-                <h1>Live Flight Trace</h1>
-                <span id="trace-count" class="badge">0 Events Detected</span>
-            </header>
-            <div class="trace-table-container">
-                <table class="trace-table">
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Phase</th>
-                            <th>Objective/Detail</th>
-                            <th>Latency</th>
-                            <th>Session</th>
-                        </tr>
-                    </thead>
-                    <tbody id="trace-list">
-                        <!-- Items injected here -->
-                    </tbody>
-                </table>
+            <!-- 🚀 GRAPH ICON -->
+            <div class="nav-item" onclick="switchPage('graph')">
+                <i class="fas fa-project-diagram"></i>
+                <span class="tooltip">Neural Graph</span>
             </div>
-        </section>
 
-        <!-- PAGE: HISTORY -->
-        <section id="history" class="page">
-            <div class="split-view">
-                <div class="log-explorer">
-                    <h1>Mission Archive</h1>
-                    <div id="log-list" class="scroll-list"></div>
+            <div class="nav-spacer"></div>
+            <div class="nav-item"><i class="fas fa-cog"></i></div>
+        </aside>
+
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="view-section active">
+            <nav class="sidebar">
+                <div class="section-title">SYSTEM VITALS</div>
+                <div class="kpi-grid">
+                    <div class="kpi-mini"><label>CPU</label><div id="kpi-cpu" class="val-text">0%</div></div>
+                    <div class="kpi-mini"><label>RAM</label><div id="kpi-ram" class="val-text">0MB</div></div>
                 </div>
-                <div class="inspector-panel">
-                    <div id="inspector-default" class="placeholder">
-                        <i class="fas fa-search"></i>
-                        <p>Select a mission to inspect telemetry</p>
-                    </div>
-                    <div id="inspector-content" class="hidden">
-                        <!-- Detailed info here -->
+                <div class="section-title">ENGINE METRICS</div>
+                <div class="kpi-box">
+                    <div class="kpi-row">
+                        <div><label>Sync Latency</label><div id="kpi-sync" class="kpi-val-small">0ms</div></div>
+                        <div><label>RAM Cache</label><div id="kpi-cache" class="kpi-val-small">0MB</div></div>
                     </div>
                 </div>
-            </div>
-        </section>
+                <div class="kpi-box">
+                    <div class="kpi-row">
+                        <div><label>AI Latency</label><div id="kpi-latency" class="kpi-val">0ms</div></div>
+                        <div><label>Tokens/Sec</label><div id="kpi-tps" class="kpi-val">0</div></div>
+                    </div>
+                </div>
+                <div class="list-header">TRANSMISSION LOG</div>
+                <div id="log-list" class="log-list"></div>
+            </nav>
 
-        <!-- PAGE: CONTROL -->
-        <section id="control" class="page">
-            <h1>Mission Parameters</h1>
-            <div class="control-grid">
-                <div class="card">
-                    <h3>Stress Simulation</h3>
-                    <p>Saturate ThreadPool with synthetic concurrent missions.</p>
-                    <button onclick="triggerStressTest()" id="test-btn" class="btn btn-danger">Execute High-Load Trigger</button>
+            <main class="inspector">
+                <header>
+                    <div class="breadcrumbs">
+                        <span id="insp-id">SELECT TRANSMISSION</span>
+                        <span id="insp-type" class="badge">WAITING</span>
+                    </div>
+                    <div class="meta-row">
+                        <span><i class="far fa-clock"></i> <span id="insp-time">--</span></span>
+                        <span><i class="fas fa-bolt"></i> <span id="insp-duration">--</span></span>
+                        <span><i class="fas fa-database"></i> <span id="insp-context-size">0 chars</span></span>
+                    </div>
+                </header>
+                <div class="grid-layout">
+                    <div class="panel full-height">
+                        <h3><i class="fas fa-eye"></i> AI Retina View (Full Context)</h3>
+                        <div class="code-window" id="insp-full-prompt"><span class="placeholder-text">Select a log to see payload...</span></div>
+                    </div>
+                    <div class="panel full-height">
+                        <div class="sub-section" style="flex:1;">
+                            <h3><i class="fas fa-robot"></i> AI Response</h3>
+                            <div class="code-window" id="insp-response"></div>
+                        </div>
+                        <div class="sub-section">
+                            <h3><i class="fas fa-keyboard"></i> Raw User Input</h3>
+                            <div class="code-window small" id="insp-user-input"></div>
+                        </div>
+                        <div class="sub-section">
+                            <h3><i class="fas fa-project-diagram"></i> Vector DNA</h3>
+                            <div id="insp-vector" class="vector-bar"></div>
+                        </div>
+                    </div>
                 </div>
-                <div class="card">
-                    <h3>System Maintenance</h3>
-                    <p>Purge local telemetry cache and history.</p>
-                    <button onclick="clearLogs()" class="btn btn-secondary">Clear Data Shards</button>
+            </main>
+        </div>
+
+        <!-- LIVE TRACE VIEW -->
+        <div id="view-trace" class="view-section">
+            <div class="trace-container">
+                <div class="trace-header">
+                    <h2>🚀 Live Flight Trace</h2>
+                    <span id="trace-status" class="status-live">LISTENING</span>
                 </div>
+                <div id="trace-list" class="trace-list"></div>
             </div>
-        </section>
-    </main>
+        </div>
+
+        <!-- 🚀 GRAPH VIEW -->
+        <div id="view-graph" class="view-section">
+            <div style="display:flex; flex-direction:column; width:100%; height:100%">
+                <header style="padding:15px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+                    <h3 style="margin:0; color:#58a6ff"><i class="fas fa-project-diagram"></i> Cognitive Graph Topology</h3>
+                    <button onclick="refreshGraph()" style="background:var(--accent); border:none; color:white; padding:6px 15px; border-radius:4px; cursor:pointer; font-weight:bold;">Refresh Network</button>
+                </header>
+                <div id="graph-container"></div>
+            </div>
+        </div>
+
+    </div>
+    <script src="main.js"></script>
 </body>
-<script src="main.js"></script>
 </html>

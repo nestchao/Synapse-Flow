@@ -7,9 +7,9 @@
 
 // Forward declare grammars from third_party
 extern "C" {
-    const TSLanguage* tree_sitter_cpp();
-    const TSLanguage* tree_sitter_python();
-    const TSLanguage* tree_sitter_typescript();
+    TSLanguage* tree_sitter_cpp();
+    TSLanguage* tree_sitter_python();
+    TSLanguage* tree_sitter_json();
 }
 
 namespace code_assistance {

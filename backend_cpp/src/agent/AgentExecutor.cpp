@@ -1,5 +1,8 @@
 #define NOMINMAX
 #include <cpr/cpr.h>
+#include "agent/AgentExecutor.hpp"
+#include "LogManager.hpp"
+#include "SystemMonitor.hpp" 
 #include <regex>
 #include <chrono>
 #include <fstream>
@@ -8,98 +11,164 @@
 #include <spdlog/spdlog.h>
 #include <stack>
 #include <unordered_set>
-
-#include "LogManager.hpp"
-#include "agent/AgentExecutor.hpp"
 #include "parser_elite.hpp"
+#include "tools/FileSystemTools.hpp"
+#include "planning/ExecutionGuard.hpp"
 
 namespace code_assistance {
 
 namespace fs = std::filesystem;
 
-// --- 1. CONSTRUCTOR ---
+// --- CONSTRUCTOR ---
 AgentExecutor::AgentExecutor(
     std::shared_ptr<RetrievalEngine> engine,
     std::shared_ptr<EmbeddingService> ai,
     std::shared_ptr<SubAgent> sub_agent,
-    std::shared_ptr<ToolRegistry> tool_registry
-) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry) {
+    std::shared_ptr<ToolRegistry> tool_registry,
+    std::shared_ptr<MemoryVault> memory_vault
+
+) : engine_(engine), ai_service_(ai), sub_agent_(sub_agent), tool_registry_(tool_registry), memory_vault_(memory_vault) {
+
     context_mgr_ = std::make_unique<ContextManager>();
+    planning_engine_ = std::make_unique<PlanningEngine>();
 }
 
-// --- 2. HELPERS ---
+// --- HELPER: CLEAN RESPONSE ---
+std::string clean_response_text(std::string text) {
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    text.erase(std::remove(text.begin(), text.end(), '\f'), text.end());
+    size_t pos = 0;
+    while ((pos = text.find("\\frac", pos)) != std::string::npos) {
+        text.replace(pos, 5, "frac");
+        pos += 4;
+    }
+    return text;
+}
 
-// Stack-Based JSON Extractor
+// --- HELPER: ROBUST JSON EXTRACTION ---
 nlohmann::json extract_json(const std::string& raw) {
-    try {
-        std::stack<char> braces;
-        size_t start = std::string::npos;
-        size_t end = std::string::npos;
+    std::string clean = raw;
+    
+    // 1. Prioritize Explicit Markdown JSON Blocks
+    size_t md_start = clean.find("```json");
+    if (md_start != std::string::npos) {
+        size_t start = clean.find('\n', md_start);
+        if (start != std::string::npos) {
+            size_t end = clean.find("```", start + 1);
+            if (end != std::string::npos) {
+                try {
+                    return nlohmann::json::parse(clean.substr(start + 1, end - start - 1));
+                } catch(...) { /* Fallback if block is malformed */ }
+            }
+        }
+    }
 
-        for (size_t i = 0; i < raw.length(); ++i) {
-            if (raw[i] == '{') {
-                if (braces.empty()) start = i;
-                braces.push('{');
-            } else if (raw[i] == '}') {
-                if (!braces.empty()) {
-                    braces.pop();
-                    if (braces.empty()) {
-                        end = i;
-                        // We found a complete top-level JSON object.
-                        // For this agent, we assume the *last* valid JSON block is the action.
-                        // Or we can break here if we want the first. 
-                        // Let's break to capture the first distinct action.
-                        break; 
-                    }
+    // 2. Scan for VALID JSON start (Lookahead Check)
+    // Prevents crashing on math like "{k=0}"
+    size_t json_start = std::string::npos;
+    char start_char = '\0';
+    char end_char = '\0';
+
+    for (size_t i = 0; i < clean.length(); ++i) {
+        char c = clean[i];
+        if (c == '{' || c == '[') {
+            // Check next non-space char
+            for (size_t j = i + 1; j < clean.length(); ++j) {
+                char next = clean[j];
+                if (std::isspace(next)) continue;
+                
+                // Object must start with " or }
+                if (c == '{' && (next == '"' || next == '}')) {
+                    json_start = i; start_char = '{'; end_char = '}'; goto found;
+                }
+                // Array must start with {, ", ], or digit
+                if (c == '[' && (next == '{' || next == '"' || next == ']' || std::isdigit(next))) {
+                    json_start = i; start_char = '['; end_char = ']'; goto found;
+                }
+                break; // Invalid start char found
+            }
+        }
+    }
+    found:;
+
+    if (json_start == std::string::npos) return nlohmann::json::object();
+
+    // 3. Bracket Counting (Isolate the JSON string)
+    int balance = 0;
+    bool in_string = false;
+    bool escape = false;
+    size_t json_end = std::string::npos;
+
+    for (size_t i = json_start; i < clean.length(); ++i) {
+        char c = clean[i];
+        if (escape) { escape = false; continue; }
+        if (c == '\\') { escape = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        
+        if (!in_string) {
+            if (c == start_char) balance++;
+            else if (c == end_char) {
+                balance--;
+                if (balance == 0) {
+                    json_end = i;
+                    break;
                 }
             }
         }
+    }
 
-        if (start != std::string::npos && end != std::string::npos) {
-            std::string clean_json = raw.substr(start, end - start + 1);
-            return nlohmann::json::parse(clean_json);
+    std::string json_str = (json_end != std::string::npos) 
+        ? clean.substr(json_start, json_end - json_start + 1) 
+        : clean.substr(json_start);
+
+    // 4. Parse
+    try {
+        return nlohmann::json::parse(json_str);
+    } catch (...) {
+        // Last Resort: If raw code exists, wrap it
+        if (raw.find("def ") != std::string::npos) {
+            nlohmann::json f; f["tool"] = "FINAL_ANSWER"; f["parameters"] = {{"answer", raw}}; return f;
         }
-    } catch (const std::exception& e) {
-        spdlog::warn("⚠️ Failed to parse AI JSON: {}", e.what());
     }
     return nlohmann::json::object();
+}
+
+std::string sanitize_for_prompt(const std::string& text) {
+    std::string safe = text;
+    size_t pos = 0;
+    while ((pos = safe.find("f\"", pos)) != std::string::npos) {
+        size_t end = safe.find("\"", pos + 2);
+        if (end != std::string::npos) {
+            safe[pos + 1] = '\'';
+            safe[end] = '\'';
+            pos = end + 1;
+        } else break;
+    }
+    return safe;
+}
+
+std::string load_full_context_file(const std::string& project_id) {
+    std::string root = FileSystemTools::resolve_project_root(project_id);
+    if (root.empty()) return "";
+    fs::path full_ctx_path = fs::path(root) / ".study_assistant" / "converted_files" / "_full_context.txt";
+    if (!fs::exists(full_ctx_path)) full_ctx_path = fs::path("data") / project_id / "_full_context.txt";
+    if (fs::exists(full_ctx_path)) {
+        std::ifstream f(full_ctx_path);
+        std::stringstream buffer;
+        buffer << f.rdbuf();
+        return buffer.str();
+    }
+    return "";
 }
 
 std::string AgentExecutor::find_project_root() {
     fs::path p = fs::current_path();
     while (p.has_parent_path()) {
-        if (fs::exists(p / "src") || fs::exists(p / ".git") || fs::exists(p / "CMakeLists.txt")) {
-            return p.string();
-        }
+        if (fs::exists(p / "src") || fs::exists(p / ".git")) return p.string();
         p = p.parent_path();
     }
     return fs::current_path().string();
 }
-
-std::string extract_json_payload_surgical(const std::string& raw) {
-    std::regex md_regex(R"(```json\s*(\{[\s\S]*?\})\s*```)");
-    std::smatch match;
-    if (std::regex_search(raw, match, md_regex)) return match.str(1);
-    
-    std::regex plain_regex(R"(\{[\s\S]*\})");
-    if (std::regex_search(raw, match, plain_regex)) return match.str();
-    return "";
-}
-
-std::string read_agent_file_safe(const std::string& filename) {
-    fs::path root = fs::path(AgentExecutor::find_project_root());
-    fs::path target = root / filename;
-
-    if (fs::exists(target) && !fs::is_directory(target)) {
-        std::ifstream f(target);
-        std::stringstream ss;
-        ss << f.rdbuf();
-        return ss.str();
-    }
-    return "ERROR: File not found: " + filename;
-}
-
-// --- 3. TELEMETRY & LOGIC ---
 
 void AgentExecutor::notify(::grpc::ServerWriter<::code_assistance::AgentResponse>* w, 
                             const std::string& phase, 
@@ -111,151 +180,474 @@ void AgentExecutor::notify(::grpc::ServerWriter<::code_assistance::AgentResponse
         res.set_payload(msg);
         w->Write(res);
     }
-
-    nlohmann::json telemetry_payload = {
-        {"session_id", "AGENT_PROBE"},
-        {"state", phase},
-        {"detail", msg},
-        {"duration", duration_ms} // 🚀 NOW SENDING REAL DATA
-    };
-
-    cpr::PostAsync(cpr::Url{"http://127.0.0.1:5002/api/admin/publish_trace"},
-                  cpr::Body{telemetry_payload.dump()},
-                  cpr::Header{{"Content-Type", "application/json"}});
+    code_assistance::LogManager::instance().add_trace({"AGENT", "", phase, msg, duration_ms});
 }
 
-void AgentExecutor::determineContextStrategy(const std::string& query, ContextSnapshot& ctx, const std::string& project_id) {
-    ctx.architectural_map = read_agent_file_safe("tree.txt");
-    if (query.length() < 150) {
-        ctx.focal_code = read_agent_file_safe("_full_context.txt");
+std::shared_ptr<SkillLibrary> AgentExecutor::get_skill_library(const std::string& project_id) {
+    std::lock_guard<std::mutex> lock(skill_mutex_);
+    if (skill_libraries_.find(project_id) == skill_libraries_.end()) {
+        std::string root_str = FileSystemTools::resolve_project_root(project_id);
+        fs::path skill_path;
+        if (root_str.empty()) skill_path = fs::path("data") / "business_metadata";
+        else skill_path = fs::path(root_str) / ".study_assistant" / "business_metadata";
+        spdlog::info("🧠 Loading Skills for {} from {}", project_id, skill_path.string());
+        skill_libraries_[project_id] = std::make_shared<SkillLibrary>(skill_path.string(), ai_service_);
     }
+    return skill_libraries_[project_id];
 }
 
-// --- 4. THE COGNITIVE ENGINE ---
+std::shared_ptr<PointerGraph> AgentExecutor::get_or_create_graph(const std::string& project_id) {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    if (graphs_.find(project_id) == graphs_.end()) {
+        std::string safe_id = project_id;
+        std::replace(safe_id.begin(), safe_id.end(), ':', '_');
+        std::replace(safe_id.begin(), safe_id.end(), '/', '_');
+        std::replace(safe_id.begin(), safe_id.end(), '\\', '_');
+        std::string path = "data/graphs/" + safe_id;
+        if (!fs::exists(path)) fs::create_directories(path);
+        spdlog::info("📂 Loading Graph for Project: {} at {}", project_id, path);
+        graphs_[project_id] = std::make_shared<PointerGraph>(path);
+    }
+    return graphs_[project_id];
+}
+
+void AgentExecutor::ingest_sync_results(const std::string& project_id, const std::vector<std::shared_ptr<CodeNode>>& nodes) {
+    auto graph = get_or_create_graph(project_id);
+    spdlog::info("🧠 Ingesting {} code nodes into Graph Memory...", nodes.size());
+    for (const auto& node : nodes) {
+        std::unordered_map<std::string, std::string> meta;
+        meta["file_path"] = node->file_path;
+        meta["node_name"] = node->name;
+        meta["node_type"] = node->type;
+        std::string deps = "";
+        for(const auto& d : node->dependencies) deps += d + ",";
+        meta["dependencies"] = deps;
+        graph->add_node(node->content, NodeType::CONTEXT_CODE, "", node->embedding, meta);
+    }
+    graph->save();
+    spdlog::info("✅ Graph Knowledge Updated.");
+}
+
+std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> graph, const std::string& session_id) {
+    auto nodes = graph->query_by_metadata("session_id", session_id);
+    if (nodes.empty()) return "";
+    PointerNode latest = nodes[0];
+    for(const auto& n : nodes) {
+        if (n.timestamp > latest.timestamp) latest = n;
+    }
+    spdlog::info("🔄 Restored Session '{}' cursor to node: {}", session_id, latest.id);
+    return latest.id;
+}
+
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
     
+    // Setup Graph & Session
+    auto graph = get_or_create_graph(req.project_id());
+    std::string session_id = req.session_id();
+    std::string parent_node_id = "";
+    
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        if (session_cursors_.find(session_id) == session_cursors_.end()) {
+            session_cursors_[session_id] = restore_session_cursor(graph, session_id);
+        }
+        parent_node_id = session_cursors_[session_id];
+    }
+
+    // Variables
     std::string tool_manifest = tool_registry_->get_manifest();
     std::string internal_monologue = "";
-    
-    // 🚀 LOOP DETECTION HASH SET
-    std::unordered_set<size_t> action_history;
-    std::hash<std::string> hasher;
-
-    code_assistance::GenerationResult last_gen; 
     std::string final_output = "Mission Timed Out.";
-    
-    int max_steps = 10;
-    
-    for (int step = 0; step < max_steps; ++step) {
-        std::string prompt = 
-            "### ROLE: Synapse Autonomous Pilot\n"
-            "### TOOLS\n" + tool_manifest + "\n\n"
-            "### MISSION\n" + req.prompt() + "\n\n"
-            "### PROTOCOL\n"
-            "1. Format calls as JSON: {\"tool\": \"name\", \"parameters\": {...}}\n"
-            "2. If the answer is in the history, use FINAL_ANSWER immediately.\n"
-            "3. Efficiency = Success. Do not repeat failed steps.\n";
+    std::string last_error = ""; 
+    std::string last_effective_prompt = ""; 
+    code_assistance::GenerationResult last_gen; 
 
-        if (!internal_monologue.empty()) {
-            prompt += "\n### HISTORY & OBSERVATIONS\n" + internal_monologue;
-        }
-        prompt += "\nNEXT ACTION:";
+    // Record User Prompt
+    std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
+    std::string root_node_id = graph->add_node(req.prompt(), NodeType::PROMPT, parent_node_id, prompt_vec, {{"session_id", session_id}});
+    std::string last_graph_node = root_node_id;
 
-        last_gen = ai_service_->generate_text_elite(prompt);
+    // Retrieve Skills
+    auto skill_lib = get_skill_library(req.project_id());
+    std::string business_context = skill_lib->retrieve_skills(req.prompt(), prompt_vec);
+
+    // Retrieve History
+    if (!parent_node_id.empty()) {
+        auto trace = graph->get_trace(parent_node_id);
+        int start_idx = std::max(0, (int)trace.size() - 15);
         
-        if (!last_gen.success) {
-            // ... error handling ...
-            return "ERROR: AI Service Failure";
-        }
+        std::string last_user_content = ""; // 🛡️ Dedup Tracker
 
-        std::string thought = last_gen.text;
-        this->notify(writer, "THOUGHT", "Step " + std::to_string(step));
-
-        // 3. JSON EXTRACTION & VALIDATION
-        nlohmann::json action = extract_json(thought);
-        
-        if (action.contains("tool")) {
-            std::string tool_name = action["tool"];
+        for (size_t i = start_idx; i < trace.size(); ++i) {
+            const auto& node = trace[i];
             
-            // 🚀 LOOP DETECTION (HASH BASED)
-            std::string action_sig = tool_name + action["parameters"].dump();
-            size_t action_hash = hasher(action_sig);
-            
-            if (action_history.count(action_hash)) {
-                 internal_monologue += "\n[SYSTEM ALERT: You have already performed this exact action. CHANGE STRATEGY.]";
-                 spdlog::warn("🔄 Loop Detected on step {}", step);
-                 // Don't execute, just continue loop to force AI to rethink
-                 continue; 
+            if (node.type == NodeType::PROMPT) {
+                // 🛡️ DEDUPLICATION LOGIC
+                // If this prompt is identical to the last one, skip it.
+                // This prevents the "Echo Chamber" effect.
+                if (node.content == last_user_content) continue;
+                
+                internal_monologue += "\n[USER] " + node.content;
+                last_user_content = node.content;
+            } 
+            else if (node.type == NodeType::SYSTEM_THOUGHT) {
+                internal_monologue += "\n[THOUGHT] " + node.content;
+            } 
+            else if (node.type == NodeType::TOOL_CALL) {
+                std::string tname = node.metadata.count("tool") ? node.metadata.at("tool") : "tool";
+                internal_monologue += "\n[TOOL CALL] " + tname;
+            } 
+            else if (node.type == NodeType::CONTEXT_CODE) {
+                std::string preview = node.content.length() > 100 ? node.content.substr(0, 100) + "..." : node.content;
+                internal_monologue += "\n[TOOL RESULT] " + preview;
+            } 
+            else if (node.type == NodeType::RESPONSE) {
+                internal_monologue += "\n[AI] " + node.content;
             }
-            action_history.insert(action_hash);
-
-            if (tool_name == "FINAL_ANSWER") {
-                final_output = action["parameters"].value("answer", "No answer provided.");
-                this->notify(writer, "FINAL", final_output);
-                goto mission_complete; 
-            }
-
-            nlohmann::json params = action.value("parameters", nlohmann::json::object());
-            params["project_id"] = req.project_id();
-
-            std::string observation = tool_registry_->dispatch(tool_name, params);
-            
-            // 🛰️ SENSOR: AST X-Ray
-            if (tool_name == "read_file" && !observation.starts_with("ERROR")) {
-                code_assistance::elite::ASTBooster sensor;
-                auto symbols = sensor.extract_symbols(params.value("path", ""), observation);
-                this->notify(writer, "AST_SCAN", "Identified " + std::to_string(symbols.size()) + " symbols.");
-                internal_monologue += "\n[AST DATA: " + std::to_string(symbols.size()) + " symbols detected]";
-            }
-
-            internal_monologue += "\n[STEP " + std::to_string(step) + " RESULT FROM " + tool_name + "]\n" + observation;
-            this->notify(writer, "TOOL_EXEC", "Used " + tool_name);
-            
-        } else {
-            if (thought.find("FINAL_ANSWER") != std::string::npos) {
-                final_output = thought;
-                goto mission_complete;
-            }
-            internal_monologue += "\n[SYSTEM: Error - Your last response was not valid JSON.]";
         }
     }
 
+    // Memory Recall
+    std::string memories = "";
+    std::string warnings = ""; 
+    // Wrap to prevent crash on empty embeddings
+    if (!prompt_vec.empty()) {
+        MemoryRecallResult long_term = memory_vault_->recall(prompt_vec);
+        if(long_term.has_memories) {
+            if(!long_term.positive_hints.empty()) memories += "\n### 🧠 SUCCESSFUL STRATEGIES\n" + long_term.positive_hints;
+            if(!long_term.negative_warnings.empty()) warnings += "\n### ⛔ KNOWN PITFALLS\n" + long_term.negative_warnings;
+        }
+    }
+
+    // Load Full Context
+    std::string massive_context = "";
+    std::string full_codebase = load_full_context_file(req.project_id());
+    if (!full_codebase.empty()) {
+        const size_t SAFE_TOKEN_LIMIT_BYTES = 3800000; 
+        if (full_codebase.size() > SAFE_TOKEN_LIMIT_BYTES) massive_context += "\n### 📚 FULL CODEBASE (Truncated)\n" + full_codebase.substr(0, SAFE_TOKEN_LIMIT_BYTES) + "\n";
+        else massive_context += "\n### 📚 FULL CODEBASE\n" + full_codebase + "\n";
+    }
+
+    // Loop Control
+    int max_steps = 16;
+    for (int step = 0; step < max_steps; ++step) {
+        
+        std::string prompt_template = 
+            "### SYSTEM ROLE\n"
+            "You are 'Synapse', an Autonomous Coding Agent.\n\n"
+            "### TOOL MANIFEST\n" + tool_manifest + "\n"
+            "🚀 BATCH MODE ENABLED: You are encouraged to return a JSON LIST `[...]` of multiple tool calls to save time.\n"
+            "Example: `[ {\"tool\": \"apply_edit\", ...}, {\"tool\": \"execute_code\", ...} ]`\n"
+            "If you are confident, perform the edit, execution, and final answer in ONE response.\n\n"
+            "### USER REQUEST\n" + req.prompt() + "\n\n";
+
+        prompt_template += 
+            "\n### 🚨 CRITICAL JSON FORMATTING RULES 🚨\n"
+            "1. **INDENTATION IS VITAL**: When writing Python code in JSON, you MUST include proper indentation.\n"
+            "   ❌ WRONG: \"def foo():\\nreturn 1\"\n"
+            "   ✅ RIGHT: \"def foo():\\n    return 1\" (Notice the spaces after \\n)\n"
+            "2. **SINGLE QUOTES**: Use single quotes for Python strings: print('hello').\n"
+            "3. **NO LATEX**: Do NOT use LaTeX formulas (like \\frac) in the output text. It breaks the display. Use plain text like (1/pi).\n"
+            "4. **OUTPUT VALID JSON**: Start with `[`.\n"
+            "5. **ESCAPE PROPERLY**: All newlines must be \\n, all tabs must be \\t, all quotes inside strings must be escaped.\n";
+
+        prompt_template += 
+            "### 🛑 CODE GENERATION RULE 🛑\n"
+            "1. Write the full Python code inside a ```python block FIRST.\n"
+            "2. Then, inside your JSON, set \"content\": \"__CODE_BLOCK_0__\".\n"
+            "3. My system will automatically inject the code block into the file.\n";
+
+        if (!business_context.empty()) prompt_template += business_context + "\n";
+        if (!massive_context.empty()) prompt_template += massive_context + "\n";
+
+        std::string plan_ctx = planning_engine_->get_plan_context_for_ai();
+        if (!plan_ctx.empty()) prompt_template += plan_ctx + "\n";
+
+        if (!memories.empty()) prompt_template += memories + "\n";
+        if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
+        if (!warnings.empty()) prompt_template += warnings + "\n";
+        if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
+            
+        last_effective_prompt = prompt_template;
+        spdlog::debug("📝 PROMPT TO AI (Truncated):\n{}", prompt_template.substr(0, 1000));
+
+        this->notify(writer, "THINKING", "Processing logic...");
+        last_gen = ai_service_->generate_text_elite(prompt_template);
+        
+        if (!last_gen.success) {
+            final_output = "ERROR: AI Service Failure";
+            goto mission_complete;
+        }
+
+        std::string raw_thought = last_gen.text;
+
+        spdlog::info("\n==================================================");
+        spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (START):");
+        // We use std::cout for raw output to ensure no formatting/truncation issues with spdlog
+        std::cout << raw_thought << std::endl; 
+        spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (END)");
+        spdlog::info("==================================================\n");
+
+        // --- 🆕 CODE BLOCK EXTRACTION LOGIC ---
+        std::string extracted_code = "";
+        std::vector<std::string> code_blocks;
+        
+        // Strategy 1: Look for standard ```python blocks
+        size_t code_start = raw_thought.find("```python");
+        
+        // Strategy 2: Look for generic ``` blocks if python specific missing
+        if (code_start == std::string::npos) {
+            code_start = raw_thought.find("```");
+            // Ensure this isn't the start of the JSON block (which often uses ```json)
+            if (code_start != std::string::npos) {
+                if (raw_thought.substr(code_start, 7) == "```json") {
+                    code_start = std::string::npos; // Ignore if it's the JSON block
+                }
+            }
+        }
+
+        // Strategy 3: Fallback - If no blocks found, but we see "import" or "def",
+        // grab everything before the JSON array starts.
+        if (code_start == std::string::npos) {
+            size_t json_start = std::string::npos;
+
+            // Scan for '[' that is actually the start of the tool list
+            for (size_t i = 0; i < raw_thought.length(); ++i) {
+                if (raw_thought[i] == '[') {
+                    // Lookahead: Must be followed by '{' (ignoring whitespace)
+                    for (size_t k = i + 1; k < raw_thought.length(); ++k) {
+                        char next = raw_thought[k];
+                        if (std::isspace(next)) continue;
+                        if (next == '{') {
+                            json_start = i;
+                            goto found_split;
+                        }
+                        break; // Found something else (like math text), ignore this bracket
+                    }
+                }
+            }
+            found_split:;
+
+            if (json_start != std::string::npos && json_start > 10) {
+                // Heuristic: Check if the text before JSON looks like code
+                std::string pre_json = raw_thought.substr(0, json_start);
+                
+                // Safety: Only treat as code if we see Python keywords
+                if (pre_json.find("import ") != std::string::npos || pre_json.find("def ") != std::string::npos) {
+                    
+                    // Strip "Python" label if present
+                    size_t word_py = pre_json.find("Python\n");
+                    if (word_py != std::string::npos) pre_json = pre_json.substr(word_py + 7);
+                    
+                    extracted_code = pre_json;
+                    
+                    // Trim trailing whitespace
+                    extracted_code.erase(0, extracted_code.find_first_not_of(" \n\r\t"));
+                    extracted_code.erase(extracted_code.find_last_not_of(" \n\r\t") + 1);
+                    
+                    if (!extracted_code.empty()) {
+                        code_blocks.push_back(extracted_code);
+                        spdlog::info("⚠️ Auto-Recovered code block (Smart Split).");
+                    }
+                }
+            }
+        } 
+        else {
+            // Standard Extraction (Markdown found)
+            size_t start = raw_thought.find('\n', code_start) + 1;
+            size_t end = raw_thought.find("```", start);
+            if (end != std::string::npos) {
+                extracted_code = raw_thought.substr(start, end - start);
+                code_blocks.push_back(extracted_code);
+            }
+        }
+        
+        // --- 🚀 NEW BATCH PARSING LOGIC ---
+        nlohmann::json extracted = extract_json(raw_thought);
+        spdlog::info("🧩 PARSED JSON RESULT:\n{}", extracted.dump(2)); 
+        std::vector<nlohmann::json> actions;
+
+        // Detect if it is a single action or a batch
+        if (extracted.is_array()) {
+            for (const auto& item : extracted) {
+                actions.push_back(item);
+            }
+            spdlog::info("🚀 Batch Mode: Detected {} actions in one response.", actions.size());
+        } else {
+            actions.push_back(extracted);
+        }
+
+        // EXECUTE THE BATCH LOCALLY
+        bool batch_aborted = false;
+
+        for (auto& action : actions) {
+            if (batch_aborted) break; 
+
+            std::string tool_name = "";
+            if (action.contains("tool")) tool_name = action["tool"];
+            else if (action.contains("name")) tool_name = action["name"];
+            else if (action.contains("function")) tool_name = action["function"];
+
+            // Handle pure text response (no tool)
+            if (tool_name.empty()) {
+                if (actions.size() == 1) {
+                    final_output = last_gen.text;
+                    last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node);
+                    this->notify(writer, "FINAL", final_output);
+                    goto mission_complete;
+                }
+                continue;
+            }
+
+            nlohmann::json params;
+            if (action.contains("parameters")) {
+                params = action["parameters"];
+            } else if (action.contains("arguments")) {
+                params = action["arguments"];
+            } else if (action.contains("args")) {
+                params = action["args"];
+            } else {
+                // Handle Flattened Structure: { "tool": "edit", "path": "...", "content": "..." }
+                // Copy the whole object as params
+                params = action;
+                // Remove system keys to avoid confusion, though usually harmless
+                if (params.contains("tool")) params.erase("tool");
+                if (params.contains("name")) params.erase("name");
+                if (params.contains("function")) params.erase("function");
+                if (params.contains("thought")) params.erase("thought");
+            }
+
+            // 🚀 CODE INJECTION LOGIC
+            if (params.contains("content")) {
+                std::string content = params["content"].get<std::string>();
+                
+                // Flexible Regex: Matches __CODE_BLOCK_0__ OR CODE_BLOCK_0
+                std::regex placeholder_re(R"((?:__|)CODE_BLOCK_(\d+)(?:__|))");
+                std::smatch m;
+                
+                if (std::regex_search(content, m, placeholder_re)) {
+                    int idx = std::stoi(m[1].str());
+                    
+                    if (idx >= 0 && static_cast<size_t>(idx) < code_blocks.size()) {
+                        params["content"] = code_blocks[idx];
+                        spdlog::info("💉 Injected Code Block {} ({} chars)", idx, code_blocks[idx].length());
+                    } else {
+                        spdlog::warn("⚠️ Code block {} not found! Available: {}", idx, code_blocks.size());
+                    }
+                } 
+                // Auto-inject if only one block exists and content looks like a placeholder
+                else if (code_blocks.size() == 1 && (content.find("CODE_BLOCK") != std::string::npos || content.length() < 20)) {
+                     params["content"] = code_blocks[0];
+                     spdlog::info("💉 Auto-Injected Single Code Block (Fallback)");
+                }
+            }
+
+            params["project_id"] = req.project_id();
+
+            // Handle Reasoning/Thoughts
+            if (action.contains("thought")) {
+                std::string reasoning = action["thought"];
+                last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
+                this->notify(writer, "PLANNING", reasoning);
+            }
+
+            params["_batch_mode"] = true; 
+
+            // 1. Propose Plan
+            if (tool_name == "propose_plan") {
+                if (params.contains("steps")) {
+                    planning_engine_->propose_plan(req.prompt(), params["steps"]);
+                    if (actions.size() > 1) {
+                        planning_engine_->approve_plan();
+                        this->notify(writer, "PLANNING", "Plan proposed and auto-approved for batch execution.");
+                    } else {
+                        ::code_assistance::AgentResponse plan_res;
+                        plan_res.set_phase("PROPOSAL");
+                        plan_res.set_payload(planning_engine_->get_snapshot().to_json().dump()); 
+                        if (writer) writer->Write(plan_res);
+                        final_output = "Plan Proposed.";
+                        goto mission_complete; 
+                    }
+                }
+            }
+
+            // 2. Execution Guard
+            GuardResult guard = ExecutionGuard::validate_tool_call(tool_name, params, planning_engine_.get());
+            if (!guard.allowed) {
+                spdlog::warn("🛑 Guard Blocked Action: {}", guard.reason);
+                this->notify(writer, "BLOCKED", guard.reason);
+                internal_monologue += "\n[SYSTEM BLOCK] " + guard.reason;
+                last_error = guard.reason;
+                batch_aborted = true; 
+                continue;
+            }
+
+            // 3. Execute Tool
+            this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
+            std::string observation = safe_execute_tool(tool_name, params, session_id);
+
+            // 4. Update Plan Status
+            if (planning_engine_->is_plan_approved()) {
+                auto plan = planning_engine_->get_snapshot();
+                if (plan.current_step_idx < plan.steps.size()) {
+                    planning_engine_->mark_step_status(plan.current_step_idx, StepStatus::SUCCESS, observation);
+                }
+            }
+
+            // 5. Record Graph
+            std::string sig = tool_name; 
+            if (params.contains("path")) sig += " " + params["path"].get<std::string>();
+            last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
+            last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
+
+            // 6. Check for Errors
+            if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
+                memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name, prompt_vec);
+                last_error = observation;
+                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
+                this->notify(writer, "ERROR_CATCH", "Action failed. Halting batch.");
+                batch_aborted = true;
+            } else {
+                internal_monologue += "\n[OK] " + tool_name + " -> Success";
+            }
+
+            // 7. Final Answer
+            if (tool_name == "FINAL_ANSWER") {
+                final_output = params.value("answer", "");
+                last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});
+                if (last_error.empty()) {
+                    memory_vault_->add_success(req.prompt(), "Solved via: " + internal_monologue.substr(0, 500), prompt_vec);
+                }
+                this->notify(writer, "FINAL", final_output);
+                goto mission_complete; 
+            }
+        } 
+    } 
+
 mission_complete:
-    // 🚀 THE TELEMETRY BRIDGE: Executed ONCE per mission
+    {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        session_cursors_[session_id] = last_graph_node;
+    }
+    
+    final_output = clean_response_text(final_output);
+
     auto mission_end_time = std::chrono::steady_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(mission_end_time - mission_start_time).count();
-
+    SystemMonitor::global_llm_generation_ms.store(total_ms);
+    
     code_assistance::InteractionLog log;
-    log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    log.request_type = "AGENT";
     log.project_id = req.project_id();
     log.user_query = req.prompt();
     log.ai_response = final_output;
+    log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     log.duration_ms = total_ms;
-    log.prompt_tokens = last_gen.prompt_tokens;
-    log.completion_tokens = last_gen.completion_tokens;
-    log.total_tokens = last_gen.total_tokens;
-
-    // 1. Save to local process memory
+    log.full_prompt = last_effective_prompt + "\n\n### EXECUTION HISTORY\n" + internal_monologue;
     code_assistance::LogManager::instance().add_log(log);
 
-    // 2. Radio back to Dashboard (Port 5002)
-    nlohmann::json packet = {
-        {"timestamp", log.timestamp},
-        {"project_id", log.project_id},
-        {"user_query", log.user_query},
-        {"ai_response", log.ai_response},
-        {"duration_ms", log.duration_ms},
-        {"prompt_tokens", log.prompt_tokens},
-        {"completion_tokens", log.completion_tokens},
-        {"total_tokens", log.total_tokens}
-    };
-
-    cpr::PostAsync(cpr::Url{"http://127.0.0.1:5002/api/admin/publish_log"},
-                  cpr::Body{packet.dump()},
-                  cpr::Header{{"Content-Type", "application/json"}});
-
-    spdlog::info("✅ Mission Logged. Fuel consumed: {} tokens.", log.total_tokens);
+    graph->save();
     return final_output;
 }
 
@@ -263,12 +655,57 @@ std::string AgentExecutor::run_autonomous_loop_internal(const nlohmann::json& bo
     ::code_assistance::UserQuery fake_req;
     fake_req.set_prompt(body.value("prompt", ""));
     fake_req.set_project_id(body.value("project_id", "default"));
+    std::string sid = body.value("session_id", "REST_SESSION");
+    fake_req.set_session_id(sid);
     return this->run_autonomous_loop(fake_req, nullptr); 
 }
 
-bool AgentExecutor::check_reflection(const std::string& query, const std::string& topo, std::string& reason) {
-    reason = "Bypass for testing.";
-    return true; 
+std::string AgentExecutor::safe_execute_tool(
+    const std::string& tool_name, 
+    const nlohmann::json& params, 
+    const std::string& session_id
+) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    std::string result;
+    bool failed = false;
+
+    spdlog::info("🛠️ [TOOL START] {} | Params: {}", tool_name, params.dump());
+    
+    try {
+        result = tool_registry_->dispatch(tool_name, params);
+        if (result.find("ERROR:") == 0) {
+            failed = true;
+            spdlog::warn("⚠️ [TOOL FAIL] {} | Reason: {}", tool_name, result);
+        } else {
+            spdlog::info("✅ [TOOL OK] {} | Output Size: {} chars", tool_name, result.size());
+        }
+    } catch (const std::exception& e) {
+        failed = true;
+        result = "SYSTEM EXCEPTION: " + std::string(e.what());
+        spdlog::error("💥 [TOOL CRASH] {} | Exception: {}", tool_name, e.what());
+    } catch (...) {
+        failed = true;
+        result = "SYSTEM EXCEPTION: Unknown Critical Failure";
+        spdlog::critical("💥 [TOOL CRASH] {} | Unknown Signal", tool_name);
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double duration = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+
+    std::string state = failed ? "ERROR_CATCH" : "TOOL_EXEC";
+    code_assistance::LogManager::instance().add_trace({
+        session_id, 
+        "", 
+        state, 
+        (failed ? "FAILED: " : "SUCCESS: ") + tool_name + " -> " + result.substr(0, 100), 
+        duration
+    });
+
+    return result;
 }
+
+void AgentExecutor::determineContextStrategy(const std::string& query, ContextSnapshot& ctx, const std::string& project_id) {}
+bool AgentExecutor::check_reflection(const std::string& query, const std::string& topo, std::string& reason) { return true; }
+std::string AgentExecutor::construct_reasoning_prompt(const std::string& task, const std::string& history, const std::string& last_error) { return ""; }
 
 } // namespace code_assistance

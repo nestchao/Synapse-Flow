@@ -36,6 +36,9 @@ struct TelemetryData {
     int output_token_count = 0;     
     double tokens_per_second = 0.0; 
     int graph_nodes_scanned = 0; 
+
+    double last_sync_duration_ms = 0.0; 
+    double cache_size_mb = 0.0; 
 };
 
 class SystemMonitor {
@@ -46,6 +49,8 @@ public:
     inline static std::atomic<double> global_llm_generation_ms{0.0}; 
     inline static std::atomic<int> global_output_tokens{0};          
     inline static std::atomic<int> global_graph_nodes_scanned{0};
+    inline static std::atomic<double> global_sync_latency_ms{0.0};
+    inline static std::atomic<double> global_cache_size_mb{0.0};
 
     SystemMonitor() : stop_thread_(false) {
 #ifdef _WIN32
@@ -152,6 +157,8 @@ private:
             snapshot.llm_generation_ms = global_llm_generation_ms.load();
             snapshot.output_token_count = global_output_tokens.load();
             snapshot.graph_nodes_scanned = global_graph_nodes_scanned.load();
+            snapshot.last_sync_duration_ms = global_sync_latency_ms.load();
+            snapshot.cache_size_mb = global_cache_size_mb.load();
 
             if (snapshot.llm_generation_ms > 0) {
                 snapshot.tokens_per_second = (snapshot.output_token_count / snapshot.llm_generation_ms) * 1000.0;

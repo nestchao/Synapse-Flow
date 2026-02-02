@@ -1,6 +1,6 @@
 {
   "name": "code-minds-backend",
-  "version": "0.1.0",
+  "version": "2.1.0",
   "dependencies": [
     "grpc",
     "protobuf",
@@ -8,6 +8,7 @@
     "spdlog",
     "cpr",
     "faiss",
-    "tree-sitter"
+    "tree-sitter",
+    "cpp-httplib"
   ]
 }

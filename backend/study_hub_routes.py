@@ -943,3 +943,38 @@ def set_bridge_model():
             return jsonify({"success": False, "error": str(success)}), 500
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+@study_hub_bp.route('/bridge/generate', methods=['POST'])
+def bridge_generate():
+    data = request.json
+    prompt = data.get('prompt')
+    
+    if not prompt: return jsonify({"error": "No prompt provided"}), 400
+
+    print(f"🌉 [Bridge] Offloading request from C++ (Length: {len(prompt)})")
+
+    try:
+        browser_bridge.start()
+        
+        # We don't force reset here anymore to keep it fast, 
+        # the browser_bridge internal logic handles navigation if needed.
+        
+        response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
+        
+        # 🚀 FIX: Detect Browser Errors
+        if not response_text or response_text.startswith("Browser Error") or response_text.startswith("Error:"):
+            print(f"❌ [Bridge] Failed: {response_text}")
+            # Return 500 so C++ switches to API
+            return jsonify({"success": False, "error": response_text}), 500
+
+        print(f"   [Bridge] Success (Length: {len(response_text)})")
+        
+        return jsonify({
+            "success": True,
+            "text": response_text,
+            "estimated_tokens": len(response_text) // 4
+        })
+
+    except Exception as e:
+        print(f"❌ [Bridge] Exception: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500

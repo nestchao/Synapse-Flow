@@ -55,3 +55,4 @@ backend_cpp\test\venv\
 documentation\
 
 clear; cd D:\Projects\ali_study_assistance\Synapse-Flow; .\launch.ps1
+clear; cd D:\Projects\ali_study_assistance\Synapse-Flow\backend_cpp\test; venv\Scripts\activate; clear;

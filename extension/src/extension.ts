@@ -42,7 +42,14 @@ export async function activate(context: vscode.ExtensionContext) {
         // Guard 1: Don't sync if no project is loaded
         if (!currentProjectId) return;
 
-        // Guard 2: Don't sync the AI's own context files or ignored types
+        // 🚀 FIX: INSTANTLY REJECT INTERNAL STORAGE FILES
+        if (document.fileName.includes('.study_assistant') || 
+            document.fileName.includes('.codeminds') ||
+            document.fileName.includes('converted_files')) {
+            return;
+        }
+
+        // Guard 2: Don't sync ignored types
         const ext = path.extname(document.fileName).toLowerCase();
         if (ext === '.txt' || ext === '.json' || document.uri.scheme !== 'file') return;
 
@@ -117,23 +124,27 @@ export async function activate(context: vscode.ExtensionContext) {
             const workspacePath = workspaceFolders[0].uri.fsPath;
             const workspaceUri = workspaceFolders[0].uri;
 
-            // --- Read from Settings ---
             const config = vscode.workspace.getConfiguration('studyAssistant', workspaceUri);
             
-            // Debug: Print to "Extension Host" console
-            console.log('Raw Config:', {
-                ext: config.get('allowedExtensions'),
-                ign: config.get('ignoredPaths'),
-                inc: config.get('includedPaths')
-            });
+            // 1. Get Raw Config
+            let extensionsStr = config.get<string>('allowedExtensions');
+            let ignoredStr = config.get<string>('ignoredPaths');
+            
+            // 2. 🚀 SAFETY FALLBACKS: If empty, use defaults
+            if (!extensionsStr || extensionsStr.trim().length === 0) {
+                extensionsStr = 'java,json,xml,py,ts,js,cpp,h,md,txt'; // Added java/json for your project
+                console.log("⚠️ Config empty. Using Default Extensions:", extensionsStr);
+            }
+            
+            if (!ignoredStr || ignoredStr.trim().length === 0) {
+                ignoredStr = 'node_modules, .git, dist, build, .vscode, bin, obj, .idea, .study_assistant';
+            }
 
-            const extensionsStr = config.get<string>('allowedExtensions', 'ts');
-            const ignoredStr = config.get<string>('ignoredPaths', 'node_modules');
             const includedStr = config.get<string>('includedPaths', '');
 
-            // 2. Robust Parsing & Normalization
+            // 3. Robust Parser
             const parseList = (str: string) => 
-                (str || '').split(/[,\n]+/) // Handle null/undefined safely
+                (str || '').split(/[,\n]+/) 
                 .map(e => e.trim().replace(/\\/g, '/')) 
                 .filter(e => e.length > 0);
 
@@ -141,18 +152,17 @@ export async function activate(context: vscode.ExtensionContext) {
             const ignoredPaths = parseList(ignoredStr);
             const includedPaths = parseList(includedStr);
             
-            // Manually force defaults if empty (Fallback)
-            if (ignoredPaths.length === 0) {
-                ignoredPaths.push('node_modules', '.git', 'dist', 'build');
-            }
+            console.log('📤 Sending Config to Brain:', { 
+                id: currentProjectId, 
+                ext: extensions, 
+                ign: ignoredPaths 
+            });
 
-            console.log('Sending Registration Config:', { extensions, ignoredPaths, includedPaths });
-
-            // --- MISSING PART RESTORED BELOW ---
             const showNotification = !options?.silent;
 
             const task = async () => {
                 try {
+                    // 4. Register
                     await backendClient.registerCodeProject(
                         currentProjectId!, 
                         workspacePath,
@@ -161,11 +171,17 @@ export async function activate(context: vscode.ExtensionContext) {
                         includedPaths
                     );
                     
-                    // Auto-trigger sync after registration
-                    await backendClient.syncCodeProject(currentProjectId!, workspacePath);
-
+                    // 5. Trigger Immediate Sync
+                    const result = await backendClient.syncCodeProject(currentProjectId!, workspacePath);
+                    
                     if (showNotification) {
-                        vscode.window.showInformationMessage(`✅ Project Configured & Synced!`);
+                        // Check result structure (C++ backend returns {nodes: [...]})
+                        const count = result.nodes ? result.nodes.length : 0;
+                        if (count === 0) {
+                            vscode.window.showWarningMessage(`⚠️ Sync ran but found 0 files. Check "Sync Config" extensions.`);
+                        } else {
+                            vscode.window.showInformationMessage(`✅ Synced! Brain indexed ${count} files.`);
+                        }
                     }
                 } catch (error: any) {
                     vscode.window.showErrorMessage(`Failed: ${error.message}`);
@@ -175,7 +191,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (showNotification) {
                 await vscode.window.withProgress({
                     location: vscode.ProgressLocation.Notification,
-                    title: 'Registering & Syncing...',
+                    title: 'Syncing Project Memory...',
                     cancellable: false
                 }, task);
             } else {

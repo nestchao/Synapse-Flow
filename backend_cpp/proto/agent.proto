@@ -14,12 +14,11 @@ message UserQuery {
 }
 
 message AgentResponse {
-  string phase = 1; // "retrieving", "compressing", "reasoning", "final"
+  string phase = 1;
   string payload = 2;
   repeated string citations = 3;
 }
 
-// 🚀 ADDED: Definitions required by the Service
 message FileUpdate {
   string project_id = 1;
   string file_path = 2;
