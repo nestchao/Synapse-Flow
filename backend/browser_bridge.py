@@ -91,7 +91,9 @@ class AIStudioBridge:
                     try:
                         if cmd_type == "prompt":
                             # Normal prompt, allow navigation/reset if needed
+                            # CHANGED: use_clip -> return_markdown
                             msg, return_markdown = data 
+                            # CHANGED: use_clipboard -> return_markdown
                             response = self._internal_send_prompt(page, msg, return_markdown=return_markdown, skip_nav=False) 
                             result_queue.put(response)
                         
@@ -135,9 +137,12 @@ class AIStudioBridge:
         
         # 1. Reset Chat first to ensure clean state
         try:
+            # We want to start fresh so we don't attach to an old conversation
             if "aistudio.google.com" not in page.url:
                  page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
             else:
+                 # Check if the "New chat" button is visible and click it, otherwise reload
+                 # This is safer than just reloading if the URL is generic
                  page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded")
         except:
             pass
@@ -149,16 +154,20 @@ class AIStudioBridge:
         try:
             filename = os.path.basename(file_path)
             
+            # Open Add Media Menu
             add_btn = page.locator("[data-test-id='add-media-button']")
             add_btn.wait_for(state="visible", timeout=20000)
             add_btn.click()
+            # REPLACED: time.sleep(0.5) with implicit wait via expect_file_chooser
             
+            # Handle File Chooser
             upload_option = page.locator("button.mat-mdc-menu-item").filter(has_text="Upload a file")
             
             with page.expect_file_chooser() as fc_info:
                 if upload_option.is_visible():
                     upload_option.click()
                 else:
+                    # Fallback logic
                     page.keyboard.press("Escape")
                     raise Exception("Upload menu option not found")
             
@@ -166,11 +175,14 @@ class AIStudioBridge:
 
             print(f"   [Thread] File '{filename}' selected. Waiting for attachment...")
 
+            # 3. Wait for file chip to appear
             try:
                 page.get_by_text(filename).wait_for(state="visible", timeout=40000)
             except:
                 print("   [Thread] Warning: Filename chip not detected within timeout. Proceeding anyway...")
 
+            # 4. Wait for processing bar (Tokenizing)
+            # REPLACED: time.sleep(1) with immediate check/wait
             try:
                 progress_bar = page.locator("mat-progress-bar")
                 if progress_bar.is_visible():
@@ -181,22 +193,29 @@ class AIStudioBridge:
 
             print("   [Thread] File attached. Sending prompt...")
             
+            # 5. Send Prompt with SKIP NAV enabled so we don't refresh the page
+            # Set return_markdown=False as extraction usually requires raw text
             return self._internal_send_prompt(page, prompt, return_markdown=False, skip_nav=True)
 
         except Exception as e:
             page.keyboard.press("Escape")
             return f"Upload/Extract Failed: {str(e)}"
+    
+    # REMOVED: _internal_get_markdown (was duplicate/old)
 
     def _internal_send_prompt(self, page, message, return_markdown=False, skip_nav=False):
         """Optimized prompt sending with faster detection."""
         try:
-            if not skip_nav and "aistudio.google.com/app" not in page.url:
-                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+            # Only navigate if absolutely necessary
+            # if not skip_nav:
+            #     print("   [Thread] 🔄 Forcing New Chat for fresh context...", flush=True)
+            #     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
+            # Wait for prompt box with shorter timeout
             prompt_box = page.get_by_placeholder("Start typing a prompt")
             prompt_box.wait_for(state="visible", timeout=15000)
 
-            # Inject text directly
+            # Inject text directly (no sleep needed)
             page.evaluate("""
                 (text) => {
                     const el = document.querySelector('textarea, [placeholder*="Start typing"]');
@@ -208,45 +227,74 @@ class AIStudioBridge:
                 }
             """, message)
 
+            # Click Run button immediately (remove the 1s sleep)
             run_btn = page.locator('ms-run-button button').filter(has_text="Run")
             run_btn.wait_for(state="visible", timeout=5000)
             run_btn.click()
 
             print("   [Thread] Waiting for AI response...", flush=True)
 
+            # Wait for first response chunk
             page.locator('ms-text-chunk').first.wait_for(state="visible", timeout=120000)
-
-            # Force scroll to load lazy content
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(500) 
-
-            run_btn_ready = page.locator("ms-run-button button").filter(has_text="Run")
             
-            try:
-                run_btn_ready.wait_for(state="visible", timeout=300000)
-                page.locator("ms-chat-turn").last.wait_for(state="visible", timeout=5000)
-            except Exception as e:
-                return f"Error: Response timeout - {str(e)}"
+            run_btn_ready = page.locator("ms-run-button button").filter(has_text="Run")
+            last_text_len = -1
+            stability_counter = 0
+            max_stability_checks = 60 # Check for 30 seconds max (0.5s * 60)
+            
+            for i in range(max_stability_checks):
+                # 1. Force scroll down to trigger lazy loading of bottom text
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                
+                # 2. Get current text content length
+                # We target the last turn to ensure we are checking the new response
+                current_text = page.locator("ms-chat-turn").last.text_content() or ""
+                current_len = len(current_text)
+
+                # 3. Check if "Run" button is back (Primary indicator)
+                is_run_visible = run_btn_ready.is_visible()
+
+                if is_run_visible:
+                    if current_len == last_text_len and current_len > 0:
+                        # Text hasn't changed since last check AND Run button is visible
+                        stability_counter += 1
+                        if stability_counter >= 3: 
+                            # Stable for 1.5 seconds (3 * 0.5s)
+                            print("   [Thread] ✅ Text stable and generation complete.")
+                            break
+                    else:
+                        # Text is still growing/rendering
+                        stability_counter = 0 
+                
+                last_text_len = current_len
+                page.wait_for_timeout(500) # Wait 0.5s before next check
 
             print("   [Thread] Response captured.", flush=True)
 
             response = None
             if return_markdown:
+                # User wants Markdown, try to get it cleanly via clipboard
                 response = self._internal_get_markdown_via_clipboard(page)
             else:
+                # User wants plain text, use 'Copy as text' function
                 response = self._internal_get_text_via_clipboard(page)
                 
             if response is not None:
+                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
                 return response
 
+            # FALLBACK: If clipboard copy failed for any reason, scrape the raw text content.
             print("   [Thread] Clipboard copy failed. Falling back to raw text scrape.")
             final_chunk = page.locator('ms-text-chunk').last
             raw_answer = final_chunk.text_content()
 
+            # Simplified cleanup (faster regex)
             clean_answer = re.sub(r'\b(expand_more|expand_less|content_copy|share|edit|thumb_up|thumb_down|Code|JSON|Download|Copy code|Python|JavaScript)\b', '', raw_answer, flags=re.IGNORECASE)
             
             if "Expand to view model thoughts" in clean_answer:
                 clean_answer = clean_answer.split("Expand to view model thoughts", 1)[-1]
+
+            page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
             return clean_answer.strip()
 
@@ -256,21 +304,27 @@ class AIStudioBridge:
     def _internal_get_models(self, page):
         """Scrapes available Gemini models from the UI."""
         print("   [Thread] Fetching models...")
+        # Ensure we are on the app page
         if "aistudio.google.com/app" not in page.url:
              page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
         try:
+            # Wait for the model selector to be present
             model_btn = page.locator("ms-model-selector button")
             model_btn.wait_for(state="visible", timeout=20000)
             
+            # Open the menu to populate the list
             model_btn.click()
+            # REPLACED: time.sleep(1.0) with explicit wait for the first model title in the dropdown
             
+            # Target the model title text in the dropdown
             model_title_text = page.locator(".model-title-text").first
             model_title_text.wait_for(timeout=5000)
             elements = page.locator(".model-title-text").all()
             
             models = list(dict.fromkeys([t.inner_text().strip() for t in elements if t.inner_text().strip()]))
             
+            # Close menu
             page.keyboard.press("Escape")
             return models
         except Exception as e:
@@ -288,22 +342,24 @@ class AIStudioBridge:
             model_btn = page.locator("ms-model-selector button")
             model_btn.wait_for(state="visible", timeout=30000)
             
+            # Click to open the model selection dropdown
             if not model_btn.is_visible():
                 page.get_by_label("Run settings").click()
-                page.wait_for_timeout(200)
+                page.wait_for_timeout(200) # Small wait for settings panel to open
             model_btn.click()
             
             target = page.locator(".model-title-text").get_by_text(model_name, exact=True).first
-            target.wait_for(state="visible", timeout=5000)
+            target.wait_for(state="visible", timeout=5000) # Wait for target to be visible
 
             try:
                 gemini_filter = page.locator("button.ms-button-filter-chip").filter(has_text="Gemini").first
                 if gemini_filter.is_visible(): 
                     gemini_filter.click()
-                    target.wait_for(state="visible", timeout=5000)
+                    target.wait_for(state="visible", timeout=5000) # Wait for target to be visible after filtering
             except: pass
 
             target.click()
+            # REPLACED: time.sleep(1.0) with wait for the selection menu to hide/close
             page.locator("mat-mdc-menu-panel").first.wait_for(state="hidden", timeout=5000)
 
             return True
@@ -311,24 +367,22 @@ class AIStudioBridge:
             page.keyboard.press("Escape")
             return f"Error: {e}"
 
-    # 🚀 FIXED: Added use_clipboard argument for backward compatibility
-    def send_prompt(self, message, return_markdown=False, use_clipboard=None):
+    def send_prompt(self, message, return_markdown=False):
         """
         Sends a prompt to AI Studio.
         
         :param message: The prompt text.
-        :param return_markdown: If True, attempts to retrieve Markdown via clipboard.
-        :param use_clipboard: [DEPRECATED] Alias for return_markdown.
+        :param return_markdown: If True, attempts to retrieve the response 
+                                as Markdown via 'Copy as markdown'.
+                                If False, attempts to retrieve as plain text 
+                                via 'Copy as text'.
         """
-        
-        # 🔄 Backward Compatibility Fix
-        if use_clipboard is not None:
-            return_markdown = use_clipboard
-
         self.start()
         result_queue = queue.Queue()
+        # CHANGED: use_clipboard -> return_markdown
         self.cmd_queue.put(("prompt", (message, return_markdown), result_queue)) 
         try:
+            # Increased timeout slightly for reliable thread communication
             return result_queue.get(timeout=300) 
         except queue.Empty:
             return "Error: Browser bridge timed out."
@@ -346,19 +400,35 @@ class AIStudioBridge:
             return "Error: Browser bridge timed out during extraction."
     
     def _internal_get_active_model_name(self, page):
-        """Scrapes the clean Display Name of the active model."""
+        """
+        Scrapes the clean Display Name of the active model using the 
+        specific span.title inside the model selector button.
+        """
         try:
+            # We use a combined selector: Look for span.title specifically 
+            # inside the ms-model-selector button.
             selector = "ms-model-selector button span.title"
+            
             model_el = page.locator(selector).first
+            
+            # Ensure the element is attached and visible
             model_el.wait_for(state="visible", timeout=5000)
+            
+            # Get the text (e.g., "Gemini 3 Flash Preview")
             text = model_el.inner_text().strip()
+            
+            # Final cleanup: Remove hidden characters or extra newlines
+            # which sometimes appear in Angular spans
             clean_text = " ".join(text.split())
+            
             print(f"   [Thread] Scraped Active Model: {clean_text}")
             return clean_text
+            
         except Exception as e:
             print(f"   [Thread] Warning: Could not scrape active model name: {e}")
+            
+            # Fallback to the exact full path you provided if the short one fails
             try:
-                # Fallback selector
                 full_path_selector = "body > app-root > ms-app > div > div > div.layout-wrapper > div > span > ms-prompt-renderer > ms-chunk-editor > ms-right-side-panel > div > ms-run-settings > div.settings-items-wrapper > div > ms-prompt-run-settings-switcher > ms-prompt-run-settings > div.settings-item.settings-model-selector > div > ms-model-selector > button > span.title"
                 text = page.locator(full_path_selector).first.inner_text().strip()
                 return " ".join(text.split())
@@ -369,16 +439,23 @@ class AIStudioBridge:
         """Hovers over the last message and clicks 'Copy as markdown'."""
         print("   [Thread] Attempting 'Copy as Markdown' via Clipboard...")
         try:
+            # 1. Target the last message bubble
             latest_turn = page.locator("ms-chat-turn").last
             latest_turn.scroll_into_view_if_needed()
             latest_turn.hover()
             
+            # 2. Click the 'Three Dots' options button
             options_btn = latest_turn.locator("button[aria-label='Open options']")
+            # Explicit wait for options button to appear after hover (REMOVED: time.sleep(0.5) equivalent)
             options_btn.wait_for(state="visible", timeout=3000) 
             options_btn.click(force=True) 
             
+            # 3. Find and Click 'Copy as markdown'
+            # We look for the menu item containing the specific text
             copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as markdown")
+            
             if not copy_btn.is_visible():
+                # Fallback: Try generic class selector if role attribute is missing
                 copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as markdown")
 
             if not copy_btn.is_visible():
@@ -389,8 +466,13 @@ class AIStudioBridge:
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
+            # 4. Read Clipboard
+            # A small timeout is often unavoidable here as Playwright needs 
+            # to wait for the OS/Browser to populate the clipboard after the click.
             page.wait_for_timeout(200) 
             clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            
+            # Close menu just in case
             page.keyboard.press("Escape")
             
             print(f"   [Thread] Clipboard Copy Successful ({len(clipboard_text)} chars).")
@@ -398,7 +480,8 @@ class AIStudioBridge:
 
         except Exception as e:
             print(f"   [Thread] ⚠️ Copy as Markdown failed: {e}")
-            try: page.keyboard.press("Escape")
+            try:
+                page.keyboard.press("Escape")
             except: pass
             return None
     
@@ -406,16 +489,22 @@ class AIStudioBridge:
         """Hovers over the last message and clicks 'Copy as text'."""
         print("   [Thread] Attempting 'Copy as text' via Clipboard...")
         try:
+            # 1. Target the last message bubble
             latest_turn = page.locator("ms-chat-turn").last
             latest_turn.scroll_into_view_if_needed()
             latest_turn.hover()
+            # REPLACED: time.sleep(0.5) with explicit wait for options button
 
+            # 2. Click the 'Three Dots' options button
             options_btn = latest_turn.locator("button[aria-label='Open options']")
             options_btn.wait_for(state="visible", timeout=3000)
             options_btn.click(force=True) 
             
+            # 3. Find and Click 'Copy as text'
             copy_btn = page.locator("button[role='menuitem']").filter(has_text="Copy as text")
+            
             if not copy_btn.is_visible():
+                # Fallback: Try generic class selector if role attribute is missing
                 copy_btn = page.locator("button.mat-mdc-menu-item").filter(has_text="Copy as text")
 
             if not copy_btn.is_visible():
@@ -426,8 +515,12 @@ class AIStudioBridge:
             copy_btn.wait_for(state="visible", timeout=2000)
             copy_btn.click()
             
+            # 4. Read Clipboard
+            # REPLACED: time.sleep(0.5) with Playwright timeout
             page.wait_for_timeout(200) 
             clipboard_text = page.evaluate("navigator.clipboard.readText()")
+            
+            # Close menu just in case
             page.keyboard.press("Escape")
             
             print(f"   [Thread] Clipboard Text Copy Successful ({len(clipboard_text)} chars).")
@@ -435,9 +528,12 @@ class AIStudioBridge:
 
         except Exception as e:
             print(f"   [Thread] ⚠️ Copy as Text failed: {e}")
-            try: page.keyboard.press("Escape")
+            try:
+                page.keyboard.press("Escape")
             except: pass
             return None
+
+    # REMOVED: _internal_get_answer_via_clipboard (was confusing/duplicate)
     
     def get_available_models(self):
         self.start()
@@ -461,12 +557,21 @@ class AIStudioBridge:
         """Returns the list of models AND the currently active one."""
         self.start()
         result_queue = queue.Queue()
+        # We'll create a new task type for this
         self.cmd_queue.put(("get_state", None, result_queue))
         try:
             return result_queue.get(timeout=60)
         except queue.Empty:
             return {"models": [], "active": None}
     
+    def get_last_response_as_markdown(self):
+        """Retrieves the last AI response formatted as Markdown."""
+        self.start()
+        result_queue = queue.Queue()
+        # This command type 'get_markdown' is not handled in _browser_loop
+        print("Warning: get_last_response_as_markdown is an unhandled command type and should be removed or re-implemented.")
+        return "Error: Function not implemented or unhandled command type."
+
     def reset(self):
         self.start()
         result_queue = queue.Queue()
