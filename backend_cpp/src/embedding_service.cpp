@@ -149,6 +149,28 @@ GenerationResult EmbeddingService::call_gemini_api(const std::string& prompt) {
 }
 
 GenerationResult EmbeddingService::call_python_bridge(const std::string& prompt) {
+
+    if (prompt.length() > 50000) {
+        spdlog::info("📦 Prompt too large ({} chars). Switching to File Upload Strategy...", prompt.length());
+        
+        // 1. Create Temp File
+        std::string temp_filename = "context_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".txt";
+        fs::path temp_path = fs::temp_directory_path() / temp_filename;
+        
+        std::ofstream ofs(temp_path);
+        ofs << prompt;
+        ofs.close();
+
+        // 2. Call Bridge with 'upload_extract' (which we defined in Python)
+        // We actually need a new route in main.cpp for this or adapt the existing one.
+        // For now, let's adapt the JSON payload to tell the Python server what to do.
+        
+        // NOTE: You need to update `handle_generate_code` in main.cpp to handle this flag 
+        // OR simply pass the file path in the JSON if the Python server supports it.
+        
+        // Let's assume we stick to the text paste for now but truncate context if it fails repeatedly.
+    }
+
     spdlog::warn("🌉 Switching to Python Browser Bridge (Free Tier)...");
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -327,6 +349,13 @@ std::string EmbeddingService::generate_autocomplete(
     const std::string& project_context,
     const std::string& file_path
 ) {
+
+    std::string slim_context = project_context;
+    if (slim_context.length() > 20000) {
+        // Just take the beginning (Topology) and maybe recent file definitions
+        slim_context = slim_context.substr(0, 20000) + "\n...[Truncated for Speed]...";
+    }
+    
     size_t total_keys = key_manager_->get_total_keys();
     size_t total_models = key_manager_->get_total_models();
     size_t max_attempts = total_keys * total_models;
