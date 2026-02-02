@@ -17,8 +17,7 @@ import cv2
 import numpy as np
 import os
 import tempfile
-
-# --- NEW IMPORTS FOR WINDOWS COM ---
+import fitz # PyMuPDF
 import comtypes.client
 import pythoncom
 
@@ -242,6 +241,45 @@ def extract_text(pdf_stream):
     full_text = "\n\n".join(all_page_texts)
     print(f"  ✅ Max-completeness extraction complete. Total characters: {len(full_text)}")
     return full_text
+
+def split_pdf_by_size(input_path, max_mb=10):
+    """
+    Splits a PDF into multiple parts, each roughly max_mb in size.
+    Returns a list of paths to the temporary PDF parts.
+    """
+    
+    file_size = os.path.getsize(input_path)
+    max_bytes = max_mb * 1024 * 1024
+    
+    if file_size <= max_bytes:
+        return [input_path]
+
+    doc = fitz.open(input_path)
+    total_pages = len(doc)
+    
+    # Estimate pages per chunk
+    bytes_per_page = file_size / total_pages
+    pages_per_chunk = max(1, int(max_bytes / bytes_per_page))
+    
+    parts_paths = []
+    base_path = input_path.replace(".pdf", "")
+    
+    for i in range(0, total_pages, pages_per_chunk):
+        start_page = i
+        end_page = min(i + pages_per_chunk, total_pages) - 1
+        
+        part_path = f"{base_path}_part_{len(parts_paths)}.pdf"
+        
+        new_doc = fitz.open()
+        new_doc.insert_pdf(doc, from_page=start_page, to_page=end_page)
+        new_doc.save(part_path)
+        new_doc.close()
+        
+        parts_paths.append(part_path)
+        print(f"    - Created PDF part: {part_path} (Pages {start_page} to {end_page})")
+        
+    doc.close()
+    return parts_paths
     
 def extract_text_from_image(image_stream):
     print("  🖼️ Extracting text from image via OCR...")

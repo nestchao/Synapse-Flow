@@ -15,6 +15,7 @@ import redis
 from google.genai import types 
 import os
 import tempfile
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- FROM CONFIG ---
 from config import (
@@ -81,79 +82,195 @@ def get_original_text(project_id, source_id):
 def generate_note(text):
     """Generates a simplified study note using the Browser Bridge (Direct)."""
     print("  🤖 Generating AI study note via Browser Bridge...")
-    prompt = f"""
-    You are given a raw study note.
 
-    Your task is to rewrite it into a simpler and clearer version for students, WITHOUT removing, skipping, summarizing away, or merging any information from the original note.
+    CHUNK_SIZE = 25000 
+    CHUNK_OVERLAP = 1000
 
-    ⚠️ ABSOLUTE RULE (Very Important):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
 
-    - Every sentence, explanation, example, and detail in the raw note MUST appear in the output.
-
-    - You may reword sentences using simpler words, but you are NOT allowed to delete or shorten ideas.
-
-    - If something exists in the raw note, it must also exist in the final note.
-
-    📝 CRITICAL OUTPUT RULE (The "Wrapper"):
-    1. Headings:
-        - Use # for main titles
-        - Use ## for sections
+    chunks = text_splitter.split_text(text)
+    print(f"  📄 Split text into {len(chunks)} chunks (Size ~{CHUNK_SIZE/1000}k chars).")
     
-    2. Bold Keywords:
-        - You MUST bold (**text**) all key terms, definitions, and important concepts
+    full_html = ""
 
-    3. Dividers:
-        - Insert a horizontal rule (---) between every major section
+    browser_bridge.start()
 
-    4. Lists:
-        - Use bullet points (*)
+    for i, chunk in enumerate(chunks):
+        print(f"    Processing Note Chunk {i+1}/{len(chunks)}...")
 
-    ✏️ Content Rules:
+        # Reset bridge for each chunk to ensure clean context and avoid token limits
+        browser_bridge.reset() 
 
-    1. Do NOT skip any point or explanation from the original note.
+        prompt = f"""
+        You are given a raw study note (Part {i+1} of {len(chunks)}).
 
-    2. Shorten the sentence, and change unfamiliar word to more common words, but do not skip any points or explanations.
+        Your task is to rewrite it into a simpler and clearer version for students, WITHOUT removing, skipping, summarizing away, or merging any information from the original note.
 
-    3. The output language must be the same as the source note (do not translate the whole note).
+        CONTEXT INFO: 
+        - This text is part of a larger document.
+        - It includes overlapping text from the previous/next parts to ensure you have context.
+        - If you see a Header (e.g., "Chapter 1") at the very start that seems to repeat what you just finished, include it anyway (we will merge it later).
+        - If the text starts mid-sentence, just continue the thought naturally.
 
-    4. For any unfamiliar word, add a Chinese explanation (中文解释) right after it in brackets.
+        ⚠️ ABSOLUTE RULE (Very Important):
 
-    5. Add some emojis to make the note friendly (do not overuse).
+        - Every sentence, explanation, example, and detail in the raw note MUST appear in the output.
 
-    6. After each section, add a Mnemonic Tip to help students remember.
+        - You may reword sentences using simpler words, but you are NOT allowed to delete or shorten ideas.
 
-    🎯 Goal:
+        - If something exists in the raw note, it must also exist in the final note.
 
-    Make the note shorter, clearer, and student-friendly, while keeping 100% of the original information.
-
-    If yes, generate the simplified note for the text below:
-
-    {text} 
-    """
-    try:
-        # --- DIRECT BROWSER BRIDGE USAGE ---
-        # Ensure bridge thread is running
-        browser_bridge.start()
+        📝 CRITICAL OUTPUT RULE (The "Wrapper"):
+        1. Headings:
+            - Use # for main titles
+            - Use ## for sections
         
-        response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
-        print("  ✅ Browser Bridge response received.")
-        clean_text = response_text.strip()
-        
-        # Remove Markdown fences if present
-        if clean_text.startswith("```markdown"):
-            clean_text = clean_text.replace("```markdown", "", 1)
-        elif clean_text.startswith("```"):
-            clean_text = clean_text.replace("```", "", 1)
-        if clean_text.endswith("```"):
-            clean_text = clean_text[:-3]
+        2. Bold Keywords:
+            - You MUST bold (**text**) all key terms, definitions, and important concepts
 
-        # Fix HTML entities
-        clean_text = re.sub(r'(#include\s*)<([^>]+)>', r'\1&lt;\2&gt;', clean_text)
+        3. Dividers:
+            - Insert a horizontal rule (---) between every major section
+
+        4. Lists:
+            - Use bullet points (*)
+
+        ✏️ Content Rules:
+
+        1. Do NOT skip any point or explanation from the original note.
+
+        2. Shorten the sentence, and change unfamiliar word to more common words, but do not skip any points or explanations.
+
+        3. The output language must be the same as the source note (do not translate the whole note).
+
+        4. For any unfamiliar word, add a Chinese explanation (中文解释) right after it in brackets.
+
+        5. Add some emojis to make the note friendly (do not overuse).
+
+        6. After each section, add a Mnemonic Tip to help students remember.
+
+        🎯 Goal:
+
+        Make the note shorter, clearer, and student-friendly, while keeping 100% of the original information.
+
+        If yes, generate the simplified note for the text below:
+
+        {chunk} 
+        """
         
-        return markdown.markdown(clean_text, extensions=['tables'])
-    except Exception as e:
-        print(f"  ❌ Browser Bridge Note Generation Failed: {e}")
-        raise
+        try:
+            # Use clipboard=True for large text speed
+            response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
+            
+            clean_text = response_text.strip()
+            
+            # Remove Markdown fences if present
+            if clean_text.startswith("```markdown"):
+                clean_text = clean_text.replace("```markdown", "", 1)
+            elif clean_text.startswith("```"):
+                clean_text = clean_text.replace("```", "", 1)
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+
+            # Fix HTML entities
+            clean_text = re.sub(r'(#include\s*)<([^>]+)>', r'\1&lt;\2&gt;', clean_text)
+            
+            # Convert to HTML
+            chunk_html = markdown.markdown(clean_text, extensions=['tables'])
+            
+            full_html += chunk_html
+            
+            # Add a visual separator between chunks if not the last one
+            if i < len(chunks) - 1:
+                full_html += "\n<br><hr><br>\n"
+                
+            print(f"    ✅ Chunk {i+1} completed.")
+
+        except Exception as e:
+            print(f"    ❌ Chunk {i+1} failed: {e}")
+            full_html += f"<div style='color:red; border:1px solid red; padding:10px;'><strong>Error processing part {i+1}:</strong> {e}</div>"
+
+    return full_html
+
+
+
+    # prompt = f"""
+    # You are given a raw study note.
+
+    # Your task is to rewrite it into a simpler and clearer version for students, WITHOUT removing, skipping, summarizing away, or merging any information from the original note.
+
+    # ⚠️ ABSOLUTE RULE (Very Important):
+
+    # - Every sentence, explanation, example, and detail in the raw note MUST appear in the output.
+
+    # - You may reword sentences using simpler words, but you are NOT allowed to delete or shorten ideas.
+
+    # - If something exists in the raw note, it must also exist in the final note.
+
+    # 📝 CRITICAL OUTPUT RULE (The "Wrapper"):
+    # 1. Headings:
+    #     - Use # for main titles
+    #     - Use ## for sections
+    
+    # 2. Bold Keywords:
+    #     - You MUST bold (**text**) all key terms, definitions, and important concepts
+
+    # 3. Dividers:
+    #     - Insert a horizontal rule (---) between every major section
+
+    # 4. Lists:
+    #     - Use bullet points (*)
+
+    # ✏️ Content Rules:
+
+    # 1. Do NOT skip any point or explanation from the original note.
+
+    # 2. Shorten the sentence, and change unfamiliar word to more common words, but do not skip any points or explanations.
+
+    # 3. The output language must be the same as the source note (do not translate the whole note).
+
+    # 4. For any unfamiliar word, add a Chinese explanation (中文解释) right after it in brackets.
+
+    # 5. Add some emojis to make the note friendly (do not overuse).
+
+    # 6. After each section, add a Mnemonic Tip to help students remember.
+
+    # 🎯 Goal:
+
+    # Make the note shorter, clearer, and student-friendly, while keeping 100% of the original information.
+
+    # If yes, generate the simplified note for the text below:
+
+    # {text} 
+    # """
+    # try:
+    #     # --- DIRECT BROWSER BRIDGE USAGE ---
+    #     # Ensure bridge thread is running
+    #     browser_bridge.start()
+        
+    #     response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
+    #     print("  ✅ Browser Bridge response received.")
+    #     clean_text = response_text.strip()
+        
+    #     # Remove Markdown fences if present
+    #     if clean_text.startswith("```markdown"):
+    #         clean_text = clean_text.replace("```markdown", "", 1)
+    #     elif clean_text.startswith("```"):
+    #         clean_text = clean_text.replace("```", "", 1)
+    #     if clean_text.endswith("```"):
+    #         clean_text = clean_text[:-3]
+
+    #     # Fix HTML entities
+    #     clean_text = re.sub(r'(#include\s*)<([^>]+)>', r'\1&lt;\2&gt;', clean_text)
+        
+    #     return markdown.markdown(clean_text, extensions=['tables'])
+    # except Exception as e:
+    #     print(f"  ❌ Browser Bridge Note Generation Failed: {e}")
+    #     raise
 
 def get_simplified_note_context(project_id, source_id=None):
     """Fetches and combines all simplified note pages into clean text for the chatbot."""
@@ -299,26 +416,43 @@ def upload_source(project_id):
                     print("    ✅ Conversion successful.")
                 else:
                     raise Exception("PPTX to PDF conversion failed.")
+            
+            if target_upload_path.lower().endswith('.pdf'):
+                print(f"    📏 Checking size of {filename}...")
+                from utils import split_pdf_by_size
+                # Split into 10MB parts
+                all_pdf_parts = split_pdf_by_size(target_upload_path, max_mb=10)
+            else:
+                all_pdf_parts = [target_upload_path]
 
-            # 3. Call Browser Bridge to Extract Text
-            print(f"    🤖 Sending {os.path.basename(target_upload_path)} to AI Studio for extraction...")
-            extracted_text = browser_bridge.extract_text_from_file(target_upload_path)
+            full_extracted_text = []
+            for idx, part_path in enumerate(all_pdf_parts):
+                print(f"    🤖 Sending part {idx+1}/{len(all_pdf_parts)} to AI Studio...")
+                part_text = browser_bridge.extract_text_from_file(part_path)
+                
+                if part_text and "Error:" not in part_text[:10]:
+                    full_extracted_text.append(part_text)
+                else:
+                    print(f"    ⚠️ Warning: Failed to extract part {idx}. Error: {part_text}")
 
-            if not extracted_text or "Error:" in extracted_text[:20]:
-                raise Exception(f"AI Extraction Failed: {extracted_text}")
+            combined_text = "\n\n".join(full_extracted_text)
 
-            print(f"    ✅ Text Extracted: {len(extracted_text)} characters.")
+            if not combined_text.strip():
+                raise Exception("Combined extraction resulted in no text.")
+
+
+            print(f"    ✅ Text Extracted: {len(combined_text)} characters.")
 
             # 4. Save Metadata to Firestore
             source_ref = db.collection(STUDY_PROJECTS_COLLECTION).document(project_id).collection('sources').document(safe_id)
             source_ref.set({
                 'filename': filename, 
                 'timestamp': firestore.SERVER_TIMESTAMP, 
-                'character_count': len(extracted_text)
+                'character_count': len(combined_text)
             })
             
             # 5. Save Original Text Chunks
-            text_chunks = split_chunks(extracted_text)
+            text_chunks = split_chunks(combined_text)
             for i in range(0, len(text_chunks), 100):
                 batch = text_chunks[i:i+100]
                 page_num = i // 100
@@ -329,7 +463,7 @@ def upload_source(project_id):
             
             # 6. Generate Note (Using the extracted text)
             try:
-                note_html = generate_note(extracted_text)
+                note_html = generate_note(combined_text)
                 
                 chunk_size = 900000 
                 for i in range(0, len(note_html), chunk_size):
