@@ -8,6 +8,7 @@ namespace code_assistance {
 
 class ContextManager {
     const size_t TOKEN_LIMIT = 100000;
+    const size_t SAFE_CHAR_LIMIT = 250000;
 
 public:
     std::string rank_and_prune(const ContextSnapshot& ctx) {
@@ -34,6 +35,10 @@ public:
         
         payload += std::string("### CHAT HISTORY\n") + ctx.history.substr(start_pos);
 
+        if (payload.length() > SAFE_CHAR_LIMIT) {
+            payload = payload.substr(0, SAFE_CHAR_LIMIT);
+            payload += "\n\n[SYSTEM WARNING: Context Truncated due to Browser Bridge Limits]";
+        }
         return payload;
     }
 };

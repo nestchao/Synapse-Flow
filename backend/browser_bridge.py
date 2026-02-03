@@ -207,9 +207,9 @@ class AIStudioBridge:
         """Optimized prompt sending with faster detection."""
         try:
             # Only navigate if absolutely necessary
-            # if not skip_nav:
-            #     print("   [Thread] 🔄 Forcing New Chat for fresh context...", flush=True)
-            #     page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+            if not skip_nav:
+                print("   [Thread] 🔄 Forcing New Chat for fresh context...", flush=True)
+                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
             # Wait for prompt box with shorter timeout
             prompt_box = page.get_by_placeholder("Start typing a prompt")
@@ -231,43 +231,83 @@ class AIStudioBridge:
             run_btn = page.locator('ms-run-button button').filter(has_text="Run")
             run_btn.wait_for(state="visible", timeout=5000)
             run_btn.click()
+            # self._force_scroll_bottom(page)
 
             print("   [Thread] Waiting for AI response...", flush=True)
 
             # Wait for first response chunk
-            page.locator('ms-text-chunk').first.wait_for(state="visible", timeout=120000)
+            # page.locator('ms-text-chunk').first.wait_for(state="visible", timeout=240000)
             
             run_btn_ready = page.locator("ms-run-button button").filter(has_text="Run")
-            last_text_len = -1
-            stability_counter = 0
-            max_stability_checks = 60 # Check for 30 seconds max (0.5s * 60)
             
-            for i in range(max_stability_checks):
-                # 1. Force scroll down to trigger lazy loading of bottom text
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # --- Stability Settings ---
+            last_text_len = 0
+            stability_counter = 0
+            required_stability = 4  # Wait for 4 consecutive stable checks (approx 2-4 seconds)
+            max_checks = 240        # Loop limit (approx 120 seconds max wait)
+            
+            for i in range(max_checks):
+                # --- SCROLL FIX (User Provided) ---
+                # This recursively finds the scrollable parent and forces it down
+                page.evaluate("""
+                    () => {
+                        const chunks = document.querySelectorAll('ms-text-chunk');
+                        if (chunks.length > 0) {
+                            const lastChunk = chunks[chunks.length - 1];
+                            
+                            // 1. Direct Element Scroll
+                            lastChunk.scrollIntoView({ block: 'end', behavior: 'instant' });
+                            
+                            // 2. Recursive Parent Scroll (The 'Nuclear' Option)
+                            let parent = lastChunk.parentElement;
+                            while (parent) {
+                                // If this parent is scrollable (content bigger than view)
+                                if (parent.scrollHeight > parent.clientHeight) {
+                                    parent.scrollTop = parent.scrollHeight;
+                                }
+                                parent = parent.parentElement;
+                            }
+                            
+                            // 3. Specific UI Element Fallback
+                            const editor = document.querySelector('ms-prompt-editor');
+                            if (editor) editor.scrollTop = editor.scrollHeight;
+                        }
+                    }
+                """)
                 
-                # 2. Get current text content length
-                # We target the last turn to ensure we are checking the new response
-                current_text = page.locator("ms-chat-turn").last.text_content() or ""
+                # Wait a moment for render
+                page.wait_for_timeout(500)
+
+                # Get the VERY LAST chat turn for checking length
+                # We use evaluate to ensure we get the browser's rendered state
+                current_text = page.evaluate("""
+                    () => {
+                        const turns = document.querySelectorAll('ms-chat-turn');
+                        return turns.length > 0 ? turns[turns.length - 1].innerText : "";
+                    }
+                """)
+                
                 current_len = len(current_text)
 
-                # 3. Check if "Run" button is back (Primary indicator)
+                # Check if "Run" button is visible (meaning generation likely stopped)
                 is_run_visible = run_btn_ready.is_visible()
 
-                if is_run_visible:
-                    if current_len == last_text_len and current_len > 0:
-                        # Text hasn't changed since last check AND Run button is visible
+                if is_run_visible and current_len > 0:
+                    if current_len == last_text_len:
                         stability_counter += 1
-                        if stability_counter >= 3: 
-                            # Stable for 1.5 seconds (3 * 0.5s)
+                        # print(f"   [Debug] Stability {stability_counter}/{required_stability}")
+                        
+                        if stability_counter >= required_stability:
                             print("   [Thread] ✅ Text stable and generation complete.")
                             break
                     else:
-                        # Text is still growing/rendering
+                        # Text changed (stream is still active)
                         stability_counter = 0 
-                
+                else:
+                    # Run button not visible (still generating) or text empty
+                    stability_counter = 0
+
                 last_text_len = current_len
-                page.wait_for_timeout(500) # Wait 0.5s before next check
 
             print("   [Thread] Response captured.", flush=True)
 
@@ -280,7 +320,7 @@ class AIStudioBridge:
                 response = self._internal_get_text_via_clipboard(page)
                 
             if response is not None:
-                page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+                # page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
                 return response
 
             # FALLBACK: If clipboard copy failed for any reason, scrape the raw text content.
@@ -294,7 +334,7 @@ class AIStudioBridge:
             if "Expand to view model thoughts" in clean_answer:
                 clean_answer = clean_answer.split("Expand to view model thoughts", 1)[-1]
 
-            page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
+            # page.goto("https://aistudio.google.com/app/prompts/new_chat", wait_until="domcontentloaded", timeout=60000)
 
             return clean_answer.strip()
 

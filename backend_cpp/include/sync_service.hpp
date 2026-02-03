@@ -68,6 +68,7 @@ private:
     void generate_embeddings_batch(std::vector<std::shared_ptr<CodeNode>>& nodes, int batch_size = 50);
     void generate_tree_file(const fs::path& base_dir, const std::vector<fs::path>& files, const fs::path& output_file);
     std::unordered_map<std::string, std::shared_ptr<CodeNode>> load_existing_nodes(const std::string& storage_path);
+    void update_file_context(const std::string& file_path, const std::string& content);
 };
 
 } // namespace code_assistance

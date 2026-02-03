@@ -64,7 +64,6 @@ nlohmann::json extract_json(const std::string& raw) {
     }
 
     // 2. Scan for VALID JSON start (Lookahead Check)
-    // Prevents crashing on math like "{k=0}"
     size_t json_start = std::string::npos;
     char start_char = '\0';
     char end_char = '\0';
@@ -72,20 +71,16 @@ nlohmann::json extract_json(const std::string& raw) {
     for (size_t i = 0; i < clean.length(); ++i) {
         char c = clean[i];
         if (c == '{' || c == '[') {
-            // Check next non-space char
             for (size_t j = i + 1; j < clean.length(); ++j) {
                 char next = clean[j];
                 if (std::isspace(next)) continue;
-                
-                // Object must start with " or }
                 if (c == '{' && (next == '"' || next == '}')) {
                     json_start = i; start_char = '{'; end_char = '}'; goto found;
                 }
-                // Array must start with {, ", ], or digit
                 if (c == '[' && (next == '{' || next == '"' || next == ']' || std::isdigit(next))) {
                     json_start = i; start_char = '['; end_char = ']'; goto found;
                 }
-                break; // Invalid start char found
+                break; 
             }
         }
     }
@@ -93,7 +88,7 @@ nlohmann::json extract_json(const std::string& raw) {
 
     if (json_start == std::string::npos) return nlohmann::json::object();
 
-    // 3. Bracket Counting (Isolate the JSON string)
+    // 3. Bracket Counting
     int balance = 0;
     bool in_string = false;
     bool escape = false;
@@ -121,11 +116,9 @@ nlohmann::json extract_json(const std::string& raw) {
         ? clean.substr(json_start, json_end - json_start + 1) 
         : clean.substr(json_start);
 
-    // 4. Parse
     try {
         return nlohmann::json::parse(json_str);
     } catch (...) {
-        // Last Resort: If raw code exists, wrap it
         if (raw.find("def ") != std::string::npos) {
             nlohmann::json f; f["tool"] = "FINAL_ANSWER"; f["parameters"] = {{"answer", raw}}; return f;
         }
@@ -272,38 +265,58 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     auto skill_lib = get_skill_library(req.project_id());
     std::string business_context = skill_lib->retrieve_skills(req.prompt(), prompt_vec);
 
-    // Retrieve History
+    // 🚀 RETRIEVE & FORMAT HISTORY (DEDUPLICATED)
     if (!parent_node_id.empty()) {
         auto trace = graph->get_trace(parent_node_id);
-        int start_idx = std::max(0, (int)trace.size() - 15);
         
-        std::string last_user_content = ""; // 🛡️ Dedup Tracker
+        // Take more history to ensure we see past tool usage
+        int start_idx = std::max(0, (int)trace.size() - 25);
+        
+        std::string last_user_content = ""; 
+        std::unordered_set<std::string> content_hashes; // For deduplication
 
         for (size_t i = start_idx; i < trace.size(); ++i) {
             const auto& node = trace[i];
             
+            // Hash content for dedupe
+            std::string hash_key = node.content;
+            
             if (node.type == NodeType::PROMPT) {
-                // 🛡️ DEDUPLICATION LOGIC
-                // If this prompt is identical to the last one, skip it.
-                // This prevents the "Echo Chamber" effect.
                 if (node.content == last_user_content) continue;
-                
-                internal_monologue += "\n[USER] " + node.content;
+                internal_monologue += "\n\n👤 [USER REQUEST]\n" + node.content;
                 last_user_content = node.content;
             } 
             else if (node.type == NodeType::SYSTEM_THOUGHT) {
-                internal_monologue += "\n[THOUGHT] " + node.content;
+                // Keep thoughts short in history
+                internal_monologue += "\n💭 [THOUGHT] " + node.content;
             } 
             else if (node.type == NodeType::TOOL_CALL) {
                 std::string tname = node.metadata.count("tool") ? node.metadata.at("tool") : "tool";
-                internal_monologue += "\n[TOOL CALL] " + tname;
+                // Extract arguments from content if possible (usually content is tool name + args)
+                internal_monologue += "\n▶️ [ACTION] " + node.content;
             } 
             else if (node.type == NodeType::CONTEXT_CODE) {
-                std::string preview = node.content.length() > 100 ? node.content.substr(0, 100) + "..." : node.content;
-                internal_monologue += "\n[TOOL RESULT] " + preview;
+                // 🚀 SMART DEDUPLICATION:
+                // If we've seen this EXACT tool output before in this trace, summarise it.
+                // BUT: Always show it if it was the VERY LAST thing (i = size - 1)
+                bool is_duplicate = content_hashes.count(hash_key);
+                bool is_recent = (i >= trace.size() - 2);
+
+                internal_monologue += "\n### 🛠️ OBSERVATION (Result)\n";
+                if (is_duplicate && !is_recent) {
+                    internal_monologue += "(...Result same as previous step to save context...)\n";
+                } else {
+                    // Truncate massive outputs in history, but allow reasonably large ones
+                    if (node.content.length() > 2000 && !is_recent) {
+                        internal_monologue += "```\n" + node.content.substr(0, 2000) + "\n... (Truncated history)\n```";
+                    } else {
+                        internal_monologue += "```\n" + node.content + "\n```";
+                    }
+                    content_hashes.insert(hash_key);
+                }
             } 
             else if (node.type == NodeType::RESPONSE) {
-                internal_monologue += "\n[AI] " + node.content;
+                internal_monologue += "\n🤖 [AI REPLY] " + node.content;
             }
         }
     }
@@ -311,7 +324,6 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     // Memory Recall
     std::string memories = "";
     std::string warnings = ""; 
-    // Wrap to prevent crash on empty embeddings
     if (!prompt_vec.empty()) {
         MemoryRecallResult long_term = memory_vault_->recall(prompt_vec);
         if(long_term.has_memories) {
@@ -365,7 +377,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         if (!plan_ctx.empty()) prompt_template += plan_ctx + "\n";
 
         if (!memories.empty()) prompt_template += memories + "\n";
-        if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY\n" + internal_monologue + "\n";
+        if (!internal_monologue.empty()) prompt_template += "### EXECUTION HISTORY (Read-Only)\n" + internal_monologue + "\n";
         if (!warnings.empty()) prompt_template += warnings + "\n";
         if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
             
@@ -384,68 +396,44 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
         spdlog::info("\n==================================================");
         spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (START):");
-        // We use std::cout for raw output to ensure no formatting/truncation issues with spdlog
         std::cout << raw_thought << std::endl; 
         spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (END)");
         spdlog::info("==================================================\n");
 
-        // --- 🆕 CODE BLOCK EXTRACTION LOGIC ---
+        // Code Extraction Logic
         std::string extracted_code = "";
         std::vector<std::string> code_blocks;
-        
-        // Strategy 1: Look for standard ```python blocks
         size_t code_start = raw_thought.find("```python");
         
-        // Strategy 2: Look for generic ``` blocks if python specific missing
         if (code_start == std::string::npos) {
             code_start = raw_thought.find("```");
-            // Ensure this isn't the start of the JSON block (which often uses ```json)
-            if (code_start != std::string::npos) {
-                if (raw_thought.substr(code_start, 7) == "```json") {
-                    code_start = std::string::npos; // Ignore if it's the JSON block
-                }
+            if (code_start != std::string::npos && raw_thought.substr(code_start, 7) == "```json") {
+                code_start = std::string::npos;
             }
         }
 
-        // Strategy 3: Fallback - If no blocks found, but we see "import" or "def",
-        // grab everything before the JSON array starts.
         if (code_start == std::string::npos) {
             size_t json_start = std::string::npos;
-
-            // Scan for '[' that is actually the start of the tool list
             for (size_t i = 0; i < raw_thought.length(); ++i) {
                 if (raw_thought[i] == '[') {
-                    // Lookahead: Must be followed by '{' (ignoring whitespace)
                     for (size_t k = i + 1; k < raw_thought.length(); ++k) {
                         char next = raw_thought[k];
                         if (std::isspace(next)) continue;
-                        if (next == '{') {
-                            json_start = i;
-                            goto found_split;
-                        }
-                        break; // Found something else (like math text), ignore this bracket
+                        if (next == '{') { json_start = i; goto found_split; }
+                        break;
                     }
                 }
             }
             found_split:;
 
             if (json_start != std::string::npos && json_start > 10) {
-                // Heuristic: Check if the text before JSON looks like code
                 std::string pre_json = raw_thought.substr(0, json_start);
-                
-                // Safety: Only treat as code if we see Python keywords
                 if (pre_json.find("import ") != std::string::npos || pre_json.find("def ") != std::string::npos) {
-                    
-                    // Strip "Python" label if present
                     size_t word_py = pre_json.find("Python\n");
                     if (word_py != std::string::npos) pre_json = pre_json.substr(word_py + 7);
-                    
                     extracted_code = pre_json;
-                    
-                    // Trim trailing whitespace
                     extracted_code.erase(0, extracted_code.find_first_not_of(" \n\r\t"));
                     extracted_code.erase(extracted_code.find_last_not_of(" \n\r\t") + 1);
-                    
                     if (!extracted_code.empty()) {
                         code_blocks.push_back(extracted_code);
                         spdlog::info("⚠️ Auto-Recovered code block (Smart Split).");
@@ -454,7 +442,6 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             }
         } 
         else {
-            // Standard Extraction (Markdown found)
             size_t start = raw_thought.find('\n', code_start) + 1;
             size_t end = raw_thought.find("```", start);
             if (end != std::string::npos) {
@@ -463,22 +450,17 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             }
         }
         
-        // --- 🚀 NEW BATCH PARSING LOGIC ---
         nlohmann::json extracted = extract_json(raw_thought);
         spdlog::info("🧩 PARSED JSON RESULT:\n{}", extracted.dump(2)); 
         std::vector<nlohmann::json> actions;
 
-        // Detect if it is a single action or a batch
         if (extracted.is_array()) {
-            for (const auto& item : extracted) {
-                actions.push_back(item);
-            }
+            for (const auto& item : extracted) actions.push_back(item);
             spdlog::info("🚀 Batch Mode: Detected {} actions in one response.", actions.size());
         } else {
             actions.push_back(extracted);
         }
 
-        // EXECUTE THE BATCH LOCALLY
         bool batch_aborted = false;
 
         for (auto& action : actions) {
@@ -489,7 +471,6 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             else if (action.contains("name")) tool_name = action["name"];
             else if (action.contains("function")) tool_name = action["function"];
 
-            // Handle pure text response (no tool)
             if (tool_name.empty()) {
                 if (actions.size() == 1) {
                     final_output = last_gen.text;
@@ -501,42 +482,28 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             }
 
             nlohmann::json params;
-            if (action.contains("parameters")) {
-                params = action["parameters"];
-            } else if (action.contains("arguments")) {
-                params = action["arguments"];
-            } else if (action.contains("args")) {
-                params = action["args"];
-            } else {
-                // Handle Flattened Structure: { "tool": "edit", "path": "...", "content": "..." }
-                // Copy the whole object as params
+            if (action.contains("parameters")) params = action["parameters"];
+            else if (action.contains("arguments")) params = action["arguments"];
+            else if (action.contains("args")) params = action["args"];
+            else {
                 params = action;
-                // Remove system keys to avoid confusion, though usually harmless
                 if (params.contains("tool")) params.erase("tool");
                 if (params.contains("name")) params.erase("name");
                 if (params.contains("function")) params.erase("function");
                 if (params.contains("thought")) params.erase("thought");
             }
 
-            // 🚀 CODE INJECTION LOGIC
             if (params.contains("content")) {
                 std::string content = params["content"].get<std::string>();
-                
-                // Flexible Regex: Matches __CODE_BLOCK_0__ OR CODE_BLOCK_0
                 std::regex placeholder_re(R"((?:__|)CODE_BLOCK_(\d+)(?:__|))");
                 std::smatch m;
-                
                 if (std::regex_search(content, m, placeholder_re)) {
                     int idx = std::stoi(m[1].str());
-                    
                     if (idx >= 0 && static_cast<size_t>(idx) < code_blocks.size()) {
                         params["content"] = code_blocks[idx];
                         spdlog::info("💉 Injected Code Block {} ({} chars)", idx, code_blocks[idx].length());
-                    } else {
-                        spdlog::warn("⚠️ Code block {} not found! Available: {}", idx, code_blocks.size());
                     }
                 } 
-                // Auto-inject if only one block exists and content looks like a placeholder
                 else if (code_blocks.size() == 1 && (content.find("CODE_BLOCK") != std::string::npos || content.length() < 20)) {
                      params["content"] = code_blocks[0];
                      spdlog::info("💉 Auto-Injected Single Code Block (Fallback)");
@@ -545,16 +512,15 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
             params["project_id"] = req.project_id();
 
-            // Handle Reasoning/Thoughts
             if (action.contains("thought")) {
                 std::string reasoning = action["thought"];
                 last_graph_node = graph->add_node(reasoning, NodeType::SYSTEM_THOUGHT, last_graph_node);
+                internal_monologue += "\n💭 [THOUGHT] " + reasoning; // Update current context immediately
                 this->notify(writer, "PLANNING", reasoning);
             }
 
             params["_batch_mode"] = true; 
 
-            // 1. Propose Plan
             if (tool_name == "propose_plan") {
                 if (params.contains("steps")) {
                     planning_engine_->propose_plan(req.prompt(), params["steps"]);
@@ -572,22 +538,19 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                 }
             }
 
-            // 2. Execution Guard
             GuardResult guard = ExecutionGuard::validate_tool_call(tool_name, params, planning_engine_.get());
             if (!guard.allowed) {
                 spdlog::warn("🛑 Guard Blocked Action: {}", guard.reason);
                 this->notify(writer, "BLOCKED", guard.reason);
-                internal_monologue += "\n[SYSTEM BLOCK] " + guard.reason;
+                internal_monologue += "\n🛑 [BLOCKED] " + guard.reason;
                 last_error = guard.reason;
                 batch_aborted = true; 
                 continue;
             }
 
-            // 3. Execute Tool
             this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             std::string observation = safe_execute_tool(tool_name, params, session_id);
 
-            // 4. Update Plan Status
             if (planning_engine_->is_plan_approved()) {
                 auto plan = planning_engine_->get_snapshot();
                 if (plan.current_step_idx < plan.steps.size()) {
@@ -595,24 +558,24 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
                 }
             }
 
-            // 5. Record Graph
             std::string sig = tool_name; 
             if (params.contains("path")) sig += " " + params["path"].get<std::string>();
+            
+            // Record Graph with metadata
             last_graph_node = graph->add_node(sig, NodeType::TOOL_CALL, last_graph_node, {}, {{"tool", tool_name}});
             last_graph_node = graph->add_node(observation, NodeType::CONTEXT_CODE, last_graph_node);
 
-            // 6. Check for Errors
+            // Update local loop monologue immediately for next iterations in batch (or next step)
+            internal_monologue += "\n▶️ [ACTION] " + sig;
+            internal_monologue += "\n### 🛠️ OBSERVATION (Result)\n```\n" + observation + "\n```";
+
             if (observation.find("ERROR:") == 0 || observation.find("SYSTEM_ERROR") == 0) {
                 memory_vault_->add_failure(req.prompt(), "Tool Failed: " + tool_name, prompt_vec);
                 last_error = observation;
-                internal_monologue += "\n[FAILED] " + tool_name + " -> " + observation;
                 this->notify(writer, "ERROR_CATCH", "Action failed. Halting batch.");
                 batch_aborted = true;
-            } else {
-                internal_monologue += "\n[OK] " + tool_name + " -> Success";
             }
 
-            // 7. Final Answer
             if (tool_name == "FINAL_ANSWER") {
                 final_output = params.value("answer", "");
                 last_graph_node = graph->add_node(final_output, NodeType::RESPONSE, last_graph_node, {}, {{"status", "success"}});

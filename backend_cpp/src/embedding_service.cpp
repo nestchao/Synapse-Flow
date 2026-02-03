@@ -1,29 +1,137 @@
-// backend_cpp/src/embedding_service.cpp
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <unordered_map>
+#include <shared_mutex>
+#include <optional>
 
 #include "SystemMonitor.hpp" 
 #include "embedding_service.hpp"
 
 namespace code_assistance {
 
+namespace fs = std::filesystem; 
 using json = nlohmann::json;
 
-// 🚀 UTILITY: Shutdown-aware sleep
-// Returns false if shutdown requested, true if sleep completed
-bool smart_sleep(int milliseconds) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-    return true;
-}
+// 🚀 COMPLETION CACHE - Sub-millisecond lookups
+class CompletionCache {
+private:
+    struct CacheEntry {
+        std::string completion;
+        std::chrono::steady_clock::time_point timestamp;
+        size_t hit_count = 0;
+    };
+    
+    std::unordered_map<std::string, CacheEntry> cache_;
+    mutable std::shared_mutex mutex_;
+    size_t max_size_ = 2000;
+    std::chrono::seconds ttl_{600}; // 10 min TTL
+    
+    std::string make_key(const std::string& prefix, const std::string& suffix, const std::string& file_path) const {
+        size_t prefix_start = prefix.length() > 80 ? prefix.length() - 80 : 0;
+        std::string prefix_tail = prefix.substr(prefix_start);
+        std::string suffix_head = suffix.substr(0, (std::min)((size_t)30, suffix.length()));
+        std::hash<std::string> hasher;
+        return std::to_string(hasher(prefix_tail + "|" + suffix_head + "|" + file_path));
+    }
 
+public:
+    std::optional<std::string> get(const std::string& prefix, const std::string& suffix, const std::string& file_path) {
+        std::shared_lock lock(mutex_);
+        auto key = make_key(prefix, suffix, file_path);
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            auto age = std::chrono::steady_clock::now() - it->second.timestamp;
+            if (age < ttl_) {
+                it->second.hit_count++;
+                return it->second.completion;
+            } else {
+                cache_.erase(it);
+            }
+        }
+        return std::nullopt;
+    }
+    
+    void set(const std::string& prefix, const std::string& suffix, const std::string& file_path, const std::string& completion) {
+        std::unique_lock lock(mutex_);
+        auto key = make_key(prefix, suffix, file_path);
+        if (cache_.size() >= max_size_) {
+            cache_.erase(cache_.begin()); // Simple eviction
+        }
+        cache_[key] = {completion, std::chrono::steady_clock::now(), 0};
+    }
+    
+    void clear() {
+        std::unique_lock lock(mutex_);
+        cache_.clear();
+    }
+};
+
+// 🚀 CONTEXT PRELOADER
+class ContextPreloader {
+private:
+    struct ContextEntry {
+        std::string imports_and_defs;
+        std::chrono::steady_clock::time_point timestamp;
+    };
+    std::unordered_map<std::string, ContextEntry> contexts_;
+    mutable std::shared_mutex mutex_;
+    std::chrono::seconds ttl_{300}; 
+    
+public:
+    void preload(const std::string& file_path, const std::string& full_content) {
+        std::unique_lock lock(mutex_);
+        std::string compact_context = full_content.substr(0, (std::min)((size_t)1200, full_content.length()));
+        contexts_[file_path] = {compact_context, std::chrono::steady_clock::now()};
+    }
+    
+    std::string get(const std::string& file_path) const {
+        std::shared_lock lock(mutex_);
+        auto it = contexts_.find(file_path);
+        if (it != contexts_.end()) {
+            return it->second.imports_and_defs;
+        }
+        return "";
+    }
+    
+    void invalidate(const std::string& file_path) {
+        std::unique_lock lock(mutex_);
+        contexts_.erase(file_path);
+    }
+};
+
+static CompletionCache g_completion_cache;
+static ContextPreloader g_context_preloader;
+
+// Utility Implementation
 std::string utf8_safe_substr(const std::string& str, size_t length) {
     if (str.length() <= length) return str;
     return str.substr(0, length);
 }
+
+// 🚀 PUBLIC API IMPLEMENTATION
+void preload_file_context(const std::string& file_path, const std::string& full_content) {
+    g_context_preloader.preload(file_path, full_content);
+}
+
+void invalidate_file_context(const std::string& file_path) {
+    g_context_preloader.invalidate(file_path);
+}
+
+void clear_completion_cache() {
+    g_completion_cache.clear();
+}
+
+// --- EmbeddingService Implementation ---
 
 EmbeddingService::EmbeddingService(std::shared_ptr<KeyManager> key_manager)
     : key_manager_(key_manager), cache_manager_(std::make_shared<CacheManager>()) {}
@@ -39,88 +147,40 @@ std::string EmbeddingService::get_endpoint_url(const std::string& action) {
         if (model.find("models/") == 0) model_path = model;
         else model_path = "models/" + model;
     }
-    
-    std::string final_url = base_url_ + model_path + ":" + action + "?key=" + key;
-    
-    spdlog::info("🔍 Action: {}, Model Path: {}", action, model_path);
-    
-    return final_url;
+    return base_url_ + model_path + ":" + action + "?key=" + key;
 }
 
-// 🚀 ELITE: Robust Request Wrapper
+// Helper: Fail-Fast Retry
 template<typename Func>
-cpr::Response perform_request_with_retry(Func request_factory, std::shared_ptr<KeyManager> km) {
-    
-    // 1. Determine how many unique keys we have. We will try ALL of them before failing.
-    size_t max_retries = km->get_total_keys();
-    if (max_retries == 0) max_retries = 1; // Safety
-
-    cpr::Response r; 
-    
-    for (size_t i = 0; i < max_retries; ++i) {
+cpr::Response perform_request_with_retry_fast(Func request_factory, std::shared_ptr<KeyManager> km) {
+    const int MAX_RETRIES = 2;
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+        cpr::Response r = request_factory();
+        if (r.status_code == 200) return r;
+        if (r.status_code == 404 || r.status_code == 400) return r;
         
-        // Factory gets the *current* key from KeyManager
-        r = request_factory(); 
-
-        // ✅ Success
-        if (r.status_code == 200) {
-            if (i > 0) spdlog::info("✅ API Recovered on attempt {}/{}", i + 1, max_retries);
-            return r;
+        if (r.status_code == 429 || r.status_code >= 500) {
+            if (attempt < MAX_RETRIES - 1) {
+                km->rotate_key();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
         }
-
-        // ❌ Error Handling
-        spdlog::warn("⚠️ API FAILURE {}/{} | Status: {} | Error: {}", 
-                     i + 1, max_retries, r.status_code, r.text.substr(0, 100));
-
-        // 404 Not Found (Model name wrong? Key invalid?) -> Rotate Key Immediately
-        if (r.status_code == 404) {
-            // spdlog::error("❌ 404 Error: Invalid Model or Endpoint. Rotating Key...");
-            // km->rotate_key();
-            // Optional: Rotate model too if you suspect the model name is the issue
-            spdlog::error("❌ 404 Error: Invalid Model/Endpoint. Stopping retries to save time.");
-            break; // Retry immediately with next key
-        }
-
-        // 429 Rate Limit -> Rotate Key + Small Sleep
-        if (r.status_code == 429) {
-            // Calculate delay: 500ms * 2^attempt
-            int delay_ms = 500 * std::pow(2, i);
-            spdlog::warn("⏳ Rate Limit Hit. Backing off for {}ms...", delay_ms);
-            km->rotate_key();
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms)); 
-            continue;
-        }
-
-        // 500+ Server Error -> Rotate Key (Maybe that region is down)
-        if (r.status_code >= 500) {
-            km->rotate_key();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            continue;
-        }
-
-        // 400 Bad Request (Invalid JSON/Prompt) -> Don't retry, it won't help
-        if (r.status_code == 400) {
-            spdlog::error("🛑 400 Bad Request. Stopping retries.");
-            break;
-        }
+        return r;
     }
-
-    return r; // Return the last response (likely error) if all keys failed
+    return cpr::Response{};
 }
 
 GenerationResult EmbeddingService::call_gemini_api(const std::string& prompt) {
     GenerationResult final_result;
-    std::string url = get_endpoint_url("generateContent");
-
-    auto r = perform_request_with_retry([&]() {
+    auto r = perform_request_with_retry_fast([&]() {
         return cpr::Post(cpr::Url{get_endpoint_url("generateContent")},
                       cpr::Body{json{
                           {"contents", {{ {"parts", {{{"text", prompt}}}} }}}
                       }.dump()},
                       cpr::Header{{"Content-Type", "application/json"}},
                       cpr::VerifySsl{false}, 
-                      cpr::Timeout{120000}
-        );
+                      cpr::Timeout{120000});
     }, key_manager_);
 
     if (r.status_code == 200) {
@@ -128,40 +188,22 @@ GenerationResult EmbeddingService::call_gemini_api(const std::string& prompt) {
             auto response_json = json::parse(r.text);
             if (response_json.contains("candidates") && !response_json["candidates"].empty()) {
                 final_result.text = response_json["candidates"][0]["content"]["parts"][0]["text"];
-                
-                if (response_json.contains("usageMetadata")) {
-                    auto& usage = response_json["usageMetadata"];
-                    final_result.prompt_tokens = usage.value("promptTokenCount", 0);
-                    final_result.completion_tokens = usage.value("candidatesTokenCount", 0);
-                    final_result.total_tokens = usage.value("totalTokenCount", 0);
-                    SystemMonitor::global_output_tokens.store(final_result.completion_tokens);
-                }
                 final_result.success = true;
                 return final_result;
             }
         } catch (...) {}
     } 
-    
-    spdlog::error("❌ API ERROR: {}", r.status_code);
-    final_result.text = "API Failure";
     final_result.success = false;
     return final_result;
 }
 
 GenerationResult EmbeddingService::call_python_bridge(const std::string& prompt) {
-    spdlog::warn("🌉 Switching to Python Browser Bridge (Free Tier)...");
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // High timeout (180s) because Browser automation is slower than API
     cpr::Response r = cpr::Post(
         cpr::Url{python_bridge_url_},
         cpr::Body{json{{"prompt", prompt}}.dump()},
         cpr::Header{{"Content-Type", "application/json"}},
         cpr::Timeout{180000} 
     );
-
-    auto end = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(end - start).count();
 
     GenerationResult result;
     if (r.status_code == 200) {
@@ -170,97 +212,75 @@ GenerationResult EmbeddingService::call_python_bridge(const std::string& prompt)
             if (j.value("success", false)) {
                 result.text = j.value("text", "");
                 result.success = true;
-                
-                // Estimate tokens since Bridge doesn't provide exact usage
-                result.completion_tokens = j.value("estimated_tokens", 0);
-                result.prompt_tokens = prompt.length() / 4;
-                result.total_tokens = result.prompt_tokens + result.completion_tokens;
-                
-                spdlog::info("✅ [Bridge] Success in {:.2f}s", ms / 1000.0);
                 return result;
             }
         } catch (...) {}
     }
-
-    spdlog::error("❌ [Bridge] Failed. Status: {} | Body: {}", r.status_code, r.text);
     result.success = false;
-    result.text = "Bridge Failure";
     return result;
 }
 
 std::vector<float> EmbeddingService::generate_embedding(const std::string& text) {
-    // if (auto cached = cache_manager_->get_embedding(text)) return *cached;
+    auto r = perform_request_with_retry_fast([&]() {
+        std::string key = key_manager_->get_current_key();
+        std::string url = base_url_ + "models/text-embedding-004:embedContent?key=" + key;
+        return cpr::Post(cpr::Url{url},
+                         cpr::Body(json{
+                             {"model", "models/text-embedding-004"},
+                             {"content", {{"parts", {{{"text", text}}}}}}
+                         }.dump()),
+                         cpr::Header{{"Content-Type", "application/json"}},
+                         cpr::VerifySsl{false});
+    }, key_manager_);
     
-    // // Direct call - no fallback needed
-    // auto r = perform_request_with_retry([&]() {
-    //     std::string key = key_manager_->get_current_key();
-    //     std::string url = base_url_ + "models/text-embedding-004:embedContent?key=" + key;
-
-    //     // 🔍 ADD THIS LOG HERE:
-    //     spdlog::info("🔍 BASE_URL: {}", base_url_);
-        
-    //     return cpr::Post(cpr::Url{url},
-    //                      cpr::Body(json{
-    //                          {"model", "models/text-embedding-004"},
-    //                          {"content", {{"parts", {{{"text", text}}}}}}
-    //                      }.dump()),
-    //                      cpr::Header{{"Content-Type", "application/json"}},
-    //                      cpr::VerifySsl{false});
-    // }, key_manager_);
-    
-    // if (r.status_code == 200) {
-    //     try {
-    //         auto j = json::parse(r.text);
-    //         if (j.contains("embedding") && j["embedding"].contains("values")) {
-    //             std::vector<float> vec = j["embedding"]["values"];
-    //             cache_manager_->set_embedding(text, vec);
-    //             return vec;
-    //         }
-    //     } catch(...) { 
-    //         spdlog::error("❌ Failed to parse embedding JSON");
-    //     }
-    // }
-
-    // spdlog::error("❌ Embedding request failed with status: {}", r.status_code);
+    if (r.status_code == 200) {
+        try {
+            auto j = json::parse(r.text);
+            if (j.contains("embedding") && j["embedding"].contains("values")) {
+                std::vector<float> vec = j["embedding"]["values"];
+                cache_manager_->set_embedding(text, vec);
+                return vec;
+            }
+        } catch(...) {}
+    }
     return {};
 }
 
 std::vector<std::vector<float>> EmbeddingService::generate_embeddings_batch(const std::vector<std::string>& texts) {
+    if (texts.empty()) return {};
+    std::string key = key_manager_->get_current_key();
+    std::string url = base_url_ + "models/text-embedding-004:batchEmbedContents?key=" + key;
+
     json requests = json::array();
-    for(const auto& raw_text : texts){
+    for (const auto& text : texts) {
         requests.push_back({
             {"model", "models/text-embedding-004"},
-            {"content", { {"parts", {{{"text", raw_text}}}} }}
+            {"content", {{"parts", {{{"text", text}}}}}}
         });
     }
-    
-    // Google Batch API specific structure
-    std::string payload_str = json{{"requests", requests}}.dump();
-    
-    auto r = perform_request_with_retry([&]() {
-        return cpr::Post(cpr::Url{get_endpoint_url("batchEmbedContents")}, 
-                         cpr::Body{payload_str}, 
-                         cpr::Header{{"Content-Type", "application/json"}});
-    }, key_manager_);
 
-    if (r.status_code != 200) {
-        spdlog::error("Batch Embedding API error [{}]: {}", r.status_code, r.text);
-        throw std::runtime_error("Failed to generate batch embeddings");
-    }
-    
-    auto response_json = json::parse(r.text);
-    std::vector<std::vector<float>> embeddings;
-    
-    if (response_json.contains("embeddings")) {
-        for(const auto& emb : response_json["embeddings"]){
-            if (emb.contains("values")) {
-                embeddings.push_back(emb["values"].get<std::vector<float>>());
-            } else {
-                embeddings.push_back({}); // Handle failure case gracefully
+    auto r = cpr::Post(cpr::Url{url},
+        cpr::Body(json{{"requests", requests}}.dump()),
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::VerifySsl{false}
+    );
+
+    std::vector<std::vector<float>> results;
+    if (r.status_code == 200) {
+        try {
+            auto j = json::parse(r.text);
+            if (j.contains("embeddings")) {
+                for (const auto& item : j["embeddings"]) {
+                    if (item.contains("values")) {
+                        results.push_back(item["values"].get<std::vector<float>>());
+                    } else {
+                        results.push_back({});
+                    }
+                }
             }
-        }
+        } catch(...) {}
     }
-    return embeddings;
+    return results;
 }
 
 std::string EmbeddingService::generate_text(const std::string& prompt) {
@@ -268,36 +288,20 @@ std::string EmbeddingService::generate_text(const std::string& prompt) {
 }
 
 GenerationResult EmbeddingService::generate_text_elite(const std::string& prompt, RoutingStrategy strategy) {
-    
     if (strategy == RoutingStrategy::SPEED_FIRST) {
-        spdlog::info("⚡ Routing: SPEED MODE (API -> Bridge)");
-        
-        // Try API First
         GenerationResult api_res = call_gemini_api(prompt);
         if (api_res.success) return api_res;
-        
-        // Fallback to Bridge
-        spdlog::warn("⚠️ API failed. Falling back to Bridge...");
         return call_python_bridge(prompt);
-    } 
-    else {
-        spdlog::info("🌉 Routing: QUALITY MODE (Bridge -> API)");
-        
-        // Try Bridge First
+    } else {
         GenerationResult bridge_res = call_python_bridge(prompt);
         if (bridge_res.success) return bridge_res;
-        
-        // Fallback to API
-        spdlog::warn("⚠️ Bridge failed. Falling back to API...");
         return call_gemini_api(prompt);
     }
 }
 
-
 VisionResult EmbeddingService::analyze_vision(const std::string& prompt, const std::string& base64_image) {
     VisionResult result;
     result.success = false;
-
     json payload = {
         {"contents", {{
             {"parts", {
@@ -306,11 +310,9 @@ VisionResult EmbeddingService::analyze_vision(const std::string& prompt, const s
             }}
         }}}
     };
-
     auto r = cpr::Post(cpr::Url{get_endpoint_url("generateContent")},
                   cpr::Body{payload.dump()},
                   cpr::Header{{"Content-Type", "application/json"}});
-
     if (r.status_code == 200) {
         auto j = json::parse(r.text);
         if (j["candidates"][0]["content"]["parts"].size() > 0) {
@@ -327,83 +329,70 @@ std::string EmbeddingService::generate_autocomplete(
     const std::string& project_context,
     const std::string& file_path
 ) {
-    size_t total_keys = key_manager_->get_total_keys();
-    size_t total_models = key_manager_->get_total_models();
-    size_t max_attempts = total_keys * total_models;
+    // 1. Check Cache
+    auto cached = g_completion_cache.get(prefix, suffix, file_path);
+    if (cached.has_value()) return cached.value();
     
-    for(size_t attempt = 0; attempt < max_attempts; ++attempt) {
-        auto pair = key_manager_->get_current_pair();
-        std::string url = base_url_ + pair.model + ":generateContent?key=" + pair.key;
-        
-        // 🏗️ GOD MODE PROMPT CONSTRUCTION
-        std::string full_prompt = 
-            "ROLE: Senior Code Completion Engine.\n"
-            "TASK: Complete the code at the <CURSOR> position. Return ONLY the code to be inserted.\n"
-            "RULES:\n"
-            "1. No Markdown (```). No conversational text.\n"
-            "2. Use the provided PROJECT TOPOLOGY and CONTEXT to resolve imports/definitions.\n"
-            "3. If the user started a word, complete it. Do not repeat the prefix.\n\n"
-            + project_context + "\n\n" // <--- 0ms RAM Injection
-            "### CURRENT FILE: " + file_path + "\n"
-            "[START]\n" + prefix + "<CURSOR>" + suffix + "\n[END]";
-
-        json payload = {
-            {"contents", {{ {"parts", {{{"text", full_prompt}}}} }}},
-            {"generationConfig", {
-                {"maxOutputTokens", 64}, // Low token count for latency
-                {"stopSequences", {"```", "\n\n\n"}} 
-            }}
-        };
-
-        // Short timeout (4s) for Ghost Text - fail fast if network lags
-        auto r = cpr::Post(cpr::Url{url}, cpr::Body{payload.dump()}, cpr::Header{{"Content-Type", "application/json"}}, cpr::Timeout{4000});
-        
-        if (r.status_code == 200) {
-            try {
-                auto j = json::parse(r.text);
-                if (j["candidates"].empty()) { key_manager_->rotate_key(); continue; }
-                
-                std::string text = j["candidates"][0]["content"]["parts"][0]["text"];
-                
-                // 1. Sanitize Markdown
-                if (text.find("```") != std::string::npos) {
-                    size_t start = text.find("```");
-                    size_t end = text.rfind("```");
-                    if (start != std::string::npos) text = text.substr(text.find('\n', start) + 1);
-                    if (end != std::string::npos && end > 0) text = text.substr(0, end);
-                }
-
-                // 2. Smart Overlap Detection
-                // Prevents "std::vec" -> "vector" becoming "std::vecvector"
-                if (!prefix.empty() && !text.empty()) {
-                    size_t check_len = (std::min)((size_t)15, prefix.length());
-                    std::string tail = prefix.substr(prefix.length() - check_len);
-                    
-                    for (size_t i = 0; i < check_len; ++i) {
-                        std::string sub = tail.substr(i);
-                        if (text.find(sub) == 0) {
-                            text = text.substr(sub.length());
-                            break;
-                        }
-                    }
-                }
-
-                // 3. Trim whitespace logic
-                if (!text.empty() && text.back() == '\n') text.pop_back();
-
-                spdlog::info("✅ Ghost Generated ({} chars) via {}", text.length(), pair.model);
-                return text;
-
-            } catch(...) { key_manager_->rotate_key(); continue; }
-        }
-        
-        if (r.status_code == 429) {
-            key_manager_->report_rate_limit();
-            continue;
-        }
-        key_manager_->rotate_key();
+    // 2. Get Preloaded Context
+    std::string context = g_context_preloader.get(file_path);
+    if (context.empty() && !prefix.empty()) {
+        size_t ctx_start = prefix.length() > 600 ? prefix.length() - 600 : 0;
+        context = prefix.substr(ctx_start);
     }
-    return "";
+    
+    size_t prefix_tail_size = (std::min)((size_t)150, prefix.length());
+    std::string prefix_tail = prefix.substr(prefix.length() - prefix_tail_size);
+    size_t suffix_head_size = (std::min)((size_t)80, suffix.length());
+    std::string suffix_head = suffix.substr(0, suffix_head_size);
+    
+    std::string prompt = 
+        "Complete code at <CURSOR>. Return ONLY the completion.\n\n"
+        "File context:\n" + context.substr(0, (std::min)((size_t)400, context.length())) + "\n\n"
+        "Code:\n" + prefix_tail + "<CURSOR>" + suffix_head;
+    
+    auto pair = key_manager_->get_current_pair();
+    std::string url = base_url_ + pair.model + ":generateContent?key=" + pair.key;
+    
+    json payload = {
+        {"contents", {{{"parts", {{{"text", prompt}}}}}}},
+        {"generationConfig", {
+            {"maxOutputTokens", 40},
+            {"temperature", 0.0},
+            {"topP", 0.9},
+            {"candidateCount", 1},
+            {"stopSequences", {"```", "\n\n", "//", "#"}}
+        }}
+    };
+    
+    cpr::Response r = cpr::Post(
+        cpr::Url{url},
+        cpr::Body{payload.dump()},
+        cpr::Header{{"Content-Type", "application/json"}},
+        cpr::VerifySsl{false},
+        cpr::Timeout{1500}
+    );
+    
+    if (r.status_code != 200) return "";
+    
+    try {
+        auto j = json::parse(r.text);
+        if (j["candidates"].empty()) return "";
+        std::string text = j["candidates"][0]["content"]["parts"][0]["text"];
+        
+        // Quick cleanup
+        if (text.find("```") != std::string::npos) {
+            size_t start_pos = text.find("```");
+            size_t end_pos = text.rfind("```");
+            if (start_pos != std::string::npos) text = text.substr(text.find('\n', start_pos) + 1);
+            if (end_pos != std::string::npos && end_pos > 0) text = text.substr(0, end_pos);
+        }
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        
+        if (!text.empty()) {
+            g_completion_cache.set(prefix, suffix, file_path, text);
+        }
+        return text;
+    } catch(...) { return ""; }
 }
 
 } // namespace code_assistance
