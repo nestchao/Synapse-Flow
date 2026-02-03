@@ -29,29 +29,24 @@ struct VisualNode {
 
 // --- UTILITIES ---
 
-// Case-insensitive, separator-agnostic path comparison
 bool paths_are_equal(const fs::path& p1, const fs::path& p2) {
     std::string s1 = p1.string();
     std::string s2 = p2.string();
     std::transform(s1.begin(), s1.end(), s1.begin(), ::tolower);
     std::transform(s2.begin(), s2.end(), s2.begin(), ::tolower);
     
-    // Normalize separators
     std::replace(s1.begin(), s1.end(), '\\', '/');
     std::replace(s2.begin(), s2.end(), '\\', '/');
     
-    // Strip trailing slashes
     if (!s1.empty() && s1.back() == '/') s1.pop_back();
     if (!s2.empty() && s2.back() == '/') s2.pop_back();
 
     return s1 == s2;
 }
 
-// Check if child is inside parent (or equal)
 bool is_inside(const fs::path& child, const fs::path& parent) {
     if (parent.empty()) return false;
     
-    // Normalize both paths to remove dots and redundant slashes
     auto c = child.lexically_normal();
     auto p = parent.lexically_normal();
 
@@ -59,8 +54,6 @@ bool is_inside(const fs::path& child, const fs::path& parent) {
     auto it_p = p.begin();
 
     while (it_p != p.end()) {
-        // If parent has a trailing slash, lexically_normal might leave a "." segment. 
-        // We skip it.
         if (it_p->string() == "." || it_p->string().empty()) {
             ++it_p;
             continue;
@@ -71,7 +64,6 @@ bool is_inside(const fs::path& child, const fs::path& parent) {
         std::string s_c = it_c->string();
         std::string s_p = it_p->string();
         
-        // Windows Case-Insensitivity
         std::transform(s_c.begin(), s_c.end(), s_c.begin(), ::tolower);
         std::transform(s_p.begin(), s_p.end(), s_p.begin(), ::tolower);
         
@@ -128,7 +120,6 @@ void SyncService::generate_tree_file(
 ) {
     VisualNode root;
 
-    // 1. Build the Trie structure from flat paths
     for (const auto& file_path : files) {
         std::string rel = fs::relative(file_path, base_dir).string();
         std::replace(rel.begin(), rel.end(), '\\', '/');
@@ -143,21 +134,17 @@ void SyncService::generate_tree_file(
         }
     }
 
-    // 2. Recursive Lambda to print with standard box-drawing characters
     std::ofstream out(output_file);
     out << base_dir.filename().string() << "/\n";
 
-    // Helper function for recursive drawing
     std::function<void(VisualNode&, std::string)> draw_node;
     draw_node = [&](VisualNode& node, std::string prefix) {
         auto it = node.children.begin();
         while (it != node.children.end()) {
             bool is_last = (std::next(it) == node.children.end());
             
-            // Standard ASCII Tree Characters
             std::string connector = is_last ? "└── " : "├── ";
             
-            // Render folder trailing slash if it has children
             std::string name = it->first;
             if (!it->second.children.empty()) {
                 name += "/";
@@ -165,7 +152,6 @@ void SyncService::generate_tree_file(
 
             out << prefix << connector << name << "\n";
 
-            // Prepare prefix for children
             std::string new_prefix = prefix + (is_last ? "    " : "│   ");
             draw_node(it->second, new_prefix);
             
@@ -183,74 +169,6 @@ std::string SyncService::calculate_file_hash(const fs::path& file_path) {
         auto time = fs::last_write_time(file_path).time_since_epoch().count();
         return std::to_string(size) + "-" + std::to_string(time);
     } catch (...) { return "err"; }
-}
-
-// backend_cpp/src/sync_service.cpp
-
-void scan_directory_recursive(
-    const fs::path& current_dir,
-    const fs::path& root_dir,
-    const fs::path& storage_dir,
-    const std::unordered_set<std::string>& ext_set,
-    const std::vector<std::string>& ignored_paths,
-    const std::vector<std::string>& included_paths,
-    std::vector<fs::path>& results
-) {
-    try {
-        for (const auto& entry : fs::directory_iterator(current_dir)) {
-            const auto& path = entry.path();
-            if (fs::equivalent(path, storage_dir)) continue;
-
-            fs::path rel_fs = fs::relative(path, root_dir);
-            std::string rel_str = rel_fs.generic_string(); // Always uses '/'
-
-            // Check if explicitly ignored
-            bool explicitly_ignored = false;
-            for (const auto& ign : ignored_paths) {
-                if (is_inside(rel_fs, fs::path(ign))) {
-                    explicitly_ignored = true;
-                    break;
-                }
-            }
-
-            // Check exceptions
-            bool is_explicit_exception = false;
-            bool is_bridge_to_exception = false;
-            for (const auto& inc : included_paths) {
-                fs::path inc_path(inc);
-                if (is_inside(rel_fs, inc_path)) { is_explicit_exception = true; break; }
-                if (is_inside(inc_path, rel_fs)) { is_bridge_to_exception = true; }
-            }
-
-            if (entry.is_directory()) {
-                bool enter = !explicitly_ignored || is_bridge_to_exception || is_explicit_exception;
-                spdlog::info("DIR  | {} | Ignored: {} | Bridge: {} | Action: {}", 
-                    rel_str, explicitly_ignored ? "YES" : "NO ", is_bridge_to_exception ? "YES" : "NO ", enter ? "ENTER" : "SKIP");
-                
-                if (enter) {
-                    scan_directory_recursive(path, root_dir, storage_dir, ext_set, ignored_paths, included_paths, results);
-                }
-            } else {
-                bool collect = !explicitly_ignored || is_explicit_exception;
-                
-                std::string ext = path.extension().string();
-                if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                
-                bool ext_match = ext_set.empty() || ext_set.count(ext);
-
-                if (collect && ext_match) {
-                    spdlog::info("FILE | {} | Action: COLLECT", rel_str);
-                    results.push_back(path);
-                } else {
-                    spdlog::info("FILE | {} | Action: SKIP (Ignored: {}, ExtMatch: {})", 
-                        rel_str, explicitly_ignored ? "YES" : "NO ", ext_match ? "YES" : "NO ");
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("Scanner error at {}: {}", current_dir.string(), e.what());
-    }
 }
 
 void SyncService::generate_embeddings_batch(std::vector<std::shared_ptr<CodeNode>>& nodes, int batch_size) {
@@ -286,14 +204,13 @@ void SyncService::recursive_scan(
     const fs::path& current_dir,
     const fs::path& root_dir,
     const fs::path& storage_dir,
-    const FilterConfig& cfg, // You might need to refactor FilterConfig to hold the Trie
+    const FilterConfig& cfg,
     std::vector<fs::path>& results
 ) {
-    // 1. Build Trie locally (In production, build this ONCE in the class constructor/update)
-    // For this snippet, we assume 'trie_' is a member of SyncService populated from cfg.
     PrefixTrie trie;
-    for(const auto& p : cfg.blacklist) trie.insert(p, PathFlag::IGNORE);
-    for(const auto& p : cfg.whitelist) trie.insert(p, PathFlag::INCLUDE);
+    // Updated enum constants
+    for(const auto& p : cfg.blacklist) trie.insert(p, PathFlag::PF_IGNORE);
+    for(const auto& p : cfg.whitelist) trie.insert(p, PathFlag::PF_INCLUDE);
 
     try {
         for (const auto& entry : fs::directory_iterator(current_dir)) {
@@ -302,27 +219,20 @@ void SyncService::recursive_scan(
 
             fs::path rel_path = fs::relative(path, root_dir);
             
-            // 🚀 ELITE O(1) LOOKUP
             uint8_t flag = trie.check(rel_path);
             
-            bool is_ignored = (flag & PathFlag::IGNORE);
-            bool is_included = (flag & PathFlag::INCLUDE);
+            // Updated check
+            bool is_ignored = (flag & PathFlag::PF_IGNORE);
+            bool is_included = (flag & PathFlag::PF_INCLUDE);
 
             if (entry.is_directory()) {
-                // Logic: Enter if NOT ignored, OR if explicit exception exists
-                // Note: The Trie check returns the status of the *current* path.
-                // We need to know if there's a deep exception.
-                // For simplicity in Phase 2.1: We scan if not ignored OR if included.
-                
                 if (!is_ignored || is_included) {
                     recursive_scan(path, root_dir, storage_dir, cfg, results);
                 }
             } 
             else if (entry.is_regular_file()) {
-                // File Logic
                 if (is_ignored && !is_included) continue;
 
-                // Extension Check
                 std::string ext = path.extension().string();
                 if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
                 
@@ -351,7 +261,6 @@ SyncResult SyncService::perform_sync(
     auto manifest = load_manifest(project_id);
     auto existing_nodes_map = load_existing_nodes(storage_path_str);
 
-    // 🚀 PHASE 1: PRE-FLIGHT SANITATION
     FilterConfig cfg;
     cfg.blacklist = ignored_paths;
     cfg.whitelist = included_paths;
@@ -365,12 +274,9 @@ SyncResult SyncService::perform_sync(
     spdlog::info("🔍 Mission Start: {} | Filters: [E:{} I:{} W:{}]", 
                  project_id, cfg.allowed_extensions.size(), cfg.blacklist.size(), cfg.whitelist.size());
 
-    // 🚀 PHASE 2: PRUNING RECURSIVE SCAN
     std::vector<fs::path> files_to_process;
-    // We call the specialized recursive scan that uses should_index internally
     this->recursive_scan(source_dir, source_dir, storage_dir, cfg, files_to_process);
 
-    // 🚀 PHASE 3: DIFFERENTIAL PROCESSING
     std::unordered_map<std::string, std::string> new_manifest;
     std::vector<std::shared_ptr<CodeNode>> nodes_to_embed;
     std::ofstream full_context_file(storage_dir / "_full_context.txt");
@@ -378,23 +284,24 @@ SyncResult SyncService::perform_sync(
 
     code_assistance::elite::ASTBooster ast_parser;
 
+    std::vector<std::pair<std::string, std::string>> files_to_preload;
+
     for (const auto& file_path : files_to_process) {
         std::string rel_path_str = fs::relative(file_path, source_dir).generic_string();
         std::string current_hash = calculate_file_hash(file_path);
         std::string old_hash = manifest.count(rel_path_str) ? manifest.at(rel_path_str) : "";
         
-        // 1. Read Content
         std::ifstream file_in(file_path);
         std::string content((std::istreambuf_iterator<char>(file_in)), std::istreambuf_iterator<char>());
         
-        // 🚀 APPEND TO FULL CONTEXT STREAM
-        // This runs for EVERY file in the scan list to ensure the context file is complete
         full_context_file << "\n\n--- FILE: " << rel_path_str << " ---\n" << content << "\n";
+        
+        // 🚀 NEW: Queue for context preloading
+        files_to_preload.push_back({rel_path_str, content});
 
         bool is_changed = (current_hash != old_hash);
         new_manifest[rel_path_str] = current_hash;
 
-        // 2. Node Generation
         if (is_changed) {
             spdlog::info("🔼 UPDATE: {}", rel_path_str);
             result.logs.push_back("UPDATE: " + rel_path_str);
@@ -403,20 +310,15 @@ SyncResult SyncService::perform_sync(
             fs::path p(rel_path_str);
             std::string ext = p.extension().string();
 
-            // 🚀 HYBRID PARSING LOGIC
-            // Use Tree-sitter for structured languages
             if (ext == ".cpp" || ext == ".hpp" || ext == ".py" || ext == ".ts" || ext == ".js") {
                 raw_nodes = ast_parser.extract_symbols(rel_path_str, content);
                 if(raw_nodes.empty()) {
-                    // Fallback if AST extraction returns nothing (e.g. empty file)
                     raw_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
                 }
             } else {
-                // Use Regex for others
                 raw_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
             }
 
-            // Always add the file itself as a node for "Full Context" retrieval
             if (raw_nodes.empty() || raw_nodes[0].type != "file") {
                 CodeNode file_node;
                 file_node.name = p.filename().string();
@@ -436,7 +338,6 @@ SyncResult SyncService::perform_sync(
             result.updated_count++;
             
         } else {
-            // Recover from existing map to avoid re-embedding
             for (const auto& [id, node] : existing_nodes_map) {
                 if (node->file_path == rel_path_str) result.nodes.push_back(node);
             }
@@ -445,7 +346,20 @@ SyncResult SyncService::perform_sync(
 
     full_context_file.close();
 
-    // 🚀 PHASE 4: VECTOR & METADATA FINALIZATION
+    // 🚀 NEW: Preload all file contexts for fast completions
+    spdlog::info("📦 Preloading {} file contexts for ghost text...", files_to_preload.size());
+    auto preload_start = std::chrono::high_resolution_clock::now();
+    
+    for (const auto& [file_path, content] : files_to_preload) {
+        code_assistance::preload_file_context(file_path, content);
+    }
+    
+    auto preload_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - preload_start
+    ).count();
+    
+    spdlog::info("✅ Context preload complete in {}ms", preload_elapsed);
+
     if (!nodes_to_embed.empty()) {
         generate_embeddings_batch(nodes_to_embed, 200);
     }
@@ -457,6 +371,16 @@ SyncResult SyncService::perform_sync(
     return result;
 }
 
+void SyncService::update_file_context(const std::string& file_path, const std::string& content) {
+    // Invalidate old context
+    code_assistance::invalidate_file_context(file_path);
+    
+    // Preload new context
+    code_assistance::preload_file_context(file_path, content);
+    
+    spdlog::debug("🔄 Updated context for {}", file_path);
+}
+
 std::vector<std::shared_ptr<CodeNode>> SyncService::sync_single_file(
     const std::string& project_id,
     const std::string& local_root,
@@ -466,15 +390,12 @@ std::vector<std::shared_ptr<CodeNode>> SyncService::sync_single_file(
     fs::path full_path = fs::path(local_root) / relative_path;
     if (!fs::exists(full_path)) throw std::runtime_error("File not found locally");
 
-    // 1. Read Content
     std::ifstream file(full_path);
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    // 2. Parse into Nodes
     auto raw_nodes = CodeParser::extract_nodes_from_file(relative_path, content);
     std::vector<std::shared_ptr<CodeNode>> nodes;
     
-    // 3. Generate Embeddings (Atomic Batch)
     std::vector<std::string> texts_to_embed;
     for (auto& n : raw_nodes) {
         auto ptr = std::make_shared<CodeNode>(n);
@@ -485,7 +406,6 @@ std::vector<std::shared_ptr<CodeNode>> SyncService::sync_single_file(
     auto embs = embedding_service_->generate_embeddings_batch(texts_to_embed);
     for (size_t i = 0; i < embs.size(); ++i) nodes[i]->embedding = embs[i];
 
-    // 4. Update the storage .txt (for full context chat)
     fs::path target_txt = fs::path(storage_path) / "converted_files" / (relative_path + ".txt");
     fs::create_directories(target_txt.parent_path());
     std::ofstream out(target_txt);
@@ -495,3 +415,4 @@ std::vector<std::shared_ptr<CodeNode>> SyncService::sync_single_file(
 }
 
 } // namespace code_assistance
+

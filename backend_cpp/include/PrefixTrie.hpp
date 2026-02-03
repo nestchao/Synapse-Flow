@@ -8,16 +8,17 @@
 
 namespace code_assistance {
 
+// Renamed to avoid Windows Macro collisions (IGNORE/INCLUDE)
 enum PathFlag : uint8_t {
-    NONE = 0,
-    IGNORE = 1 << 0,  // 0x01
-    INCLUDE = 1 << 1  // 0x02 (Overrides IGNORE)
+    PF_NONE = 0,
+    PF_IGNORE = 1 << 0,  // 0x01
+    PF_INCLUDE = 1 << 1  // 0x02 (Overrides IGNORE)
 };
 
 class PrefixTrie {
     struct Node {
         std::unordered_map<std::string, std::unique_ptr<Node>> children;
-        uint8_t flags = PathFlag::NONE;
+        uint8_t flags = PathFlag::PF_NONE;
     };
 
     std::unique_ptr<Node> root;
@@ -47,7 +48,7 @@ public:
     // O(L) Lookup - Returns the most specific rule found
     uint8_t check(const std::filesystem::path& path) const {
         const Node* current = root.get();
-        uint8_t accumulated_flags = PathFlag::NONE;
+        uint8_t accumulated_flags = PathFlag::PF_NONE;
 
         // Traverse the path segments
         for (const auto& part : path) {
@@ -56,15 +57,12 @@ public:
             auto it = current->children.find(segment);
             if (it == current->children.end()) {
                 // If we fall off the trie, the last specific rule applies
-                // But specifically for gitignore logic: 
-                // If a parent is ignored, children are ignored unless explicitly included.
                 break; 
             }
             current = it->second.get();
             
             // Logic: If we hit a node with flags, update our state.
-            // E.g., root/ (IGNORE) -> root/exception (INCLUDE)
-            if (current->flags != PathFlag::NONE) {
+            if (current->flags != PathFlag::PF_NONE) {
                 accumulated_flags = current->flags;
             }
         }

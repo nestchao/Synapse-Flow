@@ -65,20 +65,7 @@ def get_original_text(project_id, source_id):
     except Exception as e:
         print(f"  ❌ An error occurred while fetching original text: {e}")
         return "" # Return empty on failure
-"""
-    🛑 ABSOLUTE OUTPUT RULE (MUST FOLLOW):
 
-    - Your ENTIRE response MUST be inside ONE Markdown code block.
-    - NOTHING is allowed outside the code block.
-    - No explanations, no comments, no greetings outside the code block.
-    - If any text appears outside the code block, the answer is WRONG.
-    - DO NOT use triple backticks (```) anywhere inside the note.
-    - If the original note contains code:
-        - Rewrite the code as plain text
-        - Indent it with spaces OR
-        - Put it under a bullet point
-        - Label it clearly as **Code Example (Plain Text)**
-        """
 def generate_note(text):
     """Generates a simplified study note using the Browser Bridge (Direct)."""
     print("  🤖 Generating AI study note via Browser Bridge...")
@@ -163,8 +150,8 @@ def generate_note(text):
         """
         
         try:
-            # Use clipboard=True for large text speed
-            response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
+            # FIX: Replaced use_clipboard with return_markdown
+            response_text = browser_bridge.send_prompt(prompt, return_markdown=True)
             
             clean_text = response_text.strip()
             
@@ -195,82 +182,6 @@ def generate_note(text):
             full_html += f"<div style='color:red; border:1px solid red; padding:10px;'><strong>Error processing part {i+1}:</strong> {e}</div>"
 
     return full_html
-
-
-
-    # prompt = f"""
-    # You are given a raw study note.
-
-    # Your task is to rewrite it into a simpler and clearer version for students, WITHOUT removing, skipping, summarizing away, or merging any information from the original note.
-
-    # ⚠️ ABSOLUTE RULE (Very Important):
-
-    # - Every sentence, explanation, example, and detail in the raw note MUST appear in the output.
-
-    # - You may reword sentences using simpler words, but you are NOT allowed to delete or shorten ideas.
-
-    # - If something exists in the raw note, it must also exist in the final note.
-
-    # 📝 CRITICAL OUTPUT RULE (The "Wrapper"):
-    # 1. Headings:
-    #     - Use # for main titles
-    #     - Use ## for sections
-    
-    # 2. Bold Keywords:
-    #     - You MUST bold (**text**) all key terms, definitions, and important concepts
-
-    # 3. Dividers:
-    #     - Insert a horizontal rule (---) between every major section
-
-    # 4. Lists:
-    #     - Use bullet points (*)
-
-    # ✏️ Content Rules:
-
-    # 1. Do NOT skip any point or explanation from the original note.
-
-    # 2. Shorten the sentence, and change unfamiliar word to more common words, but do not skip any points or explanations.
-
-    # 3. The output language must be the same as the source note (do not translate the whole note).
-
-    # 4. For any unfamiliar word, add a Chinese explanation (中文解释) right after it in brackets.
-
-    # 5. Add some emojis to make the note friendly (do not overuse).
-
-    # 6. After each section, add a Mnemonic Tip to help students remember.
-
-    # 🎯 Goal:
-
-    # Make the note shorter, clearer, and student-friendly, while keeping 100% of the original information.
-
-    # If yes, generate the simplified note for the text below:
-
-    # {text} 
-    # """
-    # try:
-    #     # --- DIRECT BROWSER BRIDGE USAGE ---
-    #     # Ensure bridge thread is running
-    #     browser_bridge.start()
-        
-    #     response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
-    #     print("  ✅ Browser Bridge response received.")
-    #     clean_text = response_text.strip()
-        
-    #     # Remove Markdown fences if present
-    #     if clean_text.startswith("```markdown"):
-    #         clean_text = clean_text.replace("```markdown", "", 1)
-    #     elif clean_text.startswith("```"):
-    #         clean_text = clean_text.replace("```", "", 1)
-    #     if clean_text.endswith("```"):
-    #         clean_text = clean_text[:-3]
-
-    #     # Fix HTML entities
-    #     clean_text = re.sub(r'(#include\s*)<([^>]+)>', r'\1&lt;\2&gt;', clean_text)
-        
-    #     return markdown.markdown(clean_text, extensions=['tables'])
-    # except Exception as e:
-    #     print(f"  ❌ Browser Bridge Note Generation Failed: {e}")
-    #     raise
 
 def get_simplified_note_context(project_id, source_id=None):
     """Fetches and combines all simplified note pages into clean text for the chatbot."""
@@ -593,8 +504,6 @@ def update_note(project_id, source_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ... imports ...
-
 @study_hub_bp.route('/ask-chatbot/<project_id>', methods=['POST'])
 def ask_chatbot(project_id):
     data = request.json
@@ -626,26 +535,15 @@ def ask_chatbot(project_id):
     try:
         browser_bridge.start()
         
-        # CHANGE: If you want a TRULY new chat every time, 
-        # do not include 'history' in the flat_prompt.
         flat_prompt = f"SYSTEM: {system_prompt}\n\n"
-        
-        # Comment this loop out if you don't want the AI to remember 
-        # previous questions from the current session:
-        # for turn in history:
-        #     role = turn.get('role', 'user').upper()
-        #     content = turn.get('content', '')
-        #     flat_prompt += f"{role}: {content}\n"
-            
         flat_prompt += f"USER: {question}\n"
         flat_prompt += "MODEL: "
 
-        # Send to Browser (which will now refresh the page first)
-        raw_answer = browser_bridge.send_prompt(flat_prompt)
+        # FIX: Replaced use_clipboard with return_markdown
+        raw_answer = browser_bridge.send_prompt(flat_prompt, return_markdown=True)
         print("  ✅ Browser Bridge response received.")
         
         # --- CLEANING LOGIC ---
-        # We strip the wrapper we asked for, leaving the raw Markdown behind.
         clean_answer = raw_answer.strip()
         clean_answer = clean_answer.replace("code Markdown download", "")
         clean_answer = clean_answer.replace("code\nMarkdown\ndownload", "")
@@ -653,13 +551,11 @@ def ask_chatbot(project_id):
         if clean_answer.endswith("```"):
             clean_answer = clean_answer[:-3].strip()
         
-        # Remove the opening ```markdown or ```
         if "```markdown" in clean_answer:
             clean_answer = clean_answer.replace("```markdown", "", 1)
         elif clean_answer.startswith("```"):
             clean_answer = clean_answer.replace("```", "", 1)
             
-        # Remove the closing ```
         if clean_answer.endswith("```"):
             clean_answer = clean_answer.substring(0, len(clean_answer) - 3) if hasattr(clean_answer, 'substring') else clean_answer[:-3]
 
@@ -699,7 +595,7 @@ def topic_note(project_id):
         # --- DIRECT BROWSER BRIDGE USAGE ---
         browser_bridge.start()
             
-        response_text = browser_bridge.send_prompt(prompt)
+        response_text = browser_bridge.send_prompt(prompt, return_markdown=True)
         html = markdown.markdown(response_text, extensions=['tables'])
         return jsonify({"note_html": html})
     except Exception as e:
@@ -814,7 +710,8 @@ def generate_code_suggestion():
         
         # --- DIRECT BROWSER BRIDGE USAGE ---
         browser_bridge.start()
-        suggestion_text = browser_bridge.send_prompt(final_prompt)
+        # FIX: Replaced use_clipboard with return_markdown
+        suggestion_text = browser_bridge.send_prompt(final_prompt, return_markdown=True)
 
         print("="*80)
         print("✅ Response generated successfully")
@@ -907,7 +804,8 @@ def generate_answer_from_context():
         # --- DIRECT BROWSER BRIDGE USAGE ---
         browser_bridge.start()
         
-        answer = browser_bridge.send_prompt(final_prompt)
+        # FIX: Replaced use_clipboard with return_markdown
+        answer = browser_bridge.send_prompt(final_prompt, return_markdown=True)
         return jsonify({"suggestion": answer})
         
     except Exception as e:
@@ -917,13 +815,11 @@ def generate_answer_from_context():
 def get_bridge_models():
     """Fetches available Gemini models AND the active one from AI Studio."""
     try:
-        # We assume you added get_bridge_state() to browser_bridge.py 
-        # as suggested in the previous step
         state = browser_bridge.get_bridge_state() 
         
         return jsonify({
             "models": state.get("models", []),
-            "current_active": state.get("active") # This is what we need!
+            "current_active": state.get("active") 
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -956,15 +852,12 @@ def bridge_generate():
     try:
         browser_bridge.start()
         
-        # We don't force reset here anymore to keep it fast, 
-        # the browser_bridge internal logic handles navigation if needed.
+        # FIX: Replaced use_clipboard=True with return_markdown=True
+        # This matches the new signature: send_prompt(message, return_markdown=False)
+        response_text = browser_bridge.send_prompt(prompt, return_markdown=True)
         
-        response_text = browser_bridge.send_prompt(prompt, use_clipboard=True)
-        
-        # 🚀 FIX: Detect Browser Errors
         if not response_text or response_text.startswith("Browser Error") or response_text.startswith("Error:"):
             print(f"❌ [Bridge] Failed: {response_text}")
-            # Return 500 so C++ switches to API
             return jsonify({"success": False, "error": response_text}), 500
 
         print(f"   [Bridge] Success (Length: {len(response_text)})")
