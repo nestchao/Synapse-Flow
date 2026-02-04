@@ -61,6 +61,9 @@ std::string PointerGraph::add_node(const std::string& content,
         wrapper_node->content = content;
         wrapper_node->embedding = embedding;
         
+        if(metadata.count("file_path")) wrapper_node->file_path = metadata.at("file_path");
+        if(metadata.count("node_name")) wrapper_node->name = metadata.at("node_name");
+
         vector_store_->add_nodes({wrapper_node});
         
         // Retrieve the internal ID assigned by FAISS (Assuming standard sequential insert)

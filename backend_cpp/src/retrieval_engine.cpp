@@ -45,6 +45,19 @@ std::vector<RetrievalResult> RetrievalEngine::retrieve(
     
     spdlog::info("⏱️ Retrieval Pipeline Time: {:.2f} ms", duration);
 
+    if (!expanded.empty()) {
+        spdlog::info("🎯 Retrieval Audit (Top 3):");
+        for (size_t i = 0; i < std::min((size_t)3, expanded.size()); ++i) {
+            spdlog::info("  [{}] Path: '{}' | Name: '{}' | Score: {:.4f}", 
+                i+1, 
+                expanded[i].node->file_path, 
+                expanded[i].node->name, 
+                expanded[i].final_score);
+        }
+    } else {
+        spdlog::warn("⚠️ Retrieval returned ZERO results.");
+    }
+
     return expanded;
 }
 

@@ -50,6 +50,29 @@ def measure_ghost_latency(iterations=10):
             print("\n⚠️  PERFORMANCE WARNING: Latency > 1000ms.")
             print("    Ghost Text requires < 600ms to feel usable.")
             print("    Cause: Browser Bridge overhead or large context retrieval.")
+
+def single_request():
+    payload = {
+        "prefix": "def calculate_pi(n):\n    ",
+        "suffix": "\n",
+        "project_id": "TEST_PROJ",
+        "file_path": "math_utils.py"
+    }
+    start = time.time()
+    try:
+        res = requests.post(API_URL, json=payload, timeout=5)
+        return (time.time() - start) * 1000
+    except:
+        return None
+
+def run_pressure_test(concurrent_users):
+    with ThreadPoolExecutor(max_workers=concurrent_users) as executor:
+        results = list(executor.map(lambda _: single_request(), range(100)))
+    
+    valid_results = [r for r in results if r is not None]
+    print(f"Concurrent Users: {concurrent_users}")
+    print(f"Average Latency: {sum(valid_results)/len(valid_results):.2f}ms")
+    print(f"Success Rate: {len(valid_results)}%")
     
 if __name__ == "__main__":
     measure_ghost_latency()
