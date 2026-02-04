@@ -144,7 +144,7 @@ private:
         std::lock_guard<std::mutex> lock(store_mutex);
         if (project_stores_.count(project_id)) return project_stores_[project_id];
 
-        fs::path vector_path = fs::path("data") / project_id / "vector_store";
+        fs::path vector_path = fs::path("data") / "graphs" / project_id;
         if (!fs::exists(vector_path)) return nullptr;
 
         try {
