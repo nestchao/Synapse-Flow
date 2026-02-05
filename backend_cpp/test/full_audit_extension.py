@@ -62,8 +62,8 @@ class SynapseAccuracyAudit:
         print(colored("\n🔎 PHASE 4: RAG Retrieval Accuracy (Deep Inspection)", "blue", attrs=['bold']))
         
         test_cases = [
-            ("How to calculate fibonacci?", "math_utils"),
-            ("How do I connect to the database?", "db_core"),
+            ("Calculate the nth fibonacci number in python", "math_utils"),
+            ("Connect to the database storage manager", "db_core"),
         ]
 
         for query, target in test_cases:

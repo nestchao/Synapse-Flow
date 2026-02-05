@@ -274,7 +274,16 @@ private:
             
             json candidates = json::array();
             for (const auto& r : results) {
-                candidates.push_back({{"file_path", r.node->file_path}, {"content", r.node->content}});
+                spdlog::info("🔍 Result: name='{}' file_path='{}' type='{}'", 
+                    r.node->name, 
+                    r.node->file_path, 
+                    r.node->type);
+                candidates.push_back({
+                    {"file_path", r.node->file_path}, 
+                    {"name", r.node->name},           // Add this
+                    {"content", r.node->content},
+                    {"score", r.final_score}          // Helpful for debugging
+                });
             }
             res.set_content(json{{"candidates", candidates}}.dump(), "application/json");
         } catch(...) { res.status = 500; }

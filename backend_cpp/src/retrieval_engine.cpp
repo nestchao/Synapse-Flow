@@ -19,10 +19,14 @@ std::vector<RetrievalResult> RetrievalEngine::retrieve(
     auto start = std::chrono::high_resolution_clock::now();
 
     // 1. Search (Get seeds)
-    auto seeds = vector_store_->search(query_embedding, 200); 
+    size_t total_nodes = vector_store_->get_all_nodes().size();
+    int k = (total_nodes < 10) ? (int)total_nodes : 20; 
+
+    auto seeds = vector_store_->search(query_embedding, 20);
     
     // 2. Expand
-    auto expanded = exponential_graph_expansion(seeds, 200, 3, 0.5);
+    int hops = (total_nodes < 10) ? 1 : 2;
+    auto expanded = exponential_graph_expansion(seeds, 50, hops, 0.9);
     
     // 3. Score
     multi_dimensional_scoring(expanded);
@@ -32,33 +36,33 @@ std::vector<RetrievalResult> RetrievalEngine::retrieve(
         return a.final_score > b.final_score;
     });
 
-    if (expanded.size() > max_nodes) {
-        expanded.resize(max_nodes);
-    }
+    // 🚀 ADD DEDUPLICATION HERE:
+    std::vector<RetrievalResult> unique_results;
+    std::unordered_set<std::string> seen_ids;
 
-    // --- TELEMETRY END ---
-    auto end = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double, std::milli>(end - start).count();
-    
-    // Update global atomic metric
-    SystemMonitor::global_vector_latency_ms.store(duration);
-    
-    spdlog::info("⏱️ Retrieval Pipeline Time: {:.2f} ms", duration);
-
-    if (!expanded.empty()) {
-        spdlog::info("🎯 Retrieval Audit (Top 3):");
-        for (size_t i = 0; i < std::min((size_t)3, expanded.size()); ++i) {
-            spdlog::info("  [{}] Path: '{}' | Name: '{}' | Score: {:.4f}", 
-                i+1, 
-                expanded[i].node->file_path, 
-                expanded[i].node->name, 
-                expanded[i].final_score);
+    for (auto& res : expanded) {
+        // Use a unique key: path + name
+        std::string key = res.node->file_path + "::" + res.node->name;
+        if (seen_ids.find(key) == seen_ids.end()) {
+            unique_results.push_back(res);
+            seen_ids.insert(key);
         }
-    } else {
-        spdlog::warn("⚠️ Retrieval returned ZERO results.");
     }
 
-    return expanded;
+    if (unique_results.size() > max_nodes) {
+        unique_results.resize(max_nodes);
+    }
+
+    // Update logging to use the unique list
+    if (!unique_results.empty()) {
+        spdlog::info("🎯 Retrieval Audit (Top 3 Unique):");
+        for (size_t i = 0; i < std::min((size_t)3, unique_results.size()); ++i) {
+            spdlog::info("  [{}] Path: '{}' | Name: '{}' | Score: {:.4f}", 
+                i+1, unique_results[i].node->file_path, unique_results[i].node->name, unique_results[i].final_score);
+        }
+    }
+
+    return unique_results;
 }
 
 std::string RetrievalEngine::build_hierarchical_context(
@@ -146,8 +150,15 @@ std::vector<RetrievalResult> RetrievalEngine::exponential_graph_expansion(
 
 void RetrievalEngine::multi_dimensional_scoring(std::vector<RetrievalResult>& candidates) {
     for (auto& c : candidates) {
-        double s_weight = c.node->weights.count("structural") ? c.node->weights["structural"] : 0.5;
-        c.final_score = c.graph_score * (0.8 + (s_weight * 0.2));
+        // 🚀 FIX: Stronger Type Boosting
+        double type_boost = 1.0;
+        if (c.node->type.find("function") != std::string::npos) type_boost = 2.0; // Massively reward functions
+        if (c.node->type.find("class") != std::string::npos) type_boost = 1.5;
+
+        double s_weight = c.node->weights.count("structural") ? c.node->weights.at("structural") : 0.5;
+        
+        // Final score is now extremely sensitive to semantic match + type
+        c.final_score = c.graph_score * type_boost * (0.95 + s_weight * 0.05);
     }
 }
 

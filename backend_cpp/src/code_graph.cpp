@@ -157,7 +157,7 @@ public:
         file_node.id = file_path;
         file_node.content = content;
         file_node.type = "file";
-        file_node.weights = {{"structural", 1.0}};
+        file_node.weights = {{"structural", 0.5}, {"specificity", 0.3}};
         file_node.dependencies = file_imports;
         nodes.push_back(file_node);
 
