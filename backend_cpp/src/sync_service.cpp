@@ -174,16 +174,31 @@ std::string SyncService::calculate_file_hash(const fs::path& file_path) {
 void SyncService::generate_embeddings_batch(std::vector<std::shared_ptr<CodeNode>>& nodes, int batch_size) {
     spdlog::info("Generating embeddings for {} nodes...", nodes.size());
     for (size_t i = 0; i < nodes.size(); i += batch_size) {
-        std::vector<std::string> texts;
+        
+        // 🚀 FIX: Declare the variable here!
+        std::vector<std::string> texts_to_embed; 
+        
         size_t end = std::min(i + batch_size, nodes.size());
         for (size_t j = i; j < end; ++j) {
-            std::string safe = utf8_safe_substr(nodes[j]->content, 800);
-            texts.push_back("Name: " + nodes[j]->name + " Code: " + safe);
+            // 🚀 IDENTITY INJECTION: Forces AI to learn the filename
+            std::string identity_text = 
+                "FILE_PATH: " + nodes[j]->file_path + " | " +
+                "SYMBOL_NAME: " + nodes[j]->name + " | " +
+                "TYPE: " + nodes[j]->type + " | " +
+                "CODE_CONTENT: " + utf8_safe_substr(nodes[j]->content, 1000);
+                
+            texts_to_embed.push_back(identity_text);
         }
+
         try {
-            auto embs = embedding_service_->generate_embeddings_batch(texts);
-            for (size_t j = 0; j < embs.size(); ++j) nodes[i + j]->embedding = embs[j];
-        } catch(...) {}
+            auto embs = embedding_service_->generate_embeddings_batch(texts_to_embed);
+            // Re-map embeddings to nodes
+            for (size_t j = 0; j < embs.size(); ++j) {
+                if (i + j < nodes.size()) nodes[i + j]->embedding = embs[j];
+            }
+        } catch(...) {
+            spdlog::error("   - Batch embedding failed at index {}", i);
+        }
         spdlog::info("  - Embedded batch {}/{}", (i/batch_size)+1, (nodes.size()/batch_size)+1);
     }
 }
@@ -394,18 +409,31 @@ std::vector<std::shared_ptr<CodeNode>> SyncService::sync_single_file(
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     auto raw_nodes = CodeParser::extract_nodes_from_file(relative_path, content);
-    std::vector<std::shared_ptr<CodeNode>> nodes;
     
-    std::vector<std::string> texts_to_embed;
+    std::vector<std::shared_ptr<CodeNode>> nodes;
+    // 🚀 FIX: Declare the variable here!
+    std::vector<std::string> texts_to_embed; 
+
     for (auto& n : raw_nodes) {
         auto ptr = std::make_shared<CodeNode>(n);
         nodes.push_back(ptr);
-        texts_to_embed.push_back("Name: " + ptr->name + " Code: " + utf8_safe_substr(ptr->content, 800));
+
+        // 🚀 IDENTITY INJECTION
+        std::string identity_text = 
+            "[FILE: " + n.file_path + "] " +
+            "[SYMBOL: " + n.name + "] " +
+            "Content: " + n.content;
+
+        texts_to_embed.push_back(identity_text);
     }
 
+    // Call AI Service
     auto embs = embedding_service_->generate_embeddings_batch(texts_to_embed);
-    for (size_t i = 0; i < embs.size(); ++i) nodes[i]->embedding = embs[i];
+    for (size_t i = 0; i < embs.size(); ++i) {
+        if (i < nodes.size()) nodes[i]->embedding = embs[i];
+    }
 
+    // Save to converted_files
     fs::path target_txt = fs::path(storage_path) / "converted_files" / (relative_path + ".txt");
     fs::create_directories(target_txt.parent_path());
     std::ofstream out(target_txt);

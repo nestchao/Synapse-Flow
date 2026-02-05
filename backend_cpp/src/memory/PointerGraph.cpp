@@ -46,37 +46,42 @@ std::string PointerGraph::add_node(const std::string& content,
     node.parent_id = parent_id;
     node.metadata = metadata;
 
-    // 1. Link Graph (Parent -> Child)
     if (!parent_id.empty() && nodes_.count(parent_id)) {
         nodes_[parent_id].children_ids.push_back(node.id);
     }
 
-    // 2. Link Vector (If embedding provided)
     if (!embedding.empty()) {
-        // Create a temporary CodeNode wrapper for the existing FaissVectorStore API
-        // In Phase 3, we might refactor FaissVectorStore to be more generic, 
-        // but for now, we adapt to it.
         auto wrapper_node = std::make_shared<CodeNode>();
-        wrapper_node->id = node.id; // Use same ID
+        wrapper_node->id = node.id;
         wrapper_node->content = content;
         wrapper_node->embedding = embedding;
         
-        if(metadata.count("file_path")) wrapper_node->file_path = metadata.at("file_path");
-        if(metadata.count("node_name")) wrapper_node->name = metadata.at("node_name");
+        // ✅ FIX: Copy ALL metadata fields properly
+        if(metadata.count("file_path")) 
+            wrapper_node->file_path = metadata.at("file_path");
+        if(metadata.count("node_name")) 
+            wrapper_node->name = metadata.at("node_name");
+        if(metadata.count("node_type"))  // ← ADD THIS
+            wrapper_node->type = metadata.at("node_type");
+        
+        // Optional: Copy dependencies if present
+        if(metadata.count("dependencies")) {
+            std::istringstream ss(metadata.at("dependencies"));
+            std::string dep;
+            while(std::getline(ss, dep, ',')) {
+                if(!dep.empty()) wrapper_node->dependencies.insert(dep);
+            }
+        }
 
         vector_store_->add_nodes({wrapper_node});
         
-        // Retrieve the internal ID assigned by FAISS (Assuming standard sequential insert)
-        // A robust way requires FaissVectorStore to return IDs, but for now we calculate:
         long internal_id = vector_store_->get_all_nodes().size() - 1; 
         node.faiss_id = internal_id;
         faiss_to_uuid_[internal_id] = node.id;
     }
 
-    // 3. Store
     nodes_[node.id] = node;
     
-    // Auto-save every 10 nodes or if critical
     if (nodes_.size() % 10 == 0) save();
 
     return node.id;
