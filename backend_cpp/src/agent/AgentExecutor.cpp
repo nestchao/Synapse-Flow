@@ -206,7 +206,10 @@ std::shared_ptr<PointerGraph> AgentExecutor::get_or_create_graph(const std::stri
 
 void AgentExecutor::ingest_sync_results(const std::string& project_id, const std::vector<std::shared_ptr<CodeNode>>& nodes) {
     auto graph = get_or_create_graph(project_id);
-    spdlog::info("🧠 Ingesting {} code nodes into Graph Memory...", nodes.size());
+
+    size_t before_count = graph->get_node_count(); // You might need to add this getter to PointerGraph
+    spdlog::info("🧠 [GRAPH INGESTION] Starting injection of {} nodes...", nodes.size());
+
     for (const auto& node : nodes) {
         std::unordered_map<std::string, std::string> meta;
         meta["file_path"] = node->file_path;
@@ -218,7 +221,7 @@ void AgentExecutor::ingest_sync_results(const std::string& project_id, const std
         graph->add_node(node->content, NodeType::CONTEXT_CODE, "", node->embedding, meta);
     }
     graph->save();
-    spdlog::info("✅ Graph Knowledge Updated.");
+    spdlog::info("✅ [GRAPH INGESTION] Success. Total Memory Nodes: {}", graph->get_node_count());
 }
 
 std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> graph, const std::string& session_id) {

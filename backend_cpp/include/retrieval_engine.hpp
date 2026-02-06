@@ -38,7 +38,7 @@ private:
         double alpha
     );
     
-    void multi_dimensional_scoring(std::vector<RetrievalResult>& candidates);
+    void multi_dimensional_scoring(std::vector<RetrievalResult>& candidates, const std::string& query);
 };
 
 } // namespace code_assistance
