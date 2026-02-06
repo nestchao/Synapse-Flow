@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 #include <chrono> 
 #include "SystemMonitor.hpp" // Required for telemetry
+#include <sstream>
 
 namespace code_assistance {
 
@@ -29,7 +30,7 @@ std::vector<RetrievalResult> RetrievalEngine::retrieve(
     auto expanded = exponential_graph_expansion(seeds, 50, hops, 0.9);
     
     // 3. Score
-    multi_dimensional_scoring(expanded);
+    multi_dimensional_scoring(expanded, query);
     
     // 4. Sort and filter
     std::sort(expanded.begin(), expanded.end(), [](const auto& a, const auto& b) {
@@ -148,17 +149,45 @@ std::vector<RetrievalResult> RetrievalEngine::exponential_graph_expansion(
     return results;
 }
 
-void RetrievalEngine::multi_dimensional_scoring(std::vector<RetrievalResult>& candidates) {
-    for (auto& c : candidates) {
-        // 🚀 FIX: Stronger Type Boosting
-        double type_boost = 1.0;
-        if (c.node->type.find("function") != std::string::npos) type_boost = 2.0; // Massively reward functions
-        if (c.node->type.find("class") != std::string::npos) type_boost = 1.5;
+void RetrievalEngine::multi_dimensional_scoring(std::vector<RetrievalResult>& candidates, const std::string& query) {
+    std::string q = query;
+    std::transform(q.begin(), q.end(), q.begin(), ::tolower);
 
-        double s_weight = c.node->weights.count("structural") ? c.node->weights.at("structural") : 0.5;
+    // 🚀 NEW: Extract significant words from query (length > 3)
+    std::vector<std::string> query_keywords;
+    std::stringstream ss(q);
+    std::string word;
+    while(ss >> word) {
+        if(word.length() > 3) query_keywords.push_back(word);
+    }
+
+    for (auto& c : candidates) {
+        double type_boost = 1.0;
+        double keyword_boost = 1.0;
+
+        // 1. Massive Type Boost for logic
+        if (c.node->type.find("function") != std::string::npos || 
+            c.node->type.find("method") != std::string::npos) {
+            type_boost = 3.0; 
+        }
+
+        // 2. Surgical Keyword Matching
+        std::string fname = c.node->file_path;
+        std::string sname = c.node->name;
+        std::transform(fname.begin(), fname.end(), fname.begin(), ::tolower);
+        std::transform(sname.begin(), sname.end(), sname.begin(), ::tolower);
         
-        // Final score is now extremely sensitive to semantic match + type
-        c.final_score = c.graph_score * type_boost * (0.95 + s_weight * 0.05);
+        for(const auto& kw : query_keywords) {
+            // Boost if word found in filename (e.g., 'math')
+            if(fname.find(kw) != std::string::npos) keyword_boost += 1.0;
+            // Stronger boost if word found in Symbol Name (e.g., 'fibonacci')
+            if(sname.find(kw) != std::string::npos) keyword_boost += 2.0;
+        }
+
+        double s_weight = c.node->weights.count("structural") ? c.node->weights.at("structural") : 0.0;
+        
+        // Final Score = Similarity * Type * Keywords
+        c.final_score = c.graph_score * type_boost * keyword_boost * (1.0 + (s_weight * 0.05));
     }
 }
 

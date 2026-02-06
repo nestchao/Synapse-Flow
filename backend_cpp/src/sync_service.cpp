@@ -29,6 +29,16 @@ struct VisualNode {
 
 // --- UTILITIES ---
 
+uintmax_t get_directory_size(const fs::path& dir) {
+    uintmax_t size = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (fs::is_regular_file(entry)) {
+            size += fs::file_size(entry);
+        }
+    }
+    return size;
+}
+
 bool paths_are_equal(const fs::path& p1, const fs::path& p2) {
     std::string s1 = p1.string();
     std::string s2 = p2.string();
@@ -182,11 +192,10 @@ void SyncService::generate_embeddings_batch(std::vector<std::shared_ptr<CodeNode
         for (size_t j = i; j < end; ++j) {
             // 🚀 IDENTITY INJECTION: Forces AI to learn the filename
             std::string identity_text = 
-                "FILE_PATH: " + nodes[j]->file_path + " | " +
-                "SYMBOL_NAME: " + nodes[j]->name + " | " +
-                "TYPE: " + nodes[j]->type + " | " +
-                "CODE_CONTENT: " + utf8_safe_substr(nodes[j]->content, 1000);
-                
+                "This is a " + nodes[j]->type + " named '" + nodes[j]->name + "' " +
+                "defined in the file '" + nodes[j]->file_path + "'.\n" +
+                "Logic Implementation:\n" + utf8_safe_substr(nodes[j]->content, 1200);
+                            
             texts_to_embed.push_back(identity_text);
         }
 
@@ -272,6 +281,10 @@ SyncResult SyncService::perform_sync(
     fs::path converted_files_dir = storage_dir / "converted_files";
     fs::create_directories(converted_files_dir);
 
+    uintmax_t total_bytes = get_directory_size(source_dir);
+    spdlog::info("📊 [PROJECT STATS] Path: {}", source_dir_str);
+    spdlog::info("   - Total Folder Size: {:.2f} MB", (double)total_bytes / (1024.0 * 1024.0));
+
     SyncResult result;
     auto manifest = load_manifest(project_id);
     auto existing_nodes_map = load_existing_nodes(storage_path_str);
@@ -291,6 +304,7 @@ SyncResult SyncService::perform_sync(
 
     std::vector<fs::path> files_to_process;
     this->recursive_scan(source_dir, source_dir, storage_dir, cfg, files_to_process);
+    spdlog::info("   - Files Found: {}", files_to_process.size());
 
     std::unordered_map<std::string, std::string> new_manifest;
     std::vector<std::shared_ptr<CodeNode>> nodes_to_embed;
@@ -382,7 +396,7 @@ SyncResult SyncService::perform_sync(
     generate_tree_file(source_dir, files_to_process, storage_dir / "tree.txt");
     save_manifest(project_id, new_manifest);
 
-    spdlog::info("✅ Mission Success: {} nodes indexed.", result.nodes.size());
+    spdlog::info("✅ [SYNC COMPLETE] Generated Nodes: {}", result.nodes.size());
     return result;
 }
 

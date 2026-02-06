@@ -49,6 +49,11 @@ public:
     void save();
     void load();
 
+    size_t get_node_count() const { 
+        std::shared_lock lock(data_mutex_);
+        return nodes_.size(); 
+    }
+
 private:
     std::string storage_path_;
     int dimension_;
