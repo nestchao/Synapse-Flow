@@ -238,11 +238,31 @@ std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> 
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
     
-    // Setup Graph & Session
+    // 1. Setup Graph & Session
     auto graph = get_or_create_graph(req.project_id());
     std::string session_id = req.session_id();
-    std::string parent_node_id = "";
     
+    // 2. GENERATE EMBEDDING FIRST (Needed for search)
+    std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
+
+    // 3. PERFORM SIGMA-2 RETRIEVAL (Now that we have prompt_vec)
+    auto top_nodes = graph->semantic_search(prompt_vec, 5);
+    std::string relational_context = "### RELATED CODE RELATIONSHIPS (Sigma-2)\n";
+    std::string massive_context = ""; // Declare this here so we can add to it
+
+    for (const auto& node : top_nodes) {
+        auto related = graph->get_children(node.id);
+        for (const auto& r_node : related) {
+            relational_context += "- " + node.id + " -> calls -> " + r_node.metadata.at("node_name") + "\n";
+            
+            if (r_node.type == NodeType::CONTEXT_CODE) {
+                massive_context += "\n# DEPENDENCY: " + r_node.metadata.at("file_path") + "\n" + r_node.content;
+            }
+        }
+    }
+
+    // 4. Restore Session Cursor
+    std::string parent_node_id = "";
     {
         std::lock_guard<std::mutex> lock(cursor_mutex_);
         if (session_cursors_.find(session_id) == session_cursors_.end()) {
@@ -372,6 +392,8 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             "1. Write the full Python code inside a ```python block FIRST.\n"
             "2. Then, inside your JSON, set \"content\": \"__CODE_BLOCK_0__\".\n"
             "3. My system will automatically inject the code block into the file.\n";
+
+        prompt_template += relational_context;
 
         if (!business_context.empty()) prompt_template += business_context + "\n";
         if (!massive_context.empty()) prompt_template += massive_context + "\n";
@@ -525,6 +547,17 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             params["_batch_mode"] = true; 
 
             if (tool_name == "propose_plan") {
+                MemoryRecallResult past_experiences = memory_vault_->recall(prompt_vec);
+
+                if (past_experiences.has_memories) {
+                    // Force the AI to reconsider the plan based on past failures
+                    internal_monologue += "\n⚠️ WAIT: Recalling past similar tasks...\n" + 
+                                        past_experiences.negative_warnings;
+                                        
+                    // Re-generate the prompt to include these warnings before the plan is finalized
+                    continue; 
+                }
+
                 if (params.contains("steps")) {
                     planning_engine_->propose_plan(req.prompt(), params["steps"]);
                     if (actions.size() > 1) {
@@ -553,6 +586,24 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
             this->notify(writer, "TOOL_EXEC", "Running " + tool_name);
             std::string observation = safe_execute_tool(tool_name, params, session_id);
+
+            if (tool_name == "apply_edit" && observation.find("SUCCESS") != std::string::npos) {
+                this->notify(writer, "VERIFYING", "Running automated build check...");
+                
+                // Automatically trigger a build/test tool based on project type
+                nlohmann::json verify_params;
+                verify_params["command"] = "python -m py_compile " + params["path"].get<std::string>(); // For Python
+                verify_params["project_id"] = req.project_id();
+                
+                std::string build_log = safe_execute_tool("run_command", verify_params, session_id);
+                
+                if (build_log.find("Exit Code: 0") == std::string::npos) {
+                    // If build fails, overwrite observation to force AI to see the error immediately
+                    observation = "⚠️ EDIT APPLIED BUT BUILD FAILED:\n" + build_log + 
+                                "\nACTION REQUIRED: Re-read the file and fix the syntax error.";
+                    this->notify(writer, "AUTO_REPAIR", "Build failed. Feeding error back to Brain.");
+                }
+            }
 
             if (planning_engine_->is_plan_approved()) {
                 auto plan = planning_engine_->get_snapshot();
@@ -638,13 +689,34 @@ std::string AgentExecutor::safe_execute_tool(
     spdlog::info("🛠️ [TOOL START] {} | Params: {}", tool_name, params.dump());
     
     try {
-        result = tool_registry_->dispatch(tool_name, params);
-        if (result.find("ERROR:") == 0) {
-            failed = true;
-            spdlog::warn("⚠️ [TOOL FAIL] {} | Reason: {}", tool_name, result);
-        } else {
-            spdlog::info("✅ [TOOL OK] {} | Output Size: {} chars", tool_name, result.size());
+        // --- 🛡️ START AST-GUARD INTEGRATION ---
+        if (tool_name == "apply_edit") {
+            std::string code = params.value("content", "");
+            std::string path = params.value("path", "");
+            std::string ext = fs::path(path).extension().string();
+
+            // Use the Elite Parser to check syntax before writing to disk
+            code_assistance::elite::ASTBooster temp_parser;
+            if (!temp_parser.validate_syntax(code, ext)) {
+                failed = true;
+                result = "ERROR: AST REJECTION. Your proposed code for '" + path + 
+                         "' contains syntax or indentation errors. Please fix the structure and try again.";
+                spdlog::warn("🚫 [AST GUARD] Blocked broken code injection for {}", path);
+            }
         }
+        // --- 🛡️ END AST-GUARD INTEGRATION ---
+
+        // Only dispatch if the guard hasn't already flagged a failure
+        if (!failed) {
+            result = tool_registry_->dispatch(tool_name, params);
+            if (result.find("ERROR:") == 0) {
+                failed = true;
+                spdlog::warn("⚠️ [TOOL FAIL] {} | Reason: {}", tool_name, result);
+            } else {
+                spdlog::info("✅ [TOOL OK] {} | Output Size: {} chars", tool_name, result.size());
+            }
+        }
+        
     } catch (const std::exception& e) {
         failed = true;
         result = "SYSTEM EXCEPTION: " + std::string(e.what());
@@ -658,6 +730,8 @@ std::string AgentExecutor::safe_execute_tool(
     auto end_time = std::chrono::high_resolution_clock::now();
     double duration = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
+    // The trace will now correctly show "FAILED: apply_edit -> ERROR: AST REJECTION..." 
+    // if the code was broken.
     std::string state = failed ? "ERROR_CATCH" : "TOOL_EXEC";
     code_assistance::LogManager::instance().add_trace({
         session_id, 
