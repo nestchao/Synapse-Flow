@@ -280,7 +280,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     code_assistance::GenerationResult last_gen; 
 
     // Record User Prompt
-    std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
+    prompt_vec = ai_service_->generate_embedding(req.prompt());
     std::string root_node_id = graph->add_node(req.prompt(), NodeType::PROMPT, parent_node_id, prompt_vec, {{"session_id", session_id}});
     std::string last_graph_node = root_node_id;
 
@@ -356,7 +356,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     }
 
     // Load Full Context
-    std::string massive_context = "";
+    massive_context = "";
     std::string full_codebase = load_full_context_file(req.project_id());
     if (!full_codebase.empty()) {
         const size_t SAFE_TOKEN_LIMIT_BYTES = 3800000; 
