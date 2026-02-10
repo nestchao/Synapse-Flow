@@ -60,7 +60,11 @@ class SynapseFullAuditor:
 
     def run_rag_precision(self):
         self.print_header("PHASE 3: RAG PRECISION (Rank-1 Accuracy)")
-        # We look for module 50 specifically among the 100 files
+        
+        # 🚀 ADD THIS: Give the C++ engine 2 seconds to finalize file writes
+        print("   (Waiting for index stabilization...)")
+        time.sleep(2) 
+        
         query = "Find the logic for perf module 50"
         res = self.session.post(f"{REST_URL}/retrieve-context-candidates", json={"project_id": PROJECT_ID, "prompt": query})
         candidates = res.json().get('candidates', [])

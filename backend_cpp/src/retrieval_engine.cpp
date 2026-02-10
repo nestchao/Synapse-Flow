@@ -42,6 +42,8 @@ std::vector<RetrievalResult> RetrievalEngine::retrieve(
     std::unordered_set<std::string> seen_ids;
 
     for (auto& res : expanded) {
+        if (!res.node) continue; 
+        
         // Use a unique key: path + name
         std::string key = res.node->file_path + "::" + res.node->name;
         if (seen_ids.find(key) == seen_ids.end()) {

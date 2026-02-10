@@ -198,15 +198,27 @@ private:
 
     // --- ROUTE HANDLERS (Moved INSIDE class) ---
 
+    // --- 1. Registration Handler ---
     void handle_register_project(const httplib::Request& req, httplib::Response& res) {
         try {
-            auto project_id = req.path_params.at("project_id");
+            std::string project_id = req.path_params.at("project_id");
             auto body = json::parse(req.body);
-            fs::path path = fs::path("data") / project_id / "config.json";
-            fs::create_directories(path.parent_path());
-            std::ofstream f(path); f << body.dump(2);
+            
+            // Ensure data directory exists
+            fs::path project_dir = fs::path("data") / project_id;
+            fs::create_directories(project_dir);
+
+            // Save config.json for future syncs
+            std::ofstream f(project_dir / "config.json");
+            f << body.dump(2);
+            
+            spdlog::info("🛰️ Project Registered: {}", project_id);
             res.set_content(json{{"success", true}}.dump(), "application/json");
-        } catch(...) { res.status = 500; }
+        } catch (const std::exception& e) {
+            spdlog::error("❌ Registration Failed: {}", e.what());
+            res.status = 400;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
     }
 
     void handle_sync_project(const httplib::Request& req, httplib::Response& res) {
@@ -263,30 +275,41 @@ private:
     void handle_retrieve_candidates(const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
-            std::string project_id = body["project_id"];
-            std::string prompt = body["prompt"];
-            auto store = load_vector_store(project_id);
-            if (!store) { res.status = 404; return; }
+            std::string project_id = body.value("project_id", "");
+            std::string prompt = body.value("prompt", "");
+
+            // 🛡️ CRITICAL FIX: Get the Graph ALREADY in memory from the executor
+            // This prevents the "Connection Reset" crash caused by file-lock conflicts
+            auto graph = executor_->get_or_create_graph(project_id);
             
+            // Generate embedding for the query
             auto query_emb = ai_service_->generate_embedding(prompt);
-            code_assistance::RetrievalEngine engine(store);
-            auto results = engine.retrieve(prompt, query_emb, 10, true);
+            if (query_emb.empty()) {
+                throw std::runtime_error("Failed to generate query embedding");
+            }
+
+            // Use the PointerGraph's semantic search directly
+            // This returns nodes that are guaranteed to exist in RAM
+            auto results = graph->semantic_search(query_emb, 10);
             
             json candidates = json::array();
-            for (const auto& r : results) {
-                spdlog::info("🔍 Result: name='{}' file_path='{}' type='{}'", 
-                    r.node->name, 
-                    r.node->file_path, 
-                    r.node->type);
-                candidates.push_back({
-                    {"file_path", r.node->file_path}, 
-                    {"name", r.node->name},           // Add this
-                    {"content", r.node->content},
-                    {"score", r.final_score}          // Helpful for debugging
-                });
+            for (const auto& node : results) {
+                json item;
+                item["file_path"] = node.metadata.count("file_path") ? node.metadata.at("file_path") : "unknown";
+                item["name"] = node.metadata.count("node_name") ? node.metadata.at("node_name") : "anonymous";
+                item["content"] = node.content; // The code snippet
+                item["type"] = node_type_to_string(node.type);
+                candidates.push_back(item);
             }
+
+            spdlog::info("🔎 RAG Audit: Found {} candidates for project {}", candidates.size(), project_id);
             res.set_content(json{{"candidates", candidates}}.dump(), "application/json");
-        } catch(...) { res.status = 500; }
+
+        } catch (const std::exception& e) {
+            spdlog::error("❌ Retrieval API Error: {}", e.what());
+            res.status = 500;
+            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+        }
     }
 
     void setup_routes() {

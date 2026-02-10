@@ -74,8 +74,8 @@ void FaissVectorStore::add_nodes(const std::vector<std::shared_ptr<CodeNode>>& n
 std::vector<FaissSearchResult> FaissVectorStore::search(const std::vector<float>& query_vector, int k) {
     std::shared_lock lock(rw_mutex_);
 
-    if (index_->ntotal == 0) return {};
-
+    if (index_->ntotal == 0 || nodes_list_.empty()) return {};
+    
     std::vector<float> query_copy = query_vector;
     faiss::fvec_renorm_L2(dimension_, 1, query_copy.data());
 
@@ -88,9 +88,9 @@ std::vector<FaissSearchResult> FaissVectorStore::search(const std::vector<float>
     for (int i = 0; i < k; ++i) {
         if (indices[i] == -1) continue;
         
-        auto it = id_to_node_map_.find(indices[i]);
-        if (it != id_to_node_map_.end()) {
-            results.push_back({it->second, scores[i]});
+        // 🛡️ CRITICAL FIX: Ensure the ID returned by FAISS exists in our mapping
+        if (id_to_node_map_.count(indices[i])) {
+            results.push_back({id_to_node_map_[indices[i]], scores[i]});
         }
     }
     return results;
