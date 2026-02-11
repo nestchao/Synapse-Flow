@@ -251,13 +251,27 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     std::string massive_context = ""; // Declare this here so we can add to it
 
     for (const auto& node : top_nodes) {
-        auto related = graph->get_children(node.id);
-        for (const auto& r_node : related) {
-            relational_context += "- " + node.id + " -> calls -> " + r_node.metadata.at("node_name") + "\n";
-            
-            if (r_node.type == NodeType::CONTEXT_CODE) {
-                massive_context += "\n# DEPENDENCY: " + r_node.metadata.at("file_path") + "\n" + r_node.content;
+        try {
+            auto related = graph->get_children(node.id);
+            for (const auto& r_node : related) {
+                // 🛡️ DEFENSIVE CHECK: Use value() with fallback to prevent .at() crashes
+                std::string r_name = "anonymous";
+                if (r_node.metadata.count("node_name")) {
+                    r_name = r_node.metadata.at("node_name");
+                }
+                
+                relational_context += "- " + node.id + " -> calls -> " + r_name + "\n";
+                
+                if (r_node.type == NodeType::CONTEXT_CODE) {
+                    std::string r_path = "unknown_path";
+                    if (r_node.metadata.count("file_path")) {
+                        r_path = r_node.metadata.at("file_path");
+                    }
+                    massive_context += "\n# DEPENDENCY: " + r_path + "\n" + r_node.content;
+                }
             }
+        } catch (const std::exception& e) {
+            spdlog::warn("⚠️ Sigma-2 Traversal skipped for node {}: {}", node.id, e.what());
         }
     }
 
