@@ -242,6 +242,8 @@ std::vector<float> EmbeddingService::generate_embedding(const std::string& text)
                 return vec;
             }
         } catch(...) {}
+    } else {
+        spdlog::error("❌ Gemini Embedding API Error: Status {} | Body: {}", r.status_code, r.text);
     }
     return {};
 }

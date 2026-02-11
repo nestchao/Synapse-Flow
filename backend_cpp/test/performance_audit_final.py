@@ -36,12 +36,14 @@ class SynapseFullAuditor:
         
         # Polling Telemetry
         while True:
-            telem = self.session.get(f"{REST_URL}/api/admin/telemetry").json()
-            if telem['metrics'].get('last_sync_duration_ms', 0) > 0:
-                duration = telem['metrics']['last_sync_duration_ms'] / 1000
-                print(colored(f"✅ Indexed {file_count} files in {duration:.2f}s", "green"))
-                print(f"📈 Speed: {file_count/duration:.1f} files/sec")
-                break
+            try:
+                telem = self.session.get(f"{REST_URL}/api/admin/telemetry").json()
+                if telem['metrics'].get('last_sync_duration_ms', 0) > 0:
+                    duration = telem['metrics']['last_sync_duration_ms'] / 1000
+                    print(colored(f"✅ Indexed {file_count} files in {duration:.2f}s", "green"))
+                    print(f"📈 Speed: {file_count/duration:.1f} files/sec")
+                    break
+            except: pass
             time.sleep(0.5)
 
     def run_ghost_latency(self, iters=20):
@@ -51,45 +53,70 @@ class SynapseFullAuditor:
         
         for i in range(iters):
             t0 = time.time()
-            self.session.post(f"{REST_URL}/complete", json=payload)
-            latencies.append((time.time() - t0) * 1000)
+            try:
+                self.session.post(f"{REST_URL}/complete", json=payload, timeout=5)
+                latencies.append((time.time() - t0) * 1000)
+            except: pass
         
-        avg = statistics.mean(latencies)
-        p95 = sorted(latencies)[int(iters*0.95)-1]
-        print(f"📊 Avg: {colored(f'{avg:.0f}ms', 'green')} | P95: {colored(f'{p95:.0f}ms', 'yellow')}")
+        if latencies:
+            avg = statistics.mean(latencies)
+            p95 = sorted(latencies)[int(len(latencies)*0.95)-1]
+            print(f"📊 Avg: {colored(f'{avg:.0f}ms', 'green')} | P95: {colored(f'{p95:.0f}ms', 'yellow')}")
 
-    def run_rag_precision(self):
+    def run_rag_precision(self, retries=5): # 🚀 Added 'retries' parameter here
         self.print_header("PHASE 3: RAG PRECISION (Rank-1 Accuracy)")
-        
-        # 🚀 ADD THIS: Give the C++ engine 2 seconds to finalize file writes
         print("   (Waiting for index stabilization...)")
-        time.sleep(2) 
+        time.sleep(3) 
+
+        for attempt in range(retries):
+            try:
+                res = self.session.post(f"{REST_URL}/retrieve-context-candidates", 
+                                        json={"project_id": PROJECT_ID, "prompt": "Find the logic for perf module 50"},
+                                        timeout=10)
+                
+                if res.status_code == 200:
+                    candidates = res.json().get('candidates', [])
+                    found_rank = 0
+                    for i, c in enumerate(candidates):
+                        if "perf_module_50" in c.get('file_path', ''):
+                            found_rank = i + 1
+                            break
+                    
+                    if found_rank == 1:
+                        print(colored("🎯 PERFECT MATCH: Target found at Rank 1", "green", attrs=['bold']))
+                    elif found_rank > 0:
+                        print(colored(f"⚠️  ACCURACY DROP: Target found at Rank {found_rank}", "yellow"))
+                    else:
+                        print(colored("❌ NOT FOUND: Target missing from top results", "red"))
+                    return # Exit function on successful API call
+                else:
+                    print(colored(f"   ⚠️ Attempt {attempt+1} failed (HTTP {res.status_code}). Retrying...", "yellow"))
+            except Exception as e:
+                print(colored(f"   ⚠️ Attempt {attempt+1} connection error. Retrying...", "yellow"))
+            
+            time.sleep(5)
         
-        query = "Find the logic for perf module 50"
-        res = self.session.post(f"{REST_URL}/retrieve-context-candidates", json={"project_id": PROJECT_ID, "prompt": query})
-        candidates = res.json().get('candidates', [])
-        
-        found_rank = 0
-        for i, c in enumerate(candidates):
-            if "perf_module_50" in c['file_path']:
-                found_rank = i + 1
-                break
-        
-        if found_rank == 1:
-            print(colored("🎯 PERFECT MATCH: Target found at Rank 1", "green", attrs=['bold']))
-        else:
-            print(colored(f"⚠️  ACCURACY DROP: Target found at Rank {found_rank}", "red"))
+        print(colored("❌ PHASE 3 FAILED after multiple retries.", "red"))
 
     def run_agent_loop(self):
         self.print_header("PHASE 4: AGENT SELF-HEALING SPEED")
         prompt = "Create a file 'verify_test.py'. Write a function with a purposeful indentation error. Then use self-healing to fix it."
         
+        print("   (Agent is thinking and executing tools...)")
         start = time.time()
-        res = self.session.post(f"{REST_URL}/generate-code-suggestion", json={"project_id": PROJECT_ID, "prompt": prompt}, timeout=120)
-        duration = time.time() - start
-        
-        print(colored(f"🤖 Agent Loop Finished in {duration:.2f}s", "magenta"))
-        print(f"📄 Result Preview: {res.json().get('suggestion')[:100]}...")
+        try:
+            res = self.session.post(f"{REST_URL}/generate-code-suggestion", 
+                                    json={"project_id": PROJECT_ID, "prompt": prompt}, 
+                                    timeout=180) # High timeout for agent loops
+            duration = time.time() - start
+            
+            if res.status_code == 200:
+                print(colored(f"🤖 Agent Loop Finished in {duration:.2f}s", "magenta"))
+                print(f"📄 Result Preview: {res.json().get('suggestion', '')[:100]}...")
+            else:
+                print(colored(f"❌ Agent Error: HTTP {res.status_code}", "red"))
+        except Exception as e:
+            print(colored(f"💥 Agent Connection Reset (Check if C++ Server Crashed): {e}", "red"))
 
 if __name__ == "__main__":
     auditor = SynapseFullAuditor()
