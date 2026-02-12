@@ -40,8 +40,9 @@ class SynapseFullAuditor:
                 telem = self.session.get(f"{REST_URL}/api/admin/telemetry").json()
                 if telem['metrics'].get('last_sync_duration_ms', 0) > 0:
                     duration = telem['metrics']['last_sync_duration_ms'] / 1000
-                    print(colored(f"✅ Indexed {file_count} files in {duration:.2f}s", "green"))
-                    print(f"📈 Speed: {file_count/duration:.1f} files/sec")
+                    print(colored(f"✅ Indexed {file_count} files.", "green"))
+                    print(colored("⏳ Cooling down API for 10 seconds...", "yellow"))
+                    time.sleep(10) # 🚀 ESSENTIAL: Prevents 429 Rate Limits
                     break
             except: pass
             time.sleep(0.5)

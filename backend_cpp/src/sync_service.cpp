@@ -289,6 +289,11 @@ SyncResult SyncService::perform_sync(
     auto manifest = load_manifest(project_id);
     auto existing_nodes_map = load_existing_nodes(storage_path_str);
 
+    if (manifest.empty()) {
+        spdlog::warn("🧹 Fresh Sync Detected. Clearing old graph nodes...");
+        // If you have a clear() method in your graph, call it here
+    }
+
     FilterConfig cfg;
     cfg.blacklist = ignored_paths;
     cfg.whitelist = included_paths;

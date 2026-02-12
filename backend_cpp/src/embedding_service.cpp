@@ -140,14 +140,15 @@ std::string EmbeddingService::get_endpoint_url(const std::string& action) {
     std::string key = key_manager_->get_current_key();
     std::string model = key_manager_->get_current_model();
     
-    std::string model_path;
-    if (action == "embedContent" || action == "batchEmbedContents") {
-        model_path = "models/text-embedding-004"; 
-    } else {
-        if (model.find("models/") == 0) model_path = model;
-        else model_path = "models/" + model;
+    // 🚀 FIX: Special handling for embeddings to avoid 404
+    if (action == "embedContent") {
+        // Use 'v1' for embeddings if 'v1beta' fails, and ensure the path is clean
+        return "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key=" + key;
     }
-    return base_url_ + model_path + ":" + action + "?key=" + key;
+
+    // Standard logic for text generation
+    std::string model_path = (model.find("models/") == 0) ? model : "models/" + model;
+    return "https://generativelanguage.googleapis.com/v1beta/" + model_path + ":" + action + "?key=" + key;
 }
 
 // Helper: Fail-Fast Retry
