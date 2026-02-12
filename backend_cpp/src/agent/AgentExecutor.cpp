@@ -254,24 +254,20 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         try {
             auto related = graph->get_children(node.id);
             for (const auto& r_node : related) {
-                // 🛡️ DEFENSIVE CHECK: Use value() with fallback to prevent .at() crashes
-                std::string r_name = "anonymous";
-                if (r_node.metadata.count("node_name")) {
-                    r_name = r_node.metadata.at("node_name");
-                }
+                // 🛡️ CRITICAL: Never use .at() or [] in a threaded agent. Use .find()
+                auto it_name = r_node.metadata.find("node_name");
+                std::string r_name = (it_name != r_node.metadata.end()) ? it_name->second : "anonymous_symbol";
                 
-                relational_context += "- " + node.id + " -> calls -> " + r_name + "\n";
+                relational_context += "- " + node.id + " -> links to -> " + r_name + "\n";
                 
                 if (r_node.type == NodeType::CONTEXT_CODE) {
-                    std::string r_path = "unknown_path";
-                    if (r_node.metadata.count("file_path")) {
-                        r_path = r_node.metadata.at("file_path");
-                    }
-                    massive_context += "\n# DEPENDENCY: " + r_path + "\n" + r_node.content;
+                    auto it_path = r_node.metadata.find("file_path");
+                    std::string r_path = (it_path != r_node.metadata.end()) ? it_path->second : "unknown_file";
+                    massive_context += "\n# FILE: " + r_path + "\n" + r_node.content + "\n";
                 }
             }
-        } catch (const std::exception& e) {
-            spdlog::warn("⚠️ Sigma-2 Traversal skipped for node {}: {}", node.id, e.what());
+        } catch (...) {
+            spdlog::warn("⚠️ Graph traversal safety-tripped for node {}", node.id);
         }
     }
 
