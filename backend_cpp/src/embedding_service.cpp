@@ -138,17 +138,17 @@ EmbeddingService::EmbeddingService(std::shared_ptr<KeyManager> key_manager)
 
 std::string EmbeddingService::get_endpoint_url(const std::string& action) {
     std::string key = key_manager_->get_current_key();
-    std::string model = key_manager_->get_current_model();
     
-    // 🚀 FIX: Special handling for embeddings to avoid 404
+    // 🚀 THE FIX: Use the model confirmed by your PowerShell test
     if (action == "embedContent") {
-        // Use 'v1' for embeddings if 'v1beta' fails, and ensure the path is clean
-        return "https://generativelanguage.googleapis.com/v1/models/text-embedding-004:embedContent?key=" + key;
+        return "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=" + key;
     }
 
-    // Standard logic for text generation
-    std::string model_path = (model.find("models/") == 0) ? model : "models/" + model;
-    return "https://generativelanguage.googleapis.com/v1beta/" + model_path + ":" + action + "?key=" + key;
+    // Standard generation (Gemini 1.5/2.0 Flash/Pro)
+    std::string model = key_manager_->get_current_model();
+    if (model.find("models/") == 0) model = model.substr(7); 
+    
+    return "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":" + action + "?key=" + key;
 }
 
 // Helper: Fail-Fast Retry
@@ -222,47 +222,56 @@ GenerationResult EmbeddingService::call_python_bridge(const std::string& prompt)
 }
 
 std::vector<float> EmbeddingService::generate_embedding(const std::string& text) {
-    auto r = perform_request_with_retry_fast([&]() {
-        std::string key = key_manager_->get_current_key();
-        std::string url = base_url_ + "models/text-embedding-004:embedContent?key=" + key;
-        return cpr::Post(cpr::Url{url},
-                         cpr::Body(json{
-                             {"model", "models/text-embedding-004"},
-                             {"content", {{"parts", {{{"text", text}}}}}}
-                         }.dump()),
-                         cpr::Header{{"Content-Type", "application/json"}},
-                         cpr::VerifySsl{false});
-    }, key_manager_);
-    
-    if (r.status_code == 200) {
-        try {
-            auto j = json::parse(r.text);
-            if (j.contains("embedding") && j["embedding"].contains("values")) {
-                std::vector<float> vec = j["embedding"]["values"];
-                cache_manager_->set_embedding(text, vec);
-                return vec;
-            }
-        } catch(...) {}
-    } else {
-        spdlog::error("❌ Gemini Embedding API Error: Status {} | Body: {}", r.status_code, r.text);
+    int max_retries = 3;
+    int backoff_ms = 2000;
+
+    for (int i = 0; i < max_retries; ++i) {
+        auto r = perform_request_with_retry_fast([&]() {
+            return cpr::Post(
+                cpr::Url{get_endpoint_url("embedContent")},
+                cpr::Body{json{
+                    {"model", "models/gemini-embedding-001"}, // 🚀 FIX: Use correct model name
+                    {"content", {{"parts", {{{"text", text}}}}}}
+                }.dump()},
+                cpr::Header{{"Content-Type", "application/json"}},
+                cpr::VerifySsl{false}, 
+                cpr::Timeout{15000}
+            );
+        }, key_manager_);
+
+        if (r.status_code == 200) {
+            try {
+                auto j = json::parse(r.text);
+                return j["embedding"]["values"].get<std::vector<float>>();
+            } catch(...) { break; }
+        } 
+        
+        if (r.status_code == 429) {
+            spdlog::warn("⏳ Embedding Rate Limited (429). Retrying in {}ms...", backoff_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+            backoff_ms *= 2;
+            continue;
+        }
+
+        spdlog::error("❌ Embedding API Error: {} | {}", r.status_code, r.text);
+        break;
     }
     return {};
 }
 
 std::vector<std::vector<float>> EmbeddingService::generate_embeddings_batch(const std::vector<std::string>& texts) {
     if (texts.empty()) return {};
-    std::string key = key_manager_->get_current_key();
-    std::string url = base_url_ + "models/text-embedding-004:batchEmbedContents?key=" + key;
-
+    
     json requests = json::array();
     for (const auto& text : texts) {
         requests.push_back({
-            {"model", "models/text-embedding-004"},
+            {"model", "models/gemini-embedding-001"}, // 🚀 FIX: Must match v1beta model list
             {"content", {{"parts", {{{"text", text}}}}}}
         });
     }
 
-    auto r = cpr::Post(cpr::Url{url},
+    auto r = cpr::Post(
+        cpr::Url{get_endpoint_url("batchEmbedContents")},
         cpr::Body(json{{"requests", requests}}.dump()),
         cpr::Header{{"Content-Type", "application/json"}},
         cpr::VerifySsl{false}
@@ -274,14 +283,12 @@ std::vector<std::vector<float>> EmbeddingService::generate_embeddings_batch(cons
             auto j = json::parse(r.text);
             if (j.contains("embeddings")) {
                 for (const auto& item : j["embeddings"]) {
-                    if (item.contains("values")) {
-                        results.push_back(item["values"].get<std::vector<float>>());
-                    } else {
-                        results.push_back({});
-                    }
+                    results.push_back(item.value("values", std::vector<float>{}));
                 }
             }
         } catch(...) {}
+    } else {
+        spdlog::error("❌ Batch Embedding Failed: {} | {}", r.status_code, r.text);
     }
     return results;
 }
