@@ -8,7 +8,7 @@ import json
 from browser_bridge import browser_bridge 
 
 # Configure your embedding model
-embedding_model = "models/text-embedding-004"
+embedding_model = "models/text-embedding-001"
 
 # --- CODE GRAPH ---
 CODE_GRAPH_COLLECTION = "code_graph_nodes"
