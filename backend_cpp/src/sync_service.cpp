@@ -395,7 +395,7 @@ SyncResult SyncService::perform_sync(
     spdlog::info("✅ Context preload complete in {}ms", preload_elapsed);
 
     if (!nodes_to_embed.empty()) {
-        generate_embeddings_batch(nodes_to_embed, 200);
+        generate_embeddings_batch(nodes_to_embed, 100);
     }
     
     generate_tree_file(source_dir, files_to_process, storage_dir / "tree.txt");

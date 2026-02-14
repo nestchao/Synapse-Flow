@@ -19,11 +19,14 @@ private:
 
     std::vector<ApiKey> key_pool;
     std::vector<std::string> model_pool;
+    std::vector<std::string> embedding_model_pool; 
+
     mutable std::shared_mutex pool_mutex;
     
     // Atomic index acts as the "Pointer" to the last usable key
     std::atomic<size_t> current_key_index{0};
     std::atomic<size_t> current_model_index{0};
+    std::atomic<size_t> current_embedding_index{0}; 
     
     std::string serper_key;
 
@@ -101,7 +104,15 @@ public:
     std::string get_current_model() const { return get_current_pair().model; }
     std::string get_serper_key() const { std::shared_lock lock(pool_mutex); return serper_key; }
 
-    // 🚀 NEW: Explicit rotation for Retries
+    std::string get_current_embedding_model() const {
+        std::shared_lock lock(pool_mutex);
+        if (embedding_model_pool.empty()) return "gemini-embedding-001";
+        return embedding_model_pool[current_embedding_index.load() % embedding_model_pool.size()];
+    }
+
+
+    void rotate_embedding_model() { current_embedding_index++; }
+
     void rotate_key() {
         size_t prev = current_key_index.fetch_add(1);
         spdlog::info("🔄 Rotating Key Pointer: {} -> {}", prev, prev + 1);
