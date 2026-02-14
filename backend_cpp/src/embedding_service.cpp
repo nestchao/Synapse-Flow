@@ -139,15 +139,14 @@ EmbeddingService::EmbeddingService(std::shared_ptr<KeyManager> key_manager)
 std::string EmbeddingService::get_endpoint_url(const std::string& action) {
     std::string key = key_manager_->get_current_key();
     
-    // 🚀 THE FIX: Use the model confirmed by your PowerShell test
-    if (action == "embedContent") {
-        return "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=" + key;
+    // 🚀 Check if the action is for embeddings
+    if (action == "embedContent" || action == "batchEmbedContents") {
+        std::string emb_model = key_manager_->get_current_embedding_model();
+        return "https://generativelanguage.googleapis.com/v1beta/models/" + emb_model + ":" + action + "?key=" + key;
     }
 
-    // Standard generation (Gemini 1.5/2.0 Flash/Pro)
+    // Otherwise use standard chat models
     std::string model = key_manager_->get_current_model();
-    if (model.find("models/") == 0) model = model.substr(7); 
-    
     return "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":" + action + "?key=" + key;
 }
 
