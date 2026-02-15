@@ -6,6 +6,7 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include "utils/Scrubber.hpp"
 
 namespace code_assistance {
 
@@ -82,7 +83,10 @@ std::string PointerGraph::add_node(const std::string& content,
 
     nodes_[node.id] = node;
     
-    if (nodes_.size() % 10 == 0) save();
+    if (nodes_.size() % 10 == 0) {
+        // 🚀 FIX: Call the INTERNAL version because we already hold the lock
+        save_internal(); 
+    }
 
     return node.id;
 }
@@ -162,18 +166,9 @@ std::vector<PointerNode> PointerGraph::query_by_metadata(const std::string& key,
 }
 
 void PointerGraph::save() {
-    // 1. Save Vector Index
-    if (!fs::exists(storage_path_)) fs::create_directories(storage_path_);
-    vector_store_->save(storage_path_);
-
-    // 2. Save Graph Structure (JSON)
-    nlohmann::json j = nlohmann::json::array();
-    for (const auto& [id, node] : nodes_) {
-        j.push_back(node.to_json());
-    }
-    
-    std::ofstream f(fs::path(storage_path_) / "graph.json");
-    f << j.dump(2);
+    std::shared_lock lock(data_mutex_); 
+    save_internal();
+    spdlog::info("💾 Pointer Graph Saved: {} nodes", nodes_.size());
 }
 
 void PointerGraph::load() {
@@ -209,6 +204,40 @@ void PointerGraph::load() {
             spdlog::error("⚠️ Failed to load Graph JSON: {}", e.what());
         }
     }
+}
+
+void PointerGraph::clear() {
+    std::unique_lock lock(data_mutex_); // 🛡️ Thread-safe wipe
+    
+    // 1. Wipe the episodic memory map
+    nodes_.clear();
+    
+    // 2. Wipe the ID mapping
+    faiss_to_uuid_.clear();
+    
+    // 3. Re-initialize the Vector Store to clear the FAISS index
+    // This ensures that old vectors are completely removed from memory
+    vector_store_ = std::make_unique<FaissVectorStore>(dimension_);
+    
+    spdlog::warn("🧠 [GRAPH WIPE] All episodic and semantic memory has been cleared.");
+}
+
+void PointerGraph::save_internal() {
+    if (!fs::exists(storage_path_)) fs::create_directories(storage_path_);
+    vector_store_->save(storage_path_);
+
+    nlohmann::json j = nlohmann::json::array();
+    for (auto& [id, node] : nodes_) {
+        PointerNode scrubbed_node = node;
+        scrubbed_node.content = code_assistance::scrub_json_string(node.content);
+        for (auto& [key, val] : scrubbed_node.metadata) {
+            val = code_assistance::scrub_json_string(val);
+        }
+        j.push_back(scrubbed_node.to_json());
+    }
+    
+    std::ofstream f(fs::path(storage_path_) / "graph.json");
+    f << j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 }
