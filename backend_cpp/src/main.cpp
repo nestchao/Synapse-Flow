@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <signal.h>
 
+#include "utils/Scrubber.hpp" 
+
 #include "KeyManager.hpp"
 #include "LogManager.hpp"
 #include "ThreadPool.hpp"
@@ -258,17 +260,26 @@ private:
 
     void handle_generate_suggestion(const httplib::Request& req, httplib::Response& res) {
         try {
-            auto body = json::parse(req.body);
+            auto body = nlohmann::json::parse(req.body);
             std::string result = executor_->run_autonomous_loop_internal(body);
-            res.set_content(json{{"suggestion", result}}.dump(), "application/json");
-        } catch(const std::exception& e) { 
-            spdlog::error("🔥 REST HANDLER ERROR: {}", e.what()); // 🚀 Log the error
-            res.status = 500; 
-            res.set_content(json{{"error", e.what()}}.dump(), "application/json"); // Return JSON error
-        } catch(...) {
-            spdlog::error("🔥 REST HANDLER CRASH: Unknown Exception"); 
+            
+            // Scrub the result string
+            std::string safe_result = code_assistance::scrub_json_string(result);
+
+            nlohmann::json response_json;
+            response_json["suggestion"] = safe_result;
+            
+            // 🚀 THE FIX: Use the 'replace' error handler during dump
+            // Parameters: (indent, indent_char, ensure_ascii, error_handler)
+            std::string dumped_json = response_json.dump(-1, ' ', false, 
+                                        nlohmann::json::error_handler_t::replace);
+            
+            res.set_content(dumped_json, "application/json");
+
+        } catch (const std::exception& e) {
+            spdlog::error("🔥 REST HANDLER FATAL: {}", e.what());
             res.status = 500;
-            res.set_content(json{{"error", "Unknown server exception"}}.dump(), "application/json");
+            res.set_content("{\"error\":\"Internal Server Error\"}", "application/json");
         }
     }
 

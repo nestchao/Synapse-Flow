@@ -14,6 +14,7 @@
 #include "parser_elite.hpp"
 #include "tools/FileSystemTools.hpp"
 #include "planning/ExecutionGuard.hpp"
+#include "utils/Scrubber.hpp"
 
 namespace code_assistance {
 
@@ -210,15 +211,21 @@ void AgentExecutor::ingest_sync_results(const std::string& project_id, const std
     size_t before_count = graph->get_node_count(); // You might need to add this getter to PointerGraph
     spdlog::info("🧠 [GRAPH INGESTION] Starting injection of {} nodes...", nodes.size());
 
+    if (nodes.size() > 50) {
+        spdlog::warn("🧹 Large sync detected. Purging old graph nodes for stability.");
+        graph->clear(); // Ensure this method exists in your PointerGraph class
+    }
+
     for (const auto& node : nodes) {
         std::unordered_map<std::string, std::string> meta;
-        meta["file_path"] = node->file_path;
-        meta["node_name"] = node->name;
-        meta["node_type"] = node->type;
+        meta["file_path"] = scrub_json_string(node->file_path);
+        meta["node_name"] = scrub_json_string(node->name);
+        meta["node_type"] = scrub_json_string(node->type);
         std::string deps = "";
         for(const auto& d : node->dependencies) deps += d + ",";
         meta["dependencies"] = deps;
-        graph->add_node(node->content, NodeType::CONTEXT_CODE, "", node->embedding, meta);
+        std::string safe_content = scrub_json_string(node->content);
+        graph->add_node(safe_content, NodeType::CONTEXT_CODE, "", node->embedding, meta);
     }
     graph->save();
     spdlog::info("✅ [GRAPH INGESTION] Success. Total Memory Nodes: {}", graph->get_node_count());

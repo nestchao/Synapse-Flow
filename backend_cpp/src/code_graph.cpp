@@ -13,32 +13,41 @@ namespace code_assistance {
 namespace fs = std::filesystem; 
 using json = nlohmann::json;
 
-std::string sanitize_utf8(const std::string& str) {
-    std::string safe_str;
-    safe_str.reserve(str.size());
+std::string scrub_utf8(const std::string& str) {
+    std::string out;
+    out.reserve(str.size());
     for (size_t i = 0; i < str.length(); ++i) {
         unsigned char c = static_cast<unsigned char>(str[i]);
-        if (c < 0x80) safe_str += c;
-        else if (c >= 0xC0) safe_str += c; 
-        else if (c >= 0x80 && c < 0xC0) safe_str += c;
-        else safe_str += '?';
+        // Allow common whitespace: Tab, Newline, Carriage Return
+        if (c == 0x09 || c == 0x0A || c == 0x0D) {
+            out += c;
+            continue;
+        }
+        // Allow Standard Printable ASCII
+        if (c >= 0x20 && c <= 0x7E) {
+            out += c;
+            continue;
+        }
+        // Replace everything else (extended ASCII, emojis, invalid bytes) with a space
+        // This prevents the JSON library from throwing type_error.316
+        out += ' ';
     }
-    return safe_str;
+    return out;
 }
 
 json CodeNode::to_json() const {
     try {
         return json{
-            {"id", sanitize_utf8(id)},
-            {"name", sanitize_utf8(name)},
-            {"content", sanitize_utf8(content)}, 
-            {"docstring", sanitize_utf8(docstring)},
-            {"file_path", sanitize_utf8(file_path)},
+            {"id", scrub_utf8(id)},
+            {"name", scrub_utf8(name)},
+            {"content", scrub_utf8(content)}, 
+            {"docstring", scrub_utf8(docstring)},
+            {"file_path", scrub_utf8(file_path)},
             {"type", type},
             {"dependencies", dependencies},
             {"embedding", embedding},
             {"weights", weights},
-            {"ai_summary", sanitize_utf8(ai_summary)},
+            {"ai_summary", scrub_utf8(ai_summary)},
             {"ai_quality_score", ai_quality_score}
         };
     } catch (...) { return json{{"id", "error"}}; }

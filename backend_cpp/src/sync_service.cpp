@@ -205,6 +205,9 @@ void SyncService::generate_embeddings_batch(std::vector<std::shared_ptr<CodeNode
             for (size_t j = 0; j < embs.size(); ++j) {
                 if (i + j < nodes.size()) nodes[i + j]->embedding = embs[j];
             }
+            if (i + batch_size < nodes.size()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            }
         } catch(...) {
             spdlog::error("   - Batch embedding failed at index {}", i);
         }

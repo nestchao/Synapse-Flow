@@ -45,6 +45,8 @@ public:
     // Returns concatenated code snippets relevant to the query
     std::string get_relevant_context(const std::string& query, int max_chars = 4000);
 
+    void clear();
+
     // --- PERSISTENCE ---
     void save();
     void load();
@@ -66,6 +68,8 @@ private:
     mutable std::shared_mutex data_mutex_;
 
     std::string generate_uuid();
+
+    void save_internal(); 
 };
 
 }
