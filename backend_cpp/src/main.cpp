@@ -204,7 +204,8 @@ private:
     void handle_register_project(const httplib::Request& req, httplib::Response& res) {
         try {
             std::string project_id = req.path_params.at("project_id");
-            auto body = json::parse(req.body);
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            auto body = json::parse(safe_body);
             
             // Ensure data directory exists
             fs::path project_dir = fs::path("data") / project_id;
@@ -260,24 +261,23 @@ private:
 
     void handle_generate_suggestion(const httplib::Request& req, httplib::Response& res) {
         try {
-            auto body = nlohmann::json::parse(req.body);
+            // 🛡️ CRITICAL: Scrub BEFORE parsing
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            auto body = nlohmann::json::parse(safe_body);
+            
             std::string result = executor_->run_autonomous_loop_internal(body);
             
-            // Scrub the result string
+            // Also scrub the output
             std::string safe_result = code_assistance::scrub_json_string(result);
-
             nlohmann::json response_json;
             response_json["suggestion"] = safe_result;
             
-            // 🚀 THE FIX: Use the 'replace' error handler during dump
-            // Parameters: (indent, indent_char, ensure_ascii, error_handler)
-            std::string dumped_json = response_json.dump(-1, ' ', false, 
-                                        nlohmann::json::error_handler_t::replace);
-            
-            res.set_content(dumped_json, "application/json");
-
+            res.set_content(
+                response_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                "application/json"
+            );
         } catch (const std::exception& e) {
-            spdlog::error("🔥 REST HANDLER FATAL: {}", e.what());
+            spdlog::error("🔥 REST HANDLER ERROR: {}", e.what());
             res.status = 500;
             res.set_content("{\"error\":\"Internal Server Error\"}", "application/json");
         }
@@ -285,7 +285,9 @@ private:
 
     void handle_retrieve_candidates(const httplib::Request& req, httplib::Response& res) {
         try {
-            auto body = json::parse(req.body);
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            auto body = json::parse(safe_body);
+
             std::string project_id = body.value("project_id", "");
             std::string prompt = body.value("prompt", "");
 
@@ -337,7 +339,9 @@ private:
         server_.Post("/complete", [this](const httplib::Request& req, httplib::Response& res) {
             auto start = std::chrono::high_resolution_clock::now();
             try {
-                auto body = json::parse(req.body);
+                std::string safe_body = code_assistance::scrub_json_string(req.body);
+                auto body = json::parse(safe_body);
+
                 std::string prefix = body.value("prefix", "");
                 std::string suffix = body.value("suffix", "");
                 std::string project_id = body.value("project_id", "");
@@ -398,7 +402,10 @@ private:
         server_.Post("/sync/run/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
             try {
                 auto project_id = req.path_params.at("project_id");
-                json body = json::parse(req.body);
+
+                std::string safe_body = code_assistance::scrub_json_string(req.body);
+                auto body = json::parse(safe_body);
+
                 std::string store_path = body.value("storage_path", "");
                 if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
                 
@@ -450,7 +457,10 @@ private:
         server_.Post("/sync/file/:project_id", [this](const httplib::Request& req, httplib::Response& res) {
             try {
                 std::string project_id = req.path_params.at("project_id");
-                auto body = json::parse(req.body);
+
+                std::string safe_body = code_assistance::scrub_json_string(req.body);
+                auto body = json::parse(safe_body);
+
                 std::string rel_path = body.value("file_path", "");
                 
                 if (rel_path.find(".study_assistant") == std::string::npos) {

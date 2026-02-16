@@ -37,20 +37,31 @@ std::string scrub_utf8(const std::string& str) {
 
 json CodeNode::to_json() const {
     try {
-        return json{
-            {"id", scrub_utf8(id)},
-            {"name", scrub_utf8(name)},
-            {"content", scrub_utf8(content)}, 
-            {"docstring", scrub_utf8(docstring)},
-            {"file_path", scrub_utf8(file_path)},
-            {"type", type},
-            {"dependencies", dependencies},
-            {"embedding", embedding},
-            {"weights", weights},
-            {"ai_summary", scrub_utf8(ai_summary)},
-            {"ai_quality_score", ai_quality_score}
-        };
-    } catch (...) { return json{{"id", "error"}}; }
+        json j;
+        j["id"] = scrub_utf8(id);
+        j["name"] = scrub_utf8(name);
+        j["content"] = scrub_utf8(content);
+        j["docstring"] = scrub_utf8(docstring);
+        j["file_path"] = scrub_utf8(file_path);
+        j["type"] = scrub_utf8(type);  // ✅ Scrub this too, just in case
+        
+        // Scrub dependencies
+        json deps_array = json::array();
+        for (const auto& dep : dependencies) {
+            deps_array.push_back(scrub_utf8(dep));
+        }
+        j["dependencies"] = deps_array;
+        
+        j["embedding"] = embedding;  // Numeric data - safe
+        j["weights"] = weights;      // Numeric data - safe
+        j["ai_summary"] = scrub_utf8(ai_summary);
+        j["ai_quality_score"] = ai_quality_score;
+        
+        return j;
+    } catch (const std::exception& e) {
+        spdlog::error("CodeNode::to_json() error: {}", e.what());
+        return json{{"id", "error"}, {"error", e.what()}};
+    }
 }
 
 CodeNode CodeNode::from_json(const json& j) {
