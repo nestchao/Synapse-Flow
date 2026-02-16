@@ -678,7 +678,7 @@ mission_complete:
     log.ai_response = final_output;
     log.timestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     log.duration_ms = total_ms;
-    log.full_prompt = last_effective_prompt + "\n\n### EXECUTION HISTORY\n" + internal_monologue;
+    log.full_prompt = scrub_json_string(last_effective_prompt + "\n\n### EXECUTION HISTORY\n" + internal_monologue);
     code_assistance::LogManager::instance().add_log(log);
 
     graph->save();

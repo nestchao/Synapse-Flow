@@ -7,6 +7,8 @@
 #include <iostream>
 #include <filesystem> 
 #include <nlohmann/json.hpp>
+#include "utils/Scrubber.hpp"
+
 using json = nlohmann::json;
 
 namespace code_assistance {
@@ -57,8 +59,8 @@ public:
                 {"project_id", it->project_id},
                 {"request_type", it->request_type},
                 {"user_query", it->user_query},
-                {"full_prompt", it->full_prompt},
-                {"ai_response", it->ai_response},
+                {"full_prompt", scrub_json_string(it->full_prompt)},
+                {"ai_response", scrub_json_string(it->ai_response)},
                 {"vector_snapshot", it->vector_snapshot},
                 {"duration_ms", it->duration_ms},
                 {"total_tokens", it->total_tokens},
@@ -105,18 +107,18 @@ private:
         for (const auto& log : logs_) {
             j.push_back({
                 {"t", (long long)log.timestamp},
-                {"p", log.project_id},
-                {"rt", log.request_type},
-                {"q", log.user_query},
-                {"fp", log.full_prompt},
-                {"r", log.ai_response},
+                {"p", scrub_json_string(log.project_id)},
+                {"rt", scrub_json_string(log.request_type)},
+                {"q", scrub_json_string(log.user_query)},
+                {"fp", scrub_json_string(log.full_prompt)},
+                {"r", scrub_json_string(log.ai_response)},
                 {"d", log.duration_ms}
             });
         }
         
         std::filesystem::create_directories("data");
         std::ofstream o(LOG_FILE);
-        o << j.dump(2);
+        o << j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     }
 
     void load_logs_from_disk() {

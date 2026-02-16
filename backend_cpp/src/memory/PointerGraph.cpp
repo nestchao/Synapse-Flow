@@ -166,9 +166,37 @@ std::vector<PointerNode> PointerGraph::query_by_metadata(const std::string& key,
 }
 
 void PointerGraph::save() {
-    std::shared_lock lock(data_mutex_); 
+    std::unique_lock lock(data_mutex_); 
     save_internal();
     spdlog::info("💾 Pointer Graph Saved: {} nodes", nodes_.size());
+}
+
+void PointerGraph::save_internal() {
+    // NO LOCK HERE - caller must hold unique_lock
+    if (!fs::exists(storage_path_)) fs::create_directories(storage_path_);
+    vector_store_->save(storage_path_);
+    
+    nlohmann::json j = nlohmann::json::array();
+    for (auto& [id, node] : nodes_) {
+        nlohmann::json node_json;
+        node_json["id"] = node.id;
+        node_json["type"] = node_type_to_string(node.type);
+        node_json["timestamp"] = node.timestamp;
+        node_json["content"] = code_assistance::scrub_json_string(node.content);
+        
+        nlohmann::json meta_json = nlohmann::json::object();
+        for (auto const& [key, val] : node.metadata) {
+            meta_json[key] = code_assistance::scrub_json_string(val);
+        }
+        node_json["metadata"] = meta_json;
+        node_json["parent_id"] = node.parent_id;
+        node_json["children_ids"] = node.children_ids;
+        
+        j.push_back(node_json);
+    }
+    
+    std::ofstream f(fs::path(storage_path_) / "graph.json");
+    f << j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 void PointerGraph::load() {
@@ -220,24 +248,6 @@ void PointerGraph::clear() {
     vector_store_ = std::make_unique<FaissVectorStore>(dimension_);
     
     spdlog::warn("🧠 [GRAPH WIPE] All episodic and semantic memory has been cleared.");
-}
-
-void PointerGraph::save_internal() {
-    if (!fs::exists(storage_path_)) fs::create_directories(storage_path_);
-    vector_store_->save(storage_path_);
-
-    nlohmann::json j = nlohmann::json::array();
-    for (auto& [id, node] : nodes_) {
-        PointerNode scrubbed_node = node;
-        scrubbed_node.content = code_assistance::scrub_json_string(node.content);
-        for (auto& [key, val] : scrubbed_node.metadata) {
-            val = code_assistance::scrub_json_string(val);
-        }
-        j.push_back(scrubbed_node.to_json());
-    }
-    
-    std::ofstream f(fs::path(storage_path_) / "graph.json");
-    f << j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 }
