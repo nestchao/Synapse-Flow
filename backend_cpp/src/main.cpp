@@ -184,7 +184,8 @@ private:
                 
                 // 🚀 UNLIMITED READ: Reads the entire file buffer directly into the stream
                 // This will consume as much RAM as the file size requires.
-                ss << f.rdbuf(); 
+                std::string raw_content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                ss << code_assistance::scrub_json_string(raw_content); 
                 
                 ss << "\n";
             }
@@ -218,6 +219,11 @@ private:
             spdlog::info("🛰️ Project Registered: {}", project_id);
             res.set_content(json{{"success", true}}.dump(), "application/json");
         } catch (const std::exception& e) {
+        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+        crash_file << "ERROR: " << e.what() << "\n\n";
+        crash_file << "BODY RECEIVED:\n" << req.body;
+        crash_file.close();
+        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
             spdlog::error("❌ Registration Failed: {}", e.what());
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
@@ -272,11 +278,31 @@ private:
             nlohmann::json response_json;
             response_json["suggestion"] = safe_result;
             
-            res.set_content(
-                response_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
-                "application/json"
-            );
+            try {
+                std::string final_payload = response_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+                res.set_content(final_payload, "application/json");
+            } catch (const std::exception& e) {
+        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+        crash_file << "ERROR: " << e.what() << "\n\n";
+        crash_file << "BODY RECEIVED:\n" << req.body;
+        crash_file.close();
+        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
+                spdlog::critical("CRITICAL DUMP FAILURE: {}", e.what());
+                
+                // If it STILL fails, dump the contents of the suggestion to a file
+                std::ofstream f("CRASH_DUMP_REST.txt");
+                f << response_json["suggestion"];
+                crash_file.close();
+                
+                res.status = 500;
+                res.set_content("{\"error\":\"Check CRASH_DUMP_REST.txt on server\"}", "application/json");
+            }
         } catch (const std::exception& e) {
+        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+        crash_file << "ERROR: " << e.what() << "\n\n";
+        crash_file << "BODY RECEIVED:\n" << req.body;
+        crash_file.close();
+        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
             spdlog::error("🔥 REST HANDLER ERROR: {}", e.what());
             res.status = 500;
             res.set_content("{\"error\":\"Internal Server Error\"}", "application/json");
@@ -319,6 +345,11 @@ private:
             res.set_content(json{{"candidates", candidates}}.dump(), "application/json");
 
         } catch (const std::exception& e) {
+        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+        crash_file << "ERROR: " << e.what() << "\n\n";
+        crash_file << "BODY RECEIVED:\n" << req.body;
+        crash_file.close();
+        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
             spdlog::error("❌ Retrieval API Error: {}", e.what());
             res.status = 500;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
