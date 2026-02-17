@@ -117,9 +117,17 @@ nlohmann::json extract_json(const std::string& raw) {
         ? clean.substr(json_start, json_end - json_start + 1) 
         : clean.substr(json_start);
 
+    
     try {
-        return nlohmann::json::parse(json_str);
-    } catch (...) {
+        return nlohmann::json::parse(code_assistance::scrub_json_string(json_str));
+    } catch (const nlohmann::json::exception& e) {
+        std::ofstream bug_file("JSON_DUMP_ERROR.txt");
+        bug_file << json_str;
+        bug_file.close();
+        spdlog::critical("!!! UTF-8 BUG FOUND !!! String dumped to JSON_DUMP_ERROR.txt. Error: {}", e.what());
+        return nlohmann::json::object();
+    }
+     catch (...) {
         if (raw.find("def ") != std::string::npos) {
             nlohmann::json f; f["tool"] = "FINAL_ANSWER"; f["parameters"] = {{"answer", raw}}; return f;
         }
@@ -428,6 +436,7 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
 
         this->notify(writer, "THINKING", "Processing logic...");
         last_gen = ai_service_->generate_text_elite(prompt_template);
+        last_gen.text = scrub_json_string(last_gen.text);
         
         if (!last_gen.success) {
             final_output = "ERROR: AI Service Failure";
@@ -492,7 +501,25 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
             }
         }
         
-        nlohmann::json extracted = extract_json(raw_thought);
+        nlohmann::json extracted;
+        try {
+            // We try to parse the thought
+            extracted = extract_json(raw_thought);
+        } catch (const nlohmann::json::exception& e) {
+            spdlog::error("!!! JSON CRASH DETECTED !!!");
+            spdlog::error("Error: {}", e.what());
+            
+            // SAVE THE POISONED DATA TO A FILE FOR INSPECTION
+            std::ofstream dump("CRASH_DUMP_THOUGHT.txt");
+            dump << raw_thought;
+            dump.close();
+            
+            spdlog::error("Poisoned data saved to CRASH_DUMP_THOUGHT.txt");
+            spdlog::error("Check the character around index 16624 in that file.");
+            
+            // Fallback so the server doesn't 500
+            extracted = nlohmann::json::object();
+        }
         spdlog::info("🧩 PARSED JSON RESULT:\n{}", extracted.dump(2)); 
         std::vector<nlohmann::json> actions;
 
