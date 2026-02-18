@@ -205,26 +205,133 @@ private:
     void handle_register_project(const httplib::Request& req, httplib::Response& res) {
         try {
             std::string project_id = req.path_params.at("project_id");
-            std::string safe_body = code_assistance::scrub_json_string(req.body);
-            auto body = json::parse(safe_body);
             
-            // Ensure data directory exists
+            // 🔍 LOG 1: Raw body inspection
+            spdlog::info("📦 Received body length: {} bytes", req.body.length());
+            
+            // 🔍 LOG 2: Dump first 100 bytes in hex
+            std::stringstream hex_dump;
+            for (size_t i = 0; i < std::min(size_t(200), req.body.length()); ++i) {
+                hex_dump << std::hex << std::setw(2) << std::setfill('0') 
+                        << (int)(unsigned char)req.body[i] << " ";
+                if ((i + 1) % 16 == 0) hex_dump << "\n";
+            }
+            spdlog::debug("🔍 First 200 bytes (hex):\n{}", hex_dump.str());
+            
+            // 🔍 LOG 3: Check for problem area around index 5115
+            if (req.body.length() > 5115) {
+                std::stringstream problem_area;
+                size_t start = std::max(size_t(0), size_t(5100));
+                size_t end = std::min(req.body.length(), size_t(5130));
+                
+                spdlog::warn("🔍 Inspecting bytes 5100-5130 (where error occurred):");
+                for (size_t i = start; i < end; ++i) {
+                    unsigned char byte = req.body[i];
+                    problem_area << std::hex << std::setw(2) << std::setfill('0') 
+                                << (int)byte << " ";
+                    
+                    // Flag suspicious bytes
+                    if (byte < 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D) {
+                        spdlog::error("⚠️ Control char at index {}: 0x{:02X}", i, byte);
+                    }
+                    if (byte >= 0x80 && byte < 0xC0) {
+                        spdlog::error("⚠️ Invalid UTF-8 continuation byte at {}: 0x{:02X}", i, byte);
+                    }
+                }
+                spdlog::warn("Hex dump around error: {}", problem_area.str());
+            }
+            
+            // 🔍 LOG 4: Save raw body to file BEFORE scrubbing
+            std::ofstream raw_dump("DEBUG_RAW_BODY.bin", std::ios::binary);
+            raw_dump.write(req.body.data(), req.body.size());
+            raw_dump.close();
+            spdlog::info("💾 Raw body saved to DEBUG_RAW_BODY.bin");
+            
+            // 🔍 LOG 5: Try scrubbing
+            spdlog::info("🧹 Starting scrubbing process...");
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            spdlog::info("✅ Scrubbing complete. New length: {} bytes", safe_body.length());
+            
+            // 🔍 LOG 6: Save scrubbed body
+            std::ofstream scrubbed_dump("DEBUG_SCRUBBED_BODY.txt");
+            scrubbed_dump << safe_body;
+            scrubbed_dump.close();
+            spdlog::info("💾 Scrubbed body saved to DEBUG_SCRUBBED_BODY.txt");
+            
+            // 🔍 LOG 7: Try parsing with detailed error catching
+            nlohmann::json body;
+            try {
+                spdlog::info("🔍 Attempting JSON parse (lenient mode)...");
+                body = nlohmann::json::parse(safe_body, nullptr, false);
+                
+                if (body.is_discarded()) {
+                    spdlog::error("❌ Parse returned 'discarded' - JSON is malformed");
+                    
+                    // Try to find where it breaks
+                    for (size_t test_len = 100; test_len < safe_body.length(); test_len += 100) {
+                        try {
+                            auto test = nlohmann::json::parse(safe_body.substr(0, test_len), nullptr, false);
+                            if (test.is_discarded()) {
+                                spdlog::error("🔍 JSON breaks somewhere between {} and {} bytes", test_len - 100, test_len);
+                                
+                                // Narrow it down
+                                for (size_t i = test_len - 100; i < test_len; ++i) {
+                                    spdlog::error("  Byte {}: 0x{:02X} ('{}')", 
+                                        i, 
+                                        (unsigned char)safe_body[i],
+                                        std::isprint(safe_body[i]) ? safe_body[i] : '?');
+                                }
+                                break;
+                            }
+                        } catch (...) {}
+                    }
+                    
+                    throw std::runtime_error("JSON parsing returned discarded object");
+                }
+                
+                spdlog::info("✅ JSON parsed successfully");
+                
+            } catch (const nlohmann::json::parse_error& e) {
+                spdlog::error("❌ JSON Parse Error: {}", e.what());
+                spdlog::error("   Error at byte: {}", e.byte);
+                
+                // Show context around error
+                if (e.byte < safe_body.length()) {
+                    size_t ctx_start = std::max(size_t(0), e.byte - 50);
+                    size_t ctx_end = std::min(safe_body.length(), e.byte + 50);
+                    spdlog::error("   Context: '{}'", safe_body.substr(ctx_start, ctx_end - ctx_start));
+                }
+                throw;
+            }
+            
+            if (!body.is_object()) {
+                spdlog::error("❌ JSON is not an object, it's a: {}", body.type_name());
+                res.status = 400;
+                res.set_content("{\"error\":\"JSON must be an object\"}", "application/json");
+                return;
+            }
+            
+            // Rest of your original code...
             fs::path project_dir = fs::path("data") / project_id;
             fs::create_directories(project_dir);
-
-            // Save config.json for future syncs
+            
             std::ofstream f(project_dir / "config.json");
             f << body.dump(2);
             
             spdlog::info("🛰️ Project Registered: {}", project_id);
             res.set_content(json{{"success", true}}.dump(), "application/json");
+            
         } catch (const std::exception& e) {
-        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
-        crash_file << "ERROR: " << e.what() << "\n\n";
-        crash_file << "BODY RECEIVED:\n" << req.body;
-        crash_file.close();
-        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
+            std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+            crash_file << "ERROR: " << e.what() << "\n\n";
+            crash_file << "BODY LENGTH: " << req.body.length() << "\n";
+            crash_file << "BODY PREVIEW (first 1000 chars):\n" 
+                    << req.body.substr(0, std::min(size_t(1000), req.body.length()));
+            crash_file.close();
+            
+            spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
             spdlog::error("❌ Registration Failed: {}", e.what());
+            
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
         }
@@ -267,42 +374,70 @@ private:
 
     void handle_generate_suggestion(const httplib::Request& req, httplib::Response& res) {
         try {
-            // 🛡️ CRITICAL: Scrub BEFORE parsing
+            spdlog::info("🎯 AGENT REQUEST - Body size: {} bytes", req.body.length());
+            
             std::string safe_body = code_assistance::scrub_json_string(req.body);
-            auto body = nlohmann::json::parse(safe_body);
+            nlohmann::json body = nlohmann::json::parse(safe_body, nullptr, false);
+            
+            if (body.is_discarded()) {
+                spdlog::warn("⚠️ Scrubbed parse failed, trying raw fallback...");
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            }
+
+            if (body.is_discarded() || !body.is_object()) {
+                spdlog::error("❌ JSON Error. Body length: {}", req.body.length());
+                res.status = 400;
+                res.set_content("{\"error\":\"Invalid JSON encoding\"}", "application/json");
+                return;
+            }
+
+            spdlog::info("✅ Request JSON parsed successfully");
+            spdlog::info("🚀 Calling executor->run_autonomous_loop_internal...");
             
             std::string result = executor_->run_autonomous_loop_internal(body);
             
-            // Also scrub the output
-            std::string safe_result = code_assistance::scrub_json_string(result);
-            nlohmann::json response_json;
-            response_json["suggestion"] = safe_result;
+            spdlog::info("✅ Agent execution completed. Result size: {} bytes", result.length());
             
-            try {
-                std::string final_payload = response_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-                res.set_content(final_payload, "application/json");
-            } catch (const std::exception& e) {
-        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
-        crash_file << "ERROR: " << e.what() << "\n\n";
-        crash_file << "BODY RECEIVED:\n" << req.body;
-        crash_file.close();
-        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
-                spdlog::critical("CRITICAL DUMP FAILURE: {}", e.what());
-                
-                // If it STILL fails, dump the contents of the suggestion to a file
-                std::ofstream f("CRASH_DUMP_REST.txt");
-                f << response_json["suggestion"];
-                crash_file.close();
-                
-                res.status = 500;
-                res.set_content("{\"error\":\"Check CRASH_DUMP_REST.txt on server\"}", "application/json");
+            // 🔥 FIX: Scrub BEFORE creating JSON object
+            std::string ultra_safe_result = code_assistance::scrub_json_string(result);
+            
+            // 🔥 FIX: Manually construct JSON string instead of using nlohmann
+            std::stringstream json_response;
+            json_response << "{\"suggestion\":\"";
+            
+            // Escape special characters for JSON manually
+            for (char c : ultra_safe_result) {
+                switch (c) {
+                    case '"': json_response << "\\\""; break;
+                    case '\\': json_response << "\\\\"; break;
+                    case '\b': json_response << "\\b"; break;
+                    case '\f': json_response << "\\f"; break;
+                    case '\n': json_response << "\\n"; break;
+                    case '\r': json_response << "\\r"; break;
+                    case '\t': json_response << "\\t"; break;
+                    default:
+                        if (c >= 0x20 && c <= 0x7E) {
+                            json_response << c;
+                        } else {
+                            // Skip non-printable chars
+                        }
+                        break;
+                }
             }
+            
+            json_response << "\"}";
+            
+            res.set_content(json_response.str(), "application/json");
+            
         } catch (const std::exception& e) {
-        std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
-        crash_file << "ERROR: " << e.what() << "\n\n";
-        crash_file << "BODY RECEIVED:\n" << req.body;
-        crash_file.close();
-        spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
+            std::ofstream crash_file("DEBUG_CRASH_DUMP.txt");
+            crash_file << "ERROR: " << e.what() << "\n\n";
+            crash_file << "LOCATION: handle_generate_suggestion\n";
+            crash_file << "REQUEST BODY LENGTH: " << req.body.length() << "\n";
+            crash_file << "BODY:\n" << req.body;
+            crash_file.close();
+            
+            spdlog::error("🔥 CRASH SAVED TO DEBUG_CRASH_DUMP.txt: {}", e.what());
             spdlog::error("🔥 REST HANDLER ERROR: {}", e.what());
             res.status = 500;
             res.set_content("{\"error\":\"Internal Server Error\"}", "application/json");
@@ -311,8 +446,23 @@ private:
 
     void handle_retrieve_candidates(const httplib::Request& req, httplib::Response& res) {
         try {
+            
             std::string safe_body = code_assistance::scrub_json_string(req.body);
-            auto body = json::parse(safe_body);
+            // VALID 3-ARGUMENT PARSE: (input, callback_fn, allow_exceptions)
+            nlohmann::json body = nlohmann::json::parse(safe_body, nullptr, false);
+            
+            if (body.is_discarded()) {
+                spdlog::warn("⚠️ Scrubbed parse failed, trying raw fallback...");
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            }
+
+            if (body.is_discarded() || !body.is_object()) {
+                spdlog::error("❌ JSON Error. Body length: {}", req.body.length());
+                res.status = 400;
+                res.set_content("{\"error\":\"Invalid JSON encoding\"}", "application/json");
+                return;
+            }
+
 
             std::string project_id = body.value("project_id", "");
             std::string prompt = body.value("prompt", "");
@@ -370,8 +520,23 @@ private:
         server_.Post("/complete", [this](const httplib::Request& req, httplib::Response& res) {
             auto start = std::chrono::high_resolution_clock::now();
             try {
-                std::string safe_body = code_assistance::scrub_json_string(req.body);
-                auto body = json::parse(safe_body);
+                
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            // VALID 3-ARGUMENT PARSE: (input, callback_fn, allow_exceptions)
+            nlohmann::json body = nlohmann::json::parse(safe_body, nullptr, false);
+            
+            if (body.is_discarded()) {
+                spdlog::warn("⚠️ Scrubbed parse failed, trying raw fallback...");
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            }
+
+            if (body.is_discarded() || !body.is_object()) {
+                spdlog::error("❌ JSON Error. Body length: {}", req.body.length());
+                res.status = 400;
+                res.set_content("{\"error\":\"Invalid JSON encoding\"}", "application/json");
+                return;
+            }
+
 
                 std::string prefix = body.value("prefix", "");
                 std::string suffix = body.value("suffix", "");
@@ -434,8 +599,23 @@ private:
             try {
                 auto project_id = req.path_params.at("project_id");
 
-                std::string safe_body = code_assistance::scrub_json_string(req.body);
-                auto body = json::parse(safe_body);
+                
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            // VALID 3-ARGUMENT PARSE: (input, callback_fn, allow_exceptions)
+            nlohmann::json body = nlohmann::json::parse(safe_body, nullptr, false);
+            
+            if (body.is_discarded()) {
+                spdlog::warn("⚠️ Scrubbed parse failed, trying raw fallback...");
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            }
+
+            if (body.is_discarded() || !body.is_object()) {
+                spdlog::error("❌ JSON Error. Body length: {}", req.body.length());
+                res.status = 400;
+                res.set_content("{\"error\":\"Invalid JSON encoding\"}", "application/json");
+                return;
+            }
+
 
                 std::string store_path = body.value("storage_path", "");
                 if(store_path.empty()) store_path = (fs::path("data") / project_id).string();
@@ -489,8 +669,23 @@ private:
             try {
                 std::string project_id = req.path_params.at("project_id");
 
-                std::string safe_body = code_assistance::scrub_json_string(req.body);
-                auto body = json::parse(safe_body);
+                
+            std::string safe_body = code_assistance::scrub_json_string(req.body);
+            // VALID 3-ARGUMENT PARSE: (input, callback_fn, allow_exceptions)
+            nlohmann::json body = nlohmann::json::parse(safe_body, nullptr, false);
+            
+            if (body.is_discarded()) {
+                spdlog::warn("⚠️ Scrubbed parse failed, trying raw fallback...");
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            }
+
+            if (body.is_discarded() || !body.is_object()) {
+                spdlog::error("❌ JSON Error. Body length: {}", req.body.length());
+                res.status = 400;
+                res.set_content("{\"error\":\"Invalid JSON encoding\"}", "application/json");
+                return;
+            }
+
 
                 std::string rel_path = body.value("file_path", "");
                 
