@@ -48,7 +48,11 @@ std::string clean_response_text(std::string text) {
 
 // --- HELPER: ROBUST JSON EXTRACTION ---
 nlohmann::json extract_json(const std::string& raw) {
-    std::string clean = raw;
+    // 🔥 SCRUB THE AI RESPONSE FIRST
+    std::string clean = code_assistance::scrub_json_string(raw);
+    
+    spdlog::debug("🔍 extract_json: Original {} bytes -> Scrubbed {} bytes", 
+                  raw.length(), clean.length());
     
     // 1. Prioritize Explicit Markdown JSON Blocks
     size_t md_start = clean.find("```json");
@@ -58,17 +62,21 @@ nlohmann::json extract_json(const std::string& raw) {
             size_t end = clean.find("```", start + 1);
             if (end != std::string::npos) {
                 try {
-                    return nlohmann::json::parse(clean.substr(start + 1, end - start - 1));
-                } catch(...) { /* Fallback if block is malformed */ }
+                    std::string content = clean.substr(start + 1, end - start - 1);
+                    // Already scrubbed at the top, but double-check
+                    return nlohmann::json::parse(content, nullptr, false);
+                } catch(const std::exception& e) {
+                    spdlog::error("❌ JSON block parse failed: {}", e.what());
+                }
             }
         }
     }
-
+    
     // 2. Scan for VALID JSON start (Lookahead Check)
     size_t json_start = std::string::npos;
     char start_char = '\0';
     char end_char = '\0';
-
+    
     for (size_t i = 0; i < clean.length(); ++i) {
         char c = clean[i];
         if (c == '{' || c == '[') {
@@ -76,34 +84,49 @@ nlohmann::json extract_json(const std::string& raw) {
                 char next = clean[j];
                 if (std::isspace(next)) continue;
                 if (c == '{' && (next == '"' || next == '}')) {
-                    json_start = i; start_char = '{'; end_char = '}'; goto found;
+                    json_start = i; start_char = '{'; end_char = '}'; goto found_json;
                 }
                 if (c == '[' && (next == '{' || next == '"' || next == ']' || std::isdigit(next))) {
-                    json_start = i; start_char = '['; end_char = ']'; goto found;
+                    json_start = i; start_char = '['; end_char = ']'; goto found_json;
                 }
                 break; 
             }
         }
     }
-    found:;
-
-    if (json_start == std::string::npos) return nlohmann::json::object();
-
+    
+found_json:
+    if (json_start == std::string::npos) {
+        return nlohmann::json::object();
+    }
+    
     // 3. Bracket Counting
     int balance = 0;
     bool in_string = false;
     bool escape = false;
     size_t json_end = std::string::npos;
-
+    
     for (size_t i = json_start; i < clean.length(); ++i) {
         char c = clean[i];
-        if (escape) { escape = false; continue; }
-        if (c == '\\') { escape = true; continue; }
-        if (c == '"') { in_string = !in_string; continue; }
+        
+        if (escape) { 
+            escape = false; 
+            continue; 
+        }
+        
+        if (c == '\\') { 
+            escape = true; 
+            continue; 
+        }
+        
+        if (c == '"') { 
+            in_string = !in_string; 
+            continue; 
+        }
         
         if (!in_string) {
-            if (c == start_char) balance++;
-            else if (c == end_char) {
+            if (c == start_char) {
+                balance++;
+            } else if (c == end_char) {
                 balance--;
                 if (balance == 0) {
                     json_end = i;
@@ -112,26 +135,32 @@ nlohmann::json extract_json(const std::string& raw) {
             }
         }
     }
-
-    std::string json_str = (json_end != std::string::npos) 
-        ? clean.substr(json_start, json_end - json_start + 1) 
-        : clean.substr(json_start);
-
+    
+    std::string json_str;
+    if (json_end != std::string::npos) {
+        json_str = clean.substr(json_start, json_end - json_start + 1);
+    } else {
+        json_str = clean.substr(json_start);
+    }
     
     try {
-        return nlohmann::json::parse(code_assistance::scrub_json_string(json_str));
+        // Already scrubbed, just parse
+        return nlohmann::json::parse(json_str, nullptr, false);
     } catch (const nlohmann::json::exception& e) {
         std::ofstream bug_file("JSON_DUMP_ERROR.txt");
-        bug_file << json_str;
+        bug_file << "ERROR: " << e.what() << "\n\n";
+        bug_file << "ORIGINAL LENGTH: " << raw.length() << "\n";
+        bug_file << "SCRUBBED LENGTH: " << clean.length() << "\n";
+        bug_file << "JSON STRING LENGTH: " << json_str.length() << "\n\n";
+        bug_file << "JSON STRING:\n" << json_str;
         bug_file.close();
-        spdlog::critical("!!! UTF-8 BUG FOUND !!! String dumped to JSON_DUMP_ERROR.txt. Error: {}", e.what());
+        
+        spdlog::critical("!!! JSON PARSE ERROR !!! Dumped to JSON_DUMP_ERROR.txt");
+        spdlog::critical("Error: {}", e.what());
+        
         return nlohmann::json::object();
     }
-     catch (...) {
-        if (raw.find("def ") != std::string::npos) {
-            nlohmann::json f; f["tool"] = "FINAL_ANSWER"; f["parameters"] = {{"answer", raw}}; return f;
-        }
-    }
+    
     return nlohmann::json::object();
 }
 
@@ -252,11 +281,15 @@ std::string AgentExecutor::restore_session_cursor(std::shared_ptr<PointerGraph> 
 
 std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuery& req, ::grpc::ServerWriter<::code_assistance::AgentResponse>* writer) {
     auto mission_start_time = std::chrono::steady_clock::now();
+
+    spdlog::info("🎯 AGENT LOOP ENTRY - Project: {}", req.project_id());
     
+    spdlog::info("  → Loading graph...");
     // 1. Setup Graph & Session
     auto graph = get_or_create_graph(req.project_id());
     std::string session_id = req.session_id();
     
+    spdlog::info("  → Setting up session...");
     // 2. GENERATE EMBEDDING FIRST (Needed for search)
     std::vector<float> prompt_vec = ai_service_->generate_embedding(req.prompt());
 
@@ -384,14 +417,24 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
     massive_context = "";
     std::string full_codebase = load_full_context_file(req.project_id());
     if (!full_codebase.empty()) {
+        spdlog::info("  → Loaded full codebase: {} bytes", full_codebase.length());
+        
         const size_t SAFE_TOKEN_LIMIT_BYTES = 3800000; 
-        if (full_codebase.size() > SAFE_TOKEN_LIMIT_BYTES) massive_context += "\n### 📚 FULL CODEBASE (Truncated)\n" + full_codebase.substr(0, SAFE_TOKEN_LIMIT_BYTES) + "\n";
-        else massive_context += "\n### 📚 FULL CODEBASE\n" + full_codebase + "\n";
+        if (full_codebase.size() > SAFE_TOKEN_LIMIT_BYTES) {
+            // 🔥 ADD SCRUBBING HERE BEFORE TRUNCATION
+            full_codebase = code_assistance::scrub_json_string(full_codebase);
+            massive_context += "\n### 📚 FULL CODEBASE (Truncated)\n" + full_codebase.substr(0, SAFE_TOKEN_LIMIT_BYTES) + "\n";
+        } else {
+            // 🔥 ADD SCRUBBING HERE TOO
+            full_codebase = code_assistance::scrub_json_string(full_codebase);
+            massive_context += "\n### 📚 FULL CODEBASE\n" + full_codebase + "\n";
+        }
     }
-
     // Loop Control
     int max_steps = 16;
     for (int step = 0; step < max_steps; ++step) {
+
+        spdlog::info("🔄 STEP {} START", step);
         
         std::string prompt_template = 
             "### SYSTEM ROLE\n"
@@ -431,19 +474,26 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         if (!warnings.empty()) prompt_template += warnings + "\n";
         if (!last_error.empty()) prompt_template += "\n### ⚠️ PREVIOUS ERROR\n" + last_error + "\nREQUIRED: Fix this error.\n";
             
+        prompt_template = code_assistance::scrub_json_string(prompt_template);
+        spdlog::info("  → After scrub: {} bytes", prompt_template.length());
+
         last_effective_prompt = prompt_template;
         spdlog::debug("📝 PROMPT TO AI (Truncated):\n{}", prompt_template.substr(0, 1000));
 
+        spdlog::info("  → Calling AI...");
         this->notify(writer, "THINKING", "Processing logic...");
         last_gen = ai_service_->generate_text_elite(prompt_template);
+
         last_gen.text = scrub_json_string(last_gen.text);
-        
+        spdlog::info("  → AI responded: {} bytes", last_gen.text.length());
+
         if (!last_gen.success) {
             final_output = "ERROR: AI Service Failure";
             goto mission_complete;
         }
 
         std::string raw_thought = last_gen.text;
+        spdlog::info("  → Extracting JSON...");
 
         spdlog::info("\n==================================================");
         spdlog::info("🤖 RAW SCRAPER/AI OUTPUT (START):");
@@ -503,8 +553,8 @@ std::string AgentExecutor::run_autonomous_loop(const ::code_assistance::UserQuer
         
         nlohmann::json extracted;
         try {
-            // We try to parse the thought
             extracted = extract_json(raw_thought);
+            spdlog::info("  → JSON extracted successfully");
         } catch (const nlohmann::json::exception& e) {
             spdlog::error("!!! JSON CRASH DETECTED !!!");
             spdlog::error("Error: {}", e.what());
@@ -718,6 +768,10 @@ std::string AgentExecutor::run_autonomous_loop_internal(const nlohmann::json& bo
     fake_req.set_project_id(body.value("project_id", "default"));
     std::string sid = body.value("session_id", "REST_SESSION");
     fake_req.set_session_id(sid);
+    
+    spdlog::info("🧠 AGENT LOOP START - Project: {}, Session: {}", 
+                 fake_req.project_id(), fake_req.session_id());
+    
     return this->run_autonomous_loop(fake_req, nullptr); 
 }
 

@@ -179,18 +179,27 @@ void PointerGraph::save_internal() {
     nlohmann::json j = nlohmann::json::array();
     for (auto& [id, node] : nodes_) {
         nlohmann::json node_json;
-        node_json["id"] = node.id;
+        node_json["id"] = code_assistance::scrub_json_string(node.id);
         node_json["type"] = node_type_to_string(node.type);
         node_json["timestamp"] = node.timestamp;
-        node_json["content"] = code_assistance::scrub_json_string(node.content);
+
+        std::string content = node.content;
+        if (content.length() > 10000) {
+            content = content.substr(0, 10000) + "\n...[truncated]";
+        }
+        node_json["content"] = code_assistance::scrub_json_string(content);
         
         nlohmann::json meta_json = nlohmann::json::object();
         for (auto const& [key, val] : node.metadata) {
             meta_json[key] = code_assistance::scrub_json_string(val);
         }
         node_json["metadata"] = meta_json;
-        node_json["parent_id"] = node.parent_id;
-        node_json["children_ids"] = node.children_ids;
+
+        nlohmann::json children_array = nlohmann::json::array();
+        for (const auto& child_id : node.children_ids) {
+            children_array.push_back(code_assistance::scrub_json_string(child_id));
+        }
+        node_json["children_ids"] = children_array;
         
         j.push_back(node_json);
     }
