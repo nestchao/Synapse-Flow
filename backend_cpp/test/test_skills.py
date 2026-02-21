@@ -18,27 +18,23 @@ def run_skill_test():
     rule_content = """
     RULE_NAME: Global_Coding_Standard
     RULES:
-    - Every file MUST start with the header: '# COPYRIGHT 2026 SYNAPSE-FLOW'
+    - Every file MUST start with the exact header: '# COPYRIGHT 2026 SYNAPSE-FLOW'
     - Use the variable name 'logger_v2' for all print statements.
     - All functions must have a docstring starting with 'STRICT:'
     """
     
     with open(os.path.join(SKILL_DIR, "coding_rules.yaml"), "w") as f:
         f.write(rule_content)
-    print("✅ Skill 'coding_rules.yaml' injected into project metadata.")
+    print("✅ Skill 'coding_rules.yaml' verified on disk.")
 
-    # 2. Trigger a sync so the C++ Brain loads the new skill
-    requests.post(f"{REST_URL}/sync/run/{PROJECT_ID}", json={})
-    time.sleep(2) # Give it a second to index
-
-    # 3. Prompt the Agent
-    prompt = "Create a file 'utility.py' with a function that adds two numbers."
+    # 2. Prompt the Agent (Notice the hint to trigger the Vector Search)
+    prompt = "Create a file 'utility_v2.py' with a function that adds two numbers. Ensure you follow the Global Coding Standards."
     print(f"🧠 Prompting Agent: {prompt}")
 
     res = requests.post(f"{REST_URL}/generate-code-suggestion", json={
         "project_id": PROJECT_ID,
         "prompt": prompt,
-        "session_id": "SKILL_PROBE_001"
+        "session_id": f"SKILL_PROBE_{int(time.time())}"
     }, timeout=120)
 
     if res.status_code == 200:
@@ -46,17 +42,30 @@ def run_skill_test():
         print(colored("\n🤖 Agent Response:", "green"))
         print(suggestion)
 
-        # 4. Verify Compliance
+        # 3. Verify Compliance
         passed = True
-        if "COPYRIGHT 2026" not in suggestion: 
+        
+        # Check actual file if the AI applied the edit
+        check_path = os.path.join(TARGET_PATH, "utility_v2.py")
+        content_to_check = suggestion
+        
+        if os.path.exists(check_path):
+            with open(check_path, 'r') as f:
+                content_to_check = f.read()
+                print(colored(f"\n📁 Validating actual file on disk...", "yellow"))
+
+        if "COPYRIGHT 2026" not in content_to_check: 
             print(colored("❌ FAILED: Missing Copyright Header", "red"))
             passed = False
-        if "STRICT:" not in suggestion:
+        if "STRICT:" not in content_to_check:
             print(colored("❌ FAILED: Missing Strict Docstring", "red"))
             passed = False
-        
+        if "logger_v2" not in content_to_check:
+            print(colored("❌ FAILED: Missing logger_v2 requirement", "red"))
+            passed = False
+            
         if passed:
-            print(colored("\n🏆 SUCCESS: Agent followed all Business Rules!", "green", attrs=["bold"]))
+            print(colored("\n🏆 SUCCESS: Agent followed all Business Rules perfectly!", "green", attrs=["bold"]))
     else:
         print(colored(f"❌ Error: {res.text}", "red"))
 
