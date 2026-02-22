@@ -11,6 +11,8 @@
 #include <nlohmann/json.hpp>
 #include <map>
 #include <sstream> 
+#include <omp.h>
+#include <iterator>
 
 #include "PrefixTrie.hpp"
 #include "code_graph.hpp"
@@ -294,7 +296,6 @@ SyncResult SyncService::perform_sync(
 
     if (manifest.empty()) {
         spdlog::warn("🧹 Fresh Sync Detected. Clearing old graph nodes...");
-        // If you have a clear() method in your graph, call it here
     }
 
     FilterConfig cfg;
@@ -316,39 +317,68 @@ SyncResult SyncService::perform_sync(
 
     std::unordered_map<std::string, std::string> new_manifest;
     std::vector<std::shared_ptr<CodeNode>> nodes_to_embed;
+    std::vector<std::pair<std::string, std::string>> files_to_preload;
     std::ofstream full_context_file(storage_dir / "_full_context.txt");
     full_context_file << "### AGGREGATED SOURCE CONTEXT\n";
 
-    code_assistance::elite::ASTBooster ast_parser;
+    // ========================================================================
+    // 🚀 PHASE 1: OPEN-MP LOCK-FREE PARALLEL PIPELINE
+    // ========================================================================
+    
+    // Create an isolated workspace for every CPU thread
+    int num_threads = omp_get_max_threads();
+    struct ThreadLocalData {
+        std::vector<std::shared_ptr<CodeNode>> nodes;
+        std::vector<std::shared_ptr<CodeNode>> to_embed;
+        std::vector<std::pair<std::string, std::string>> preloads;
+        std::vector<std::string> logs;
+        std::unordered_map<std::string, std::string> manifest_updates;
+        std::string context_chunk;
+        int updated_count = 0;
+        
+        // AST Parsers are NOT thread-safe. Each thread gets its own parser!
+        code_assistance::elite::ASTBooster local_ast_parser; 
+    };
+    
+    std::vector<ThreadLocalData> thread_workspaces(num_threads);
 
-    std::vector<std::pair<std::string, std::string>> files_to_preload;
+    // Run parallel loop. schedule(dynamic) is best because some files are huge, some are tiny.
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < (int)files_to_process.size(); ++i) {
+        int tid = omp_get_thread_num();
+        auto& local = thread_workspaces[tid]; // Grab thread's private workspace
 
-    for (const auto& file_path : files_to_process) {
+        const auto& file_path = files_to_process[i];
         std::string rel_path_str = fs::relative(file_path, source_dir).generic_string();
         std::string current_hash = calculate_file_hash(file_path);
-        std::string old_hash = manifest.count(rel_path_str) ? manifest.at(rel_path_str) : "";
         
+        // Read operations are thread-safe
+        std::string old_hash = "";
+        if (manifest.count(rel_path_str)) {
+            old_hash = manifest.at(rel_path_str);
+        }
+        
+        // Parallel File I/O
         std::ifstream file_in(file_path);
         std::string content((std::istreambuf_iterator<char>(file_in)), std::istreambuf_iterator<char>());
         
-        full_context_file << "\n\n--- FILE: " << rel_path_str << " ---\n" << content << "\n";
-        
-        // 🚀 NEW: Queue for context preloading
-        files_to_preload.push_back({rel_path_str, content});
+        // Write to LOCAL buffers
+        local.context_chunk += "\n\n--- FILE: " + rel_path_str + " ---\n" + content + "\n";
+        local.preloads.push_back({rel_path_str, content});
+        local.manifest_updates[rel_path_str] = current_hash;
 
         bool is_changed = (current_hash != old_hash);
-        new_manifest[rel_path_str] = current_hash;
 
         if (is_changed) {
-            spdlog::info("🔼 UPDATE: {}", rel_path_str);
-            result.logs.push_back("UPDATE: " + rel_path_str);
+            local.logs.push_back("UPDATE: " + rel_path_str);
             
             std::vector<CodeNode> raw_nodes;
             fs::path p(rel_path_str);
             std::string ext = p.extension().string();
 
+            // CPU-Heavy parsing happens completely in parallel
             if (ext == ".cpp" || ext == ".hpp" || ext == ".py" || ext == ".ts" || ext == ".js") {
-                raw_nodes = ast_parser.extract_symbols(rel_path_str, content);
+                raw_nodes = local.local_ast_parser.extract_symbols(rel_path_str, content);
                 if(raw_nodes.empty()) {
                     raw_nodes = CodeParser::extract_nodes_from_file(rel_path_str, content);
                 }
@@ -369,21 +399,59 @@ SyncResult SyncService::perform_sync(
 
             for (auto& n : raw_nodes) {
                 auto ptr = std::make_shared<CodeNode>(n);
-                result.nodes.push_back(ptr);
-                nodes_to_embed.push_back(ptr);
+                local.nodes.push_back(ptr);
+                local.to_embed.push_back(ptr);
             }
-            result.updated_count++;
+            local.updated_count++;
             
         } else {
+            // Concurrent maps allow safe READS by multiple threads
             for (const auto& [id, node] : existing_nodes_map) {
-                if (node->file_path == rel_path_str) result.nodes.push_back(node);
+                if (node->file_path == rel_path_str) {
+                    local.nodes.push_back(node);
+                }
             }
+        }
+    }
+
+    // ========================================================================
+    // 🚀 PHASE 2: RAPID MERGE
+    // ========================================================================
+    
+    for (auto& local : thread_workspaces) {
+        // I/O Merge
+        full_context_file << local.context_chunk;
+        
+        // Pointer Moves (Instant O(1) transferring of data)
+        files_to_preload.insert(files_to_preload.end(), 
+            std::make_move_iterator(local.preloads.begin()), std::make_move_iterator(local.preloads.end()));
+            
+        result.nodes.insert(result.nodes.end(), 
+            std::make_move_iterator(local.nodes.begin()), std::make_move_iterator(local.nodes.end()));
+            
+        nodes_to_embed.insert(nodes_to_embed.end(), 
+            std::make_move_iterator(local.to_embed.begin()), std::make_move_iterator(local.to_embed.end()));
+            
+        result.logs.insert(result.logs.end(), 
+            std::make_move_iterator(local.logs.begin()), std::make_move_iterator(local.logs.end()));
+        
+        // Map Merge
+        new_manifest.insert(local.manifest_updates.begin(), local.manifest_updates.end());
+        
+        result.updated_count += local.updated_count;
+        
+        // Output Logs sequentially to keep console clean
+        for (const auto& log : local.logs) {
+            spdlog::info("🔼 {}", log);
         }
     }
 
     full_context_file.close();
 
-    // 🚀 NEW: Preload all file contexts for fast completions
+    // ========================================================================
+    // POST-PROCESSING
+    // ========================================================================
+
     spdlog::info("📦 Preloading {} file contexts for ghost text...", files_to_preload.size());
     auto preload_start = std::chrono::high_resolution_clock::now();
     
@@ -397,6 +465,7 @@ SyncResult SyncService::perform_sync(
     
     spdlog::info("✅ Context preload complete in {}ms", preload_elapsed);
 
+    // Embeddings still hit the network, so they happen after the CPU parallelism
     if (!nodes_to_embed.empty()) {
         generate_embeddings_batch(nodes_to_embed, 100);
     }

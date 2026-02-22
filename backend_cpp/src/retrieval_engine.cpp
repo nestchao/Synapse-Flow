@@ -160,7 +160,11 @@ void RetrievalEngine::multi_dimensional_scoring(std::vector<RetrievalResult>& ca
     std::stringstream ss(q);
     std::string word;
     while(ss >> word) {
-        if(word.length() > 3) query_keywords.push_back(word);
+        // Keep words > 3 chars OR words that contain digits (like '50', 'v2', 'S3')
+        bool has_digit = std::any_of(word.begin(), word.end(), ::isdigit);
+        if(word.length() > 3 || has_digit) {
+            query_keywords.push_back(word);
+        }
     }
 
     for (auto& c : candidates) {
