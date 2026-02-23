@@ -148,6 +148,9 @@
                         <div class="thinking-container">
                             <div class="magic-circle"></div>
                             <span class="thinking-text">${message.value}</span>
+                        </div>
+                        <div id="live-trace-container" style="margin-top: 10px; font-size: 11px; color: #a5d6ff; border-left: 2px solid #9370db; padding-left: 10px; font-family: monospace;">
+                            <div style="opacity: 0.6">Initializing neural link...</div>
                         </div>`;
                 } else {
                     div.className = 'message bot';
@@ -222,6 +225,29 @@
                 chatContainer.appendChild(planDiv);
                 saveState();
                 break;
+
+            case 'traceUpdate':
+                const traceContainer = document.getElementById('live-trace-container');
+                if (traceContainer && message.traces) {
+                    // Get the 3 most recent traces to keep the UI clean
+                    const recentTraces = message.traces.slice(-3);
+                    traceContainer.innerHTML = recentTraces.map(t => {
+                        let icon = '⚡'; // default
+                        if (t.state === 'TOOL_EXEC') icon = '⚙️';
+                        if (t.state === 'ERROR_CATCH') icon = '❌';
+                        if (t.state === 'FINAL') icon = '✅';
+                        
+                        // Clean up the text so it fits nicely
+                        let safeText = escapeHtml(t.detail).replace(/\n/g, ' ');
+                        if (safeText.length > 55) safeText = safeText.substring(0, 55) + '...';
+                        
+                        return `<div style="margin-bottom: 4px;">${icon} [${t.state}] ${safeText}</div>`;
+                    }).join('');
+                    
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+                break;
+
         }
         chatContainer.scrollTop = chatContainer.scrollHeight;
     });
