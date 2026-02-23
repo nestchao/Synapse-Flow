@@ -45,11 +45,26 @@ export class CodeChatProvider implements vscode.WebviewViewProvider {
                     }
 
                     // 1. Immediate Feedback
-                    // Note: The C++ backend is fast, but "Thinking" lets the user know complex plans are forming.
                     this._view?.webview.postMessage({ type: 'addResponse', value: '🧠 Thinking...' });
 
+                    // 🚀 LIVE MONOLOGUE POLLER
+                    let isPolling = true;
+                    const pollInterval = setInterval(async () => {
+                        if (!isPolling) return;
+                        const telem = await this._backendClient.getTelemetry();
+                        if (telem && telem.agent_traces) {
+                            // Filter traces to only show what THIS session is doing
+                            const myTraces = telem.agent_traces.filter((t: any) => t.session_id === this._sessionId);
+                            if (myTraces.length > 0) {
+                                this._view?.webview.postMessage({
+                                    type: 'traceUpdate',
+                                    traces: myTraces
+                                });
+                            }
+                        }
+                    }, 1000); // Check every 1 second
+
                     try {
-                        // 2. Gather Context
                         const activeEditor = vscode.window.activeTextEditor;
                         const activeContext = activeEditor ? {
                             filePath: vscode.workspace.asRelativePath(activeEditor.document.uri),
@@ -57,23 +72,26 @@ export class CodeChatProvider implements vscode.WebviewViewProvider {
                             selection: activeEditor.document.getText(activeEditor.selection)
                         } : { filePath: "None", content: "", selection: "" };
 
-                        // 3. Send to C++ Brain
                         console.log(`[Extension] Sending to Agent [Session: ${this._sessionId}]`);
                         
                         const response = await this._backendClient.getCodeSuggestion(
                             this._projectId,
                             data.value,
-                            this._sessionId, // 🚀 Persistent Graph Session
+                            this._sessionId,
                             activeContext
                         );
 
-                        // 4. Update UI
-                        // Removes "Thinking..." and adds real response
+                        // Stop polling when done
+                        isPolling = false;
+                        clearInterval(pollInterval);
+
                         this._view?.webview.postMessage({
                             type: 'updateLastResponse',
                             value: response
                         });
                     } catch (error: any) {
+                        isPolling = false;
+                        clearInterval(pollInterval);
                         this._view?.webview.postMessage({
                             type: 'updateLastResponse',
                             value: `❌ Communication Error: ${error.message}`
@@ -144,7 +162,9 @@ export class CodeChatProvider implements vscode.WebviewViewProvider {
             }
 
             await vscode.workspace.applyEdit(edit);
-            await document.save();
+        
+            await vscode.window.showTextDocument(document);
+            vscode.window.showInformationMessage("Code Injected! Review the changes and Save (Ctrl+S), or Undo (Ctrl+Z).");
             
             this._view?.webview.postMessage({ type: 'applySuccess', id: blockId });
 

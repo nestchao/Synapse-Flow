@@ -29,6 +29,16 @@ export class BackendClient {
         return { cpp: cppStatus, python: pythonStatus };
     }
 
+    async getTelemetry(): Promise<any> {
+        try {
+            // Fast timeout so we don't block the UI loop
+            const response = await cppClient.get('/api/admin/telemetry', { timeout: 1000 });
+            return response.data;
+        } catch (error) {
+            return null;
+        }
+    }
+
     // --- Ghost Text ---
     async getAutocomplete(prefix: string, suffix: string, projectId: string, filePath: string): Promise<string> {
         try {
